@@ -630,18 +630,23 @@ func (service *Service) rewriteTaskToolCallModelForDisplay(stream *ActiveStream,
 	if taskToolCall == nil || taskToolCall.GetArgs() == nil {
 		return toolCall
 	}
-	if isConcreteTaskModelSelection(taskToolCall.GetArgs().GetModel()) {
-		return toolCall
+	effectiveModelID := strings.TrimSpace(taskToolCall.GetArgs().GetModel())
+	if !isConcreteTaskModelSelection(effectiveModelID) {
+		subagentType := taskSubagentTypeNameForDisplay(taskToolCall.GetArgs().GetSubagentType())
+		stream.mu.Lock()
+		parentModelID := strings.TrimSpace(stream.ModelID)
+		overrides := cloneSubagentModelOverrides(stream.SubagentModelOverrides)
+		stream.mu.Unlock()
+		effectiveModelID = effectiveTaskDisplayModelID(subagentType, parentModelID, overrides)
 	}
-	subagentType := taskSubagentTypeNameForDisplay(taskToolCall.GetArgs().GetSubagentType())
-	stream.mu.Lock()
-	parentModelID := strings.TrimSpace(stream.ModelID)
-	overrides := cloneSubagentModelOverrides(stream.SubagentModelOverrides)
-	stream.mu.Unlock()
-	effectiveModelID := effectiveTaskDisplayModelID(subagentType, parentModelID, overrides)
 	if effectiveModelID == "" {
 		return toolCall
 	}
+	displayName := service.resolveRequestedModelName(nil, effectiveModelID)
+	if displayName == "" || displayName == effectiveModelID {
+		return toolCall
+	}
+	effectiveModelID = displayName
 	cloned, ok := proto.Clone(toolCall).(*agentv1.ToolCall)
 	if !ok || cloned == nil {
 		return toolCall
@@ -651,6 +656,34 @@ func (service *Service) rewriteTaskToolCallModelForDisplay(stream *ActiveStream,
 		return toolCall
 	}
 	clonedTaskToolCall.Args.Model = &effectiveModelID
+	return cloned
+}
+
+func (service *Service) buildTaskToolCallForDisplay(invocation runtimecore.ToolInvocation) *agentv1.ToolCall {
+	toolCall := buildStartedToolCall(invocation)
+	if toolCall == nil || toolCall.GetTaskToolCall() == nil || toolCall.GetTaskToolCall().GetArgs() == nil {
+		return toolCall
+	}
+	return service.rewriteTaskToolCallModelForResolvedID(toolCall, toolCall.GetTaskToolCall().GetArgs().GetModel())
+}
+
+func (service *Service) rewriteTaskToolCallModelForResolvedID(toolCall *agentv1.ToolCall, modelID string) *agentv1.ToolCall {
+	if service == nil || toolCall == nil || !isConcreteTaskModelSelection(modelID) {
+		return toolCall
+	}
+	baseModelID, suffix, hasSuffix := strings.Cut(modelID, " · ")
+	displayName := service.resolveRequestedModelName(nil, baseModelID)
+	if displayName == "" || displayName == baseModelID {
+		return toolCall
+	}
+	if hasSuffix {
+		displayName += " · " + suffix
+	}
+	cloned, ok := proto.Clone(toolCall).(*agentv1.ToolCall)
+	if !ok || cloned == nil || cloned.GetTaskToolCall() == nil || cloned.GetTaskToolCall().GetArgs() == nil {
+		return toolCall
+	}
+	cloned.GetTaskToolCall().Args.Model = stringPtr(displayName)
 	return cloned
 }
 

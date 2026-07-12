@@ -1,6 +1,2 @@
-- 新增用户级 `plan-docs` Skill、标准波次计划模板和 Windows 安装脚本，支持跨项目发现与版本校验
-- 执行计划时注入选中计划正文、标识与严格波次契约，按依赖顺序推进并限制同波并行派遣
-- 修复 Execute Plan 缺省模式可能继续停留在 Plan 的问题，确保实现型 Subagent 使用 Agent 模式和可写工具
-- 支持父 Agent 为 Subagent 独立选择 `fast`、Terra 或 Sol，并按任务指定 `disabled/low/medium/high/xhigh/max` 思考强度
-- 增加 Wave 启动、完成、阻塞与重启恢复观测；实现任务未落盘或未验收时不允许通过完成门
-- 保持根 turn 最多 4 个直属 Subagent、最大 3 层以及 resume 不占配额的服务端硬限制
+- 修复 Subagent 在 `fast`、inherit 或渠道 override 场景显示内部渠道 ID 的问题，现统一显示配置名称或 provider 模型名
+- 保持子代理实际模型路由不变，并让实时进度、完成态与历史回放使用同一模型名称

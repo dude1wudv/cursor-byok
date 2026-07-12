@@ -153,7 +153,7 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 	return payload
 }
 
-func rewriteTaskInvocationModelForDisplay(invocation runtimecore.ToolInvocation, parentModelID string, overrides map[string]runtimecore.SubagentModelOverrideSelection) runtimecore.ToolInvocation {
+func rewriteTaskInvocationModelForExecution(invocation runtimecore.ToolInvocation, parentModelID string, overrides map[string]runtimecore.SubagentModelOverrideSelection) runtimecore.ToolInvocation {
 	if strings.TrimSpace(invocation.ToolName) != "Task" {
 		return invocation
 	}
@@ -988,6 +988,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return service.handlePreCompactTerminal(stream, pending.ProviderPass, strings.TrimSpace(result.ToolResultPayload))
 	}
 	if result.ToolCall != nil {
+		if taskToolCall := result.ToolCall.GetTaskToolCall(); taskToolCall != nil && taskToolCall.GetArgs() != nil {
+			result.ToolCall = service.rewriteTaskToolCallModelForResolvedID(result.ToolCall, taskToolCall.GetArgs().GetModel())
+		}
 		if err := service.appendToolResult(stream, result.ToolCallID, deriveToolNameFromPendingExec(pending), pending.ArgsJSON, result.ToolResultPayload, pending.ReasoningContent, result.ToolCall); err != nil {
 			return err
 		}
@@ -1782,11 +1785,11 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		if resolutionPayload := taskSubagentModelResolutionPayload(invocation, stream.ModelID, subagentOverrides); resolutionPayload != nil {
 			service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "subagent_model_override_resolved", resolutionPayload)
 		}
-		invocation = rewriteTaskInvocationModelForDisplay(invocation, stream.ModelID, subagentOverrides)
+		invocation = rewriteTaskInvocationModelForExecution(invocation, stream.ModelID, subagentOverrides)
 	}
 	bufferExecDispatch := isExecInvocation && shouldBufferExecDispatch(invocation.ToolName)
 	suppressStartedToolCall := shouldSuppressStartedToolCallAfterPartial(stream, trimmedToolName, invocation.CallID)
-	startedToolCall := buildStartedToolCall(invocation)
+	startedToolCall := service.buildTaskToolCallForDisplay(invocation)
 	startedEmitted := suppressStartedToolCall
 	ensureLoopActive := func() error {
 		return providerLoopInterruptErr(nil, stream, invocation.ModelCallID)
@@ -2246,6 +2249,54 @@ func (service *Service) failStreamIfNonTerminal(stream *ActiveStream, terminalCo
 	return service.failStream(stream, terminalCode, cause)
 }
 
+func (service *Service) rewriteCheckpointTaskModelsForDisplay(state *agentv1.ConversationStateStructure) {
+	if service == nil || state == nil {
+		return
+	}
+	for turnIndex, turnPayload := range state.Turns {
+		turn := &agentv1.ConversationTurnStructure{}
+		if err := proto.Unmarshal(turnPayload, turn); err != nil || turn.GetAgentConversationTurn() == nil {
+			continue
+		}
+		agentTurn := turn.GetAgentConversationTurn()
+		changed := false
+		for stepIndex, stepPayload := range agentTurn.Steps {
+			step := &agentv1.ConversationStep{}
+			if err := proto.Unmarshal(stepPayload, step); err != nil {
+				continue
+			}
+			taskToolCall := step.GetToolCall().GetTaskToolCall()
+			if taskToolCall == nil || taskToolCall.GetArgs() == nil {
+				continue
+			}
+			modelID := taskToolCall.GetArgs().GetModel()
+			baseModelID, suffix, hasSuffix := strings.Cut(modelID, " · ")
+			displayName := service.resolveRequestedModelName(nil, baseModelID)
+			if displayName == "" || displayName == baseModelID {
+				continue
+			}
+			if hasSuffix {
+				displayName += " · " + suffix
+			}
+			taskToolCall.Args.Model = stringPtr(displayName)
+			encodedStep, err := proto.Marshal(step)
+			if err != nil {
+				continue
+			}
+			agentTurn.Steps[stepIndex] = encodedStep
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+		encodedTurn, err := proto.Marshal(turn)
+		if err != nil {
+			continue
+		}
+		state.Turns[turnIndex] = encodedTurn
+	}
+}
+
 // publishCheckpoint 按当前内存会话镜像投影出 checkpoint，并广播给所有 RunSSE 订阅者。
 func (service *Service) publishCheckpoint(requestID string, _ string) error {
 	stream, ok := service.broker.Get(requestID)
@@ -2260,6 +2311,7 @@ func (service *Service) publishCheckpoint(requestID string, _ string) error {
 	if err != nil {
 		return err
 	}
+	service.rewriteCheckpointTaskModelsForDisplay(state)
 	state.PendingToolCalls = buildPendingToolCalls(pendingExecs, pendingInteractions)
 	service.rewriteCheckpointTokenDetailsForClient(stream, conversation, state)
 	return service.broker.Publish(requestID, StreamEvent{
