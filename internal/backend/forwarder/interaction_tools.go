@@ -459,6 +459,12 @@ func (service *Service) handleTodoWriteToolInvocation(stream *ActiveStream, invo
 			},
 		},
 	}
+	waveEntries := buildPlanWaveTransitionEntries(conversation, structuredState.Todos, nextTodos, stream.TurnSeq, stream.RequestID)
+	if len(waveEntries) > 0 {
+		if _, err := service.appendConversationEntries(stream, stream.ConversationID, waveEntries); err != nil {
+			return err
+		}
+	}
 	return service.completeImmediateToolResult(stream, invocation, summarizeUpdateTodosResult(result), buildUpdateTodosToolCall(args, result))
 }
 

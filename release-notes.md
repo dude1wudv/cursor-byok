@@ -1,4 +1,6 @@
-- 优化 OpenAI Responses 推理摘要事件，恢复并稳定显示模型思考内容
-- 调整 Explore 子代理触发语义，在复杂跨模块任务中更主动地进行只读调查
-- 保留每会话最多 4 个子代理和最大 3 层的服务端硬限制
-- 移除首页广告栏，并将作者、项目仓库和自动更新源切换到 dude1wudv/cursor-byok
+- 新增用户级 `plan-docs` Skill、标准波次计划模板和 Windows 安装脚本，支持跨项目发现与版本校验
+- 执行计划时注入选中计划正文、标识与严格波次契约，按依赖顺序推进并限制同波并行派遣
+- 修复 Execute Plan 缺省模式可能继续停留在 Plan 的问题，确保实现型 Subagent 使用 Agent 模式和可写工具
+- 支持父 Agent 为 Subagent 独立选择 `fast`、Terra 或 Sol，并按任务指定 `disabled/low/medium/high/xhigh/max` 思考强度
+- 增加 Wave 启动、完成、阻塞与重启恢复观测；实现任务未落盘或未验收时不允许通过完成门
+- 保持根 turn 最多 4 个直属 Subagent、最大 3 层以及 resume 不占配额的服务端硬限制

@@ -21,6 +21,7 @@ const (
 	promptContextSourceStructuredCurrentPlan  = "structured_state/current_plan"
 	promptContextSourceStructuredTodoList     = "structured_state/todo_list"
 	promptContextSourceStructuredTodoReminder = "structured_state/todo_reminder"
+	promptContextSourcePlanExecutionContract  = "structured_state/plan_execution_contract"
 )
 
 const todoUnsafeReplaceBaseError = "todo update rejected: merge=false may only omit completed or cancelled todos; use merge=true for incremental updates or include every active todo"
@@ -138,6 +139,54 @@ func refreshConversationRuntimeState(conversation *ConversationFile) error {
 	return nil
 }
 
+func buildPlanExecutionPromptContext(intent InboundIntent) PromptContextMessage {
+	if !intent.ExecutePlan {
+		return PromptContextMessage{}
+	}
+	identityLines := make([]string, 0, 5)
+	if value := strings.TrimSpace(intent.ExecutePlanID); value != "" {
+		identityLines = append(identityLines, "plan_id: "+value)
+	}
+	if value := strings.TrimSpace(intent.ExecutePlanFileURI); value != "" {
+		identityLines = append(identityLines, "plan_file_uri: "+value)
+	}
+	if value := strings.TrimSpace(intent.ExecutePlanFilePath); value != "" {
+		identityLines = append(identityLines, "plan_file_path: "+value)
+	}
+	if value := strings.TrimSpace(intent.ExecutePlanKickoffID); value != "" {
+		identityLines = append(identityLines, "kickoff_message_id: "+value)
+	}
+	if value := strings.TrimSpace(intent.ExecutePlanHash); value != "" {
+		identityLines = append(identityLines, "plan_hash: "+value)
+	}
+	planText := strings.TrimSpace(intent.ExecutePlanText)
+	parts := []string{
+		"<plan_execution_contract>",
+		"The user started execution of the selected plan. Treat the selected plan below as the execution source of truth for this run.",
+	}
+	if len(identityLines) > 0 {
+		parts = append(parts, strings.Join(identityLines, "\n"))
+	}
+	if planText != "" {
+		parts = append(parts, "<selected_plan>\n"+planText+"\n</selected_plan>")
+	}
+	parts = append(parts, strings.Join([]string{
+		"Execute only the earliest incomplete Wave.",
+		"For a simple task or work that shares files or state, keep the work on the main line and complete the Wave sequentially without dispatching a subagent.",
+		"Use subagent_type=\"explore\" with readonly=true only for reconnaissance tasks. Never assign an implementation task to an Explore or readonly subagent.",
+		"For an implementation task assigned to a subagent, use subagent_type=\"generalPurpose\" with readonly=false so the child runs in Agent mode with editing tools. Its prompt must require the owned_paths changes to be written to disk and validated, not merely described.",
+		"For independent tasks in the same Wave, dispatch the minimum necessary Task subagents together, never more than four direct subagents in one batch. Each Task prompt must include the task ID, scope, owned_paths, dependencies, acceptance criteria, expected file changes, validation command, and expected return format.",
+		"Do not duplicate delegated work on the main line. Wait for every required result in the current Wave, inspect the resulting workspace changes, update matching Todo IDs, and verify the completion gate before advancing.",
+		"A Task start or research-only report is not completion for an implementation task. If required owned_paths were not changed, validation did not run, or a required task fails, times out, conflicts, or has an unknown result, mark the Wave blocked and repair or resume it before continuing.",
+		"After restart or reconnect, do not silently redispatch work whose result is unknown. Reconcile the current plan, Todo states, workspace changes, and available Task results first.",
+	}, "\n"), "</plan_execution_contract>")
+	return newPromptContextMessage(
+		promptContextSourcePlanExecutionContract,
+		modeladapter.Message{Role: "user", Content: strings.Join(parts, "\n\n")},
+		true,
+	)
+}
+
 func buildStructuredStatePromptContexts(conversation *ConversationFile) ([]PromptContextMessage, []modeladapter.Message, error) {
 	state, err := projectConversationStructuredState(conversation)
 	if err != nil {
@@ -172,6 +221,151 @@ func buildStructuredStatePromptContexts(conversation *ConversationFile) ([]Promp
 		}
 	}
 	return contexts, tailMessages, nil
+}
+
+type planWaveDefinition struct {
+	Name    string
+	TaskIDs []string
+}
+
+func buildPlanWaveTransitionEntries(conversation *ConversationFile, previousTodos []*agentv1.TodoItem, nextTodos []*agentv1.TodoItem, turnSeq int64, requestID string) []HistoryEntry {
+	if conversation == nil || strings.TrimSpace(conversation.CurrentPlanText) == "" {
+		return nil
+	}
+	planHash := currentTurnPlanExecutionHash(conversation, turnSeq)
+	if planHash == "" {
+		return nil
+	}
+	waves := parsePlanWaveDefinitions(conversation.CurrentPlanText)
+	if len(waves) == 0 {
+		return nil
+	}
+	entries := make([]HistoryEntry, 0, len(waves))
+	for index, wave := range waves {
+		previousState := planWaveTodoState(wave.TaskIDs, previousTodos)
+		nextState := planWaveTodoState(wave.TaskIDs, nextTodos)
+		if previousState == nextState {
+			continue
+		}
+		eventType := ""
+		switch nextState {
+		case "in_progress":
+			eventType = "wave_started"
+		case "completed":
+			eventType = "wave_completed"
+		case "blocked":
+			eventType = "wave_blocked"
+		}
+		if eventType == "" {
+			continue
+		}
+		entries = append(entries, newMetadataEntry(turnSeq, requestID, eventType, map[string]any{
+			"plan_hash":      planHash,
+			"wave_index":     index + 1,
+			"wave_name":      wave.Name,
+			"task_ids":       append([]string(nil), wave.TaskIDs...),
+			"previous_state": previousState,
+			"state":          nextState,
+		}))
+	}
+	return entries
+}
+
+func currentTurnPlanExecutionHash(conversation *ConversationFile, turnSeq int64) string {
+	for index := len(conversation.Entries) - 1; index >= 0; index-- {
+		entry := conversation.Entries[index]
+		if entry.TurnSeq != turnSeq || strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if err := json.Unmarshal(entry.Payload, &payload); err != nil || strings.TrimSpace(payload.Type) != "plan_execution_started" {
+			continue
+		}
+		return strings.TrimSpace(readStringValue(payload.Value["plan_hash"]))
+	}
+	return ""
+}
+
+func parsePlanWaveDefinitions(planText string) []planWaveDefinition {
+	lines := strings.Split(strings.ReplaceAll(planText, "\r\n", "\n"), "\n")
+	waves := make([]planWaveDefinition, 0, 4)
+	currentIndex := -1
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(strings.ToLower(line), "### wave ") {
+			name := strings.TrimSpace(strings.TrimPrefix(line, "###"))
+			waves = append(waves, planWaveDefinition{Name: name})
+			currentIndex = len(waves) - 1
+			continue
+		}
+		if currentIndex < 0 || !strings.HasPrefix(line, "-") {
+			continue
+		}
+		firstTick := strings.Index(line, "`")
+		if firstTick < 0 {
+			continue
+		}
+		remaining := line[firstTick+1:]
+		secondTick := strings.Index(remaining, "`")
+		if secondTick < 0 {
+			continue
+		}
+		taskID := strings.TrimSpace(remaining[:secondTick])
+		if taskID == "" || strings.ContainsAny(taskID, " /\\") {
+			continue
+		}
+		waves[currentIndex].TaskIDs = appendUniqueString(waves[currentIndex].TaskIDs, taskID)
+	}
+	filtered := make([]planWaveDefinition, 0, len(waves))
+	for _, wave := range waves {
+		if len(wave.TaskIDs) > 0 {
+			filtered = append(filtered, wave)
+		}
+	}
+	return filtered
+}
+
+func appendUniqueString(items []string, value string) []string {
+	for _, item := range items {
+		if item == value {
+			return items
+		}
+	}
+	return append(items, value)
+}
+
+func planWaveTodoState(taskIDs []string, todos []*agentv1.TodoItem) string {
+	if len(taskIDs) == 0 {
+		return "pending"
+	}
+	byID := make(map[string]agentv1.TodoStatus, len(todos))
+	for _, todo := range todos {
+		if todo != nil {
+			byID[strings.TrimSpace(todo.GetId())] = todo.GetStatus()
+		}
+	}
+	allCompleted := true
+	anyInProgress := false
+	for _, taskID := range taskIDs {
+		status := byID[taskID]
+		switch status {
+		case agentv1.TodoStatus_TODO_STATUS_CANCELLED:
+			return "blocked"
+		case agentv1.TodoStatus_TODO_STATUS_COMPLETED:
+		case agentv1.TodoStatus_TODO_STATUS_IN_PROGRESS:
+			allCompleted = false
+			anyInProgress = true
+		default:
+			allCompleted = false
+		}
+	}
+	if allCompleted {
+		return "completed"
+	}
+	if anyInProgress {
+		return "in_progress"
+	}
+	return "pending"
 }
 
 func upsertCurrentPlanRegistryEntry(plans map[string]*agentv1.PlanRegistryEntry, planURI string) map[string]*agentv1.PlanRegistryEntry {
@@ -797,6 +991,9 @@ func buildTaskArgsFromMap(payload map[string]any) *agentv1.TaskArgs {
 		Mode:        taskModeFromReadonly(boolValue(valueByAlias(payload, "readonly", "readOnly"))),
 	}
 	if model := strings.TrimSpace(stringValue(valueByAlias(payload, "model"))); model != "" {
+		if effort := normalizeTaskThinkingEffort(stringValue(valueByAlias(payload, "thinking_effort", "thinkingEffort"))); effort != "" {
+			model = fmt.Sprintf("%s · %s", model, taskThinkingEffortDisplayName(effort))
+		}
 		args.Model = &model
 	}
 	if resume := strings.TrimSpace(stringValue(valueByAlias(payload, "resume"))); resume != "" {

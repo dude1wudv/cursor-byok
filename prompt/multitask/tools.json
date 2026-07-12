@@ -505,9 +505,23 @@
             "type": "string"
           },
           "model": {
-            "description": "Optional model to use for this agent. If not specified, inherits from parent. Prefer fast for quick, straightforward tasks to minimize cost and latency. Only select a different model when the task specifically benefits from it (e.g., deep reasoning, high-quality code review, multimodal input)",
+            "description": "Optional model for this subagent. Omit it to use the configured subagent default. Use fast for a low-cost configured fast worker, gpt-5.6-terra for normal implementation work, and gpt-5.6-sol only for unusually difficult reasoning, architecture, or high-quality review. A concrete model selected by the assigning agent takes precedence over the configured default.",
             "enum": [
-              "fast"
+              "fast",
+              "gpt-5.6-terra",
+              "gpt-5.6-sol"
+            ],
+            "type": "string"
+          },
+          "thinking_effort": {
+            "description": "Optional reasoning effort for this subagent. If omitted, inherit the parent run effort and then fall back to the selected model channel default.",
+            "enum": [
+              "disabled",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
             ],
             "type": "string"
           },

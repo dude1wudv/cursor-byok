@@ -3,12 +3,15 @@ package forwarder
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -119,14 +122,16 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 		overrideHit = true
 		matchedSubagentType = matched
 		selection = strings.TrimSpace(override.Selection)
-		switch selection {
-		case "model":
-			effectiveModelID = strings.TrimSpace(override.ModelID)
-		case "inherit":
-			effectiveModelID = strings.TrimSpace(parentModelID)
-		case "disabled":
+		if selection == "disabled" {
 			disabled = true
 			effectiveModelID = ""
+		} else if !isConcreteTaskModelSelection(taskRequestedModelID) {
+			switch selection {
+			case "model":
+				effectiveModelID = strings.TrimSpace(override.ModelID)
+			case "inherit":
+				effectiveModelID = strings.TrimSpace(parentModelID)
+			}
 		}
 	}
 	if effectiveModelID == "" && !disabled {
@@ -157,6 +162,10 @@ func rewriteTaskInvocationModelForDisplay(invocation runtimecore.ToolInvocation,
 		return invocation
 	}
 	subagentType := readStringMapValue(args, "subagent_type", "subagentType")
+	requestedModelID := readStringMapValue(args, "model", "model_id", "modelId")
+	if isConcreteTaskModelSelection(requestedModelID) {
+		return invocation
+	}
 	override, _, ok := runtimecore.LookupSubagentModelOverride(overrides, subagentType)
 	if !ok {
 		return invocation
@@ -180,6 +189,11 @@ func rewriteTaskInvocationModelForDisplay(invocation runtimecore.ToolInvocation,
 	}
 	invocation.ArgsJSON = rewrittenArgs
 	return invocation
+}
+
+func isConcreteTaskModelSelection(modelID string) bool {
+	normalized := strings.TrimSpace(modelID)
+	return normalized != "" && !strings.EqualFold(normalized, "fast")
 }
 
 func readStringMapValue(args map[string]any, keys ...string) string {
@@ -262,6 +276,8 @@ type Service struct {
 	execBridge         execbridge.ExecBridge
 	interactionBridge  interactionbridge.InteractionBridge
 	appendSeq          *appendSequenceTracker
+	subagentLaunchMu   sync.Mutex
+	pendingSubagents   []pendingSubagentLaunch
 }
 
 type agentModelMemory interface {
@@ -618,6 +634,9 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		}
 		intent.UserMessage = extractConversationActionUserMessage(action)
 		intent.RequestContext = extractConversationActionRequestContext(action)
+		if item, ok := action.GetAction().(*agentv1.ConversationAction_ExecutePlanAction); ok {
+			populateExecutePlanIntent(&intent, item.ExecutePlanAction)
+		}
 		intent.StartsRun = conversationActionStartsRun(action)
 		intent.Mode, intent.ModeSource, intent.HasExplicitMode, err = extractConversationActionMode(action)
 		if err != nil {
@@ -677,6 +696,31 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 	return intent, nil
 }
 
+func populateExecutePlanIntent(intent *InboundIntent, action *agentv1.ExecutePlanAction) {
+	if intent == nil || action == nil {
+		return
+	}
+	intent.ExecutePlan = true
+	intent.ExecutePlanID = strings.TrimSpace(action.GetPlanId())
+	intent.ExecutePlanFileURI = strings.TrimSpace(action.GetPlanFileUri())
+	intent.ExecutePlanFilePath = strings.TrimSpace(action.GetPlanFilePath())
+	intent.ExecutePlanKickoffID = strings.TrimSpace(action.GetKickoffMessageId())
+	intent.ExecutePlanText = firstNonEmpty(
+		strings.TrimSpace(action.GetPlanFileContent()),
+		strings.TrimSpace(action.GetPlan().GetPlan()),
+	)
+	intent.ExecutePlanHash = planContentHash(intent.ExecutePlanText)
+}
+
+func planContentHash(planText string) string {
+	text := strings.TrimSpace(planText)
+	if text == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
+
 // handleRunIntent 处理 run/prewarm 类 intent，负责建会话、写 turn 和拉起 provider。
 func (service *Service) handleRunIntent(intent InboundIntent) error {
 	intent.UserMessage = normalizeUserMessageForStorage(intent.UserMessage)
@@ -687,9 +731,31 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 			"[canceled] Superseded by newer request",
 		)
 	}
+	var matchedLaunch pendingSubagentLaunch
+	var hasMatchedLaunch bool
+	if isChildConversationSubagentTypeName(intent.SubagentTypeName) {
+		matchedLaunch, hasMatchedLaunch = service.consumePendingSubagentLaunch(
+			intent.SubagentTypeName,
+			intent.ModelID,
+			userMessageText(intent.UserMessage),
+		)
+		if hasMatchedLaunch && strings.TrimSpace(intent.ThinkingEffort) == "" {
+			intent.ThinkingEffort = matchedLaunch.ThinkingEffort
+		}
+	}
 	conversation, effectiveMode, turnSeq, initialEntries, err := service.bootstrapRuntimeConversation(intent)
 	if err != nil {
 		return err
+	}
+	if hasMatchedLaunch {
+		conversation.ParentConversationID = matchedLaunch.ParentConversationID
+		conversation.ParentToolCallID = matchedLaunch.ParentToolCallID
+		if strings.TrimSpace(matchedLaunch.RootConversationID) != "" {
+			conversation.RootConversationID = matchedLaunch.RootConversationID
+		}
+	}
+	if strings.TrimSpace(intent.ThinkingEffort) == "" && isChildConversationSubagentTypeName(conversation.SubagentTypeName) {
+		intent.ThinkingEffort = service.resolveSubagentDispatchThinkingEffort(conversation)
 	}
 	rewindDecision := service.decideRunRewind(intent, conversation)
 	if rewindDecision.Evaluated && !rewindDecision.Apply {
@@ -790,6 +856,11 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		"subagent_model_override_count": len(intent.SubagentModelOverrides),
 		"subagent_model_overrides":      subagentModelOverrideSummaries(intent.SubagentModelOverrides),
 		"latest_user_text":              userMessageText(intent.UserMessage),
+		"execute_plan":                  intent.ExecutePlan,
+		"execute_plan_id":               strings.TrimSpace(intent.ExecutePlanID),
+		"execute_plan_hash":             strings.TrimSpace(intent.ExecutePlanHash),
+		"execute_plan_file_uri":         strings.TrimSpace(intent.ExecutePlanFileURI),
+		"execute_plan_file_path":        strings.TrimSpace(intent.ExecutePlanFilePath),
 	})
 	if err := service.publishCheckpoint(intent.RequestID, intent.ConversationID); err != nil {
 		return err
@@ -2387,6 +2458,12 @@ func buildRunEntries(intent InboundIntent, effectiveMode agentv1.AgentMode, turn
 		modeEntry,
 		newMetadataEntry(turnSeq, intent.RequestID, "run_request", buildRunRequestMetadata(intent)),
 	)
+	if intent.ExecutePlan {
+		entries = append(entries, newMetadataEntry(turnSeq, intent.RequestID, "plan_execution_started", buildPlanExecutionMetadata(intent)))
+		if context := buildPlanExecutionPromptContext(intent); isReplayablePromptContext(context) {
+			entries = append(entries, newPromptContextEntry(turnSeq, intent.RequestID, context))
+		}
+	}
 	if intent.HasExplicitMode {
 		entries = append(entries, newModeChangePromptContextEntry(turnSeq, intent.RequestID, effectiveMode))
 	}
@@ -2398,6 +2475,18 @@ func buildRunRequestMetadata(intent InboundIntent) map[string]any {
 		"model_id":   intent.ModelID,
 		"model_name": intent.ModelName,
 		"prewarm":    intent.Prewarm,
+	}
+}
+
+func buildPlanExecutionMetadata(intent InboundIntent) map[string]any {
+	return map[string]any{
+		"plan_id":            strings.TrimSpace(intent.ExecutePlanID),
+		"plan_file_uri":      strings.TrimSpace(intent.ExecutePlanFileURI),
+		"plan_file_path":     strings.TrimSpace(intent.ExecutePlanFilePath),
+		"kickoff_message_id": strings.TrimSpace(intent.ExecutePlanKickoffID),
+		"plan_hash":          strings.TrimSpace(intent.ExecutePlanHash),
+		"plan_text_present":  strings.TrimSpace(intent.ExecutePlanText) != "",
+		"status":             "started",
 	}
 }
 
@@ -2703,6 +2792,7 @@ func extractRunMode(message *agentv1.AgentClientMessage) (agentv1.AgentMode, Mod
 			if mode := item.ExecutePlanAction.GetExecutionMode(); mode != agentv1.AgentMode_AGENT_MODE_UNSPECIFIED {
 				return resolveExplicitMode(mode, ModeSourceExecutePlanAction)
 			}
+			return resolveExplicitMode(agentv1.AgentMode_AGENT_MODE_AGENT, ModeSourceExecutePlanAction)
 		}
 	}
 	if message != nil && message.GetRunRequest() != nil && message.GetRunRequest().GetConversationState() != nil {
@@ -2736,6 +2826,7 @@ func extractConversationActionMode(action *agentv1.ConversationAction) (agentv1.
 		if item.ExecutePlanAction != nil && item.ExecutePlanAction.GetExecutionMode() != agentv1.AgentMode_AGENT_MODE_UNSPECIFIED {
 			return resolveExplicitMode(item.ExecutePlanAction.GetExecutionMode(), ModeSourceExecutePlanAction)
 		}
+		return resolveExplicitMode(agentv1.AgentMode_AGENT_MODE_AGENT, ModeSourceExecutePlanAction)
 	}
 	return agentv1.AgentMode_AGENT_MODE_AGENT, ModeSourceUnknown, false, nil
 }

@@ -760,6 +760,11 @@ func (bridge *Bridge) openForceBackgroundShell(toolCall runtimecore.ToolInvocati
 	}, nil
 }
 
+func isConcreteTaskModelSelection(modelID string) bool {
+	normalized := strings.TrimSpace(modelID)
+	return normalized != "" && !strings.EqualFold(normalized, "fast")
+}
+
 // openTask 构造 Task 对应的执行桥请求。
 func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore.ToolInvocation) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error) {
 	args, err := decodeArgsMap(toolCall.ArgsJSON)
@@ -778,13 +783,17 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 	taskRequestedModelID := strings.TrimSpace(readStringArg(args, "model", "model_id", "modelId"))
 	modelID := taskRequestedModelID
 	if override, _, ok := runtimecore.LookupSubagentModelOverride(openContext.SubagentModelOverrides, subagentType); ok {
-		switch strings.TrimSpace(override.Selection) {
-		case "disabled":
+		selection := strings.TrimSpace(override.Selection)
+		if selection == "disabled" {
 			return nil, runtimecore.PendingExec{}, fmt.Errorf("subagent type %q is disabled by model override", subagentType)
-		case "model":
-			modelID = strings.TrimSpace(override.ModelID)
-		case "inherit":
-			modelID = strings.TrimSpace(openContext.ModelID)
+		}
+		if !isConcreteTaskModelSelection(taskRequestedModelID) {
+			switch selection {
+			case "model":
+				modelID = strings.TrimSpace(override.ModelID)
+			case "inherit":
+				modelID = strings.TrimSpace(openContext.ModelID)
+			}
 		}
 	}
 	if modelID == "" {
@@ -1754,11 +1763,15 @@ func buildReadLintsCompletedToolCall(argsJSON []byte, result *agentv1.Diagnostic
 func buildTaskCompletedToolCall(argsJSON []byte, result *agentv1.SubagentResult) *agentv1.ToolCall {
 	args, _ := decodeArgsMap(argsJSON)
 	readonly := readBoolArg(args, "readonly", "readOnly")
+	model := strings.TrimSpace(readStringArg(args, "model"))
+	if effort := taskThinkingEffortDisplayName(readStringArg(args, "thinking_effort", "thinkingEffort")); model != "" && effort != "" {
+		model = fmt.Sprintf("%s · %s", model, effort)
+	}
 	taskArgs := &agentv1.TaskArgs{
 		Description:  strings.TrimSpace(readStringArg(args, "description")),
 		Prompt:       strings.TrimSpace(readStringArg(args, "prompt")),
 		SubagentType: subagentTypeProtoFromString(strings.TrimSpace(readStringArg(args, "subagent_type", "subagentType"))),
-		Model:        stringPtr(strings.TrimSpace(readStringArg(args, "model"))),
+		Model:        stringPtr(model),
 		Resume:       stringPtr(strings.TrimSpace(readStringArg(args, "resume"))),
 		Attachments:  readStringSliceArg(args, "attachments"),
 		Mode:         taskModeFromReadonly(readonly),
@@ -1773,6 +1786,25 @@ func buildTaskCompletedToolCall(argsJSON []byte, result *agentv1.SubagentResult)
 				Result: convertSubagentResultToTaskResult(result),
 			},
 		},
+	}
+}
+
+func taskThinkingEffortDisplayName(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "disabled":
+		return "Disabled"
+	case "low":
+		return "Low"
+	case "medium":
+		return "Medium"
+	case "high":
+		return "High"
+	case "xhigh":
+		return "XHigh"
+	case "max":
+		return "Max"
+	default:
+		return ""
 	}
 }
 

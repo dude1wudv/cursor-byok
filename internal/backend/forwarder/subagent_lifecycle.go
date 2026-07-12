@@ -16,6 +16,17 @@ const (
 	subagentDispatchReservation = "subagent_dispatch_reserved"
 )
 
+type pendingSubagentLaunch struct {
+	ParentConversationID string
+	ParentToolCallID     string
+	RootConversationID   string
+	SubagentType         string
+	ModelID              string
+	PromptHash           string
+	ThinkingEffort       string
+	CreatedAt            time.Time
+}
+
 type subagentDispatchDecision struct {
 	Depth        int
 	Used         int
@@ -36,6 +47,7 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		return decision, fmt.Errorf("decode Task args: %w", err)
 	}
 	decision.SubagentType = readStringMapValue(args, "subagent_type", "subagentType")
+	requestedThinkingEffort := normalizeTaskThinkingEffort(readStringMapValue(args, "thinking_effort", "thinkingEffort"))
 	callID := strings.TrimSpace(invocation.CallID)
 	if callID == "" {
 		return decision, fmt.Errorf("Task tool_call_id is required")
@@ -51,6 +63,7 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 	turnSeq := stream.TurnSeq
 	requestID := stream.RequestID
 	conversationID := stream.ConversationID
+	parentThinkingEffort := normalizeTaskThinkingEffort(stream.ThinkingEffort)
 	stream.mu.Unlock()
 	if conversation == nil {
 		return decision, fmt.Errorf("subagent dispatch conversation is unavailable")
@@ -79,18 +92,35 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		}
 		return decision, fmt.Errorf("Task limit reached: %d direct subagents per subagent conversation", subagentDispatchLimit)
 	}
+	effectiveThinkingEffort := requestedThinkingEffort
+	if effectiveThinkingEffort == "" {
+		effectiveThinkingEffort = parentThinkingEffort
+	}
 	if _, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
 		newMetadataEntry(turnSeq, requestID, subagentDispatchReservation, map[string]any{
-			"tool_call_id":           strings.TrimSpace(invocation.CallID),
-			"turn_seq":               turnSeq,
-			"parent_conversation_id": strings.TrimSpace(conversationID),
-			"depth":                  depth,
-			"subagent_type":          strings.TrimSpace(decision.SubagentType),
-			"quota_scope":            decision.QuotaScope,
+			"tool_call_id":              strings.TrimSpace(invocation.CallID),
+			"turn_seq":                  turnSeq,
+			"parent_conversation_id":    strings.TrimSpace(conversationID),
+			"depth":                     depth,
+			"subagent_type":             strings.TrimSpace(decision.SubagentType),
+			"requested_model_id":        readStringMapValue(args, "model", "model_id", "modelId"),
+			"requested_thinking_effort": requestedThinkingEffort,
+			"effective_thinking_effort": effectiveThinkingEffort,
+			"quota_scope":               decision.QuotaScope,
 		}),
 	}); err != nil {
 		return decision, fmt.Errorf("reserve subagent dispatch: %w", err)
 	}
+	service.registerPendingSubagentLaunch(pendingSubagentLaunch{
+		ParentConversationID: strings.TrimSpace(conversationID),
+		ParentToolCallID:     strings.TrimSpace(invocation.CallID),
+		RootConversationID:   strings.TrimSpace(conversation.RootConversationID),
+		SubagentType:         strings.TrimSpace(decision.SubagentType),
+		ModelID:              readStringMapValue(args, "model", "model_id", "modelId"),
+		PromptHash:           planContentHash(readStringMapValue(args, "prompt")),
+		ThinkingEffort:       effectiveThinkingEffort,
+		CreatedAt:            time.Now().UTC(),
+	})
 	decision.Used++
 	return decision, nil
 }
@@ -134,6 +164,106 @@ func (service *Service) resolveSubagentDepth(conversation *ConversationFile) (in
 		}
 		current = parent
 	}
+}
+
+func (service *Service) registerPendingSubagentLaunch(launch pendingSubagentLaunch) {
+	if service == nil || launch.PromptHash == "" {
+		return
+	}
+	service.subagentLaunchMu.Lock()
+	defer service.subagentLaunchMu.Unlock()
+	cutoff := time.Now().UTC().Add(-subagentExecutionTimeout)
+	retained := service.pendingSubagents[:0]
+	for _, item := range service.pendingSubagents {
+		if item.CreatedAt.After(cutoff) {
+			retained = append(retained, item)
+		}
+	}
+	service.pendingSubagents = append(retained, launch)
+}
+
+func (service *Service) consumePendingSubagentLaunch(subagentType string, modelID string, prompt string) (pendingSubagentLaunch, bool) {
+	if service == nil {
+		return pendingSubagentLaunch{}, false
+	}
+	promptHash := planContentHash(prompt)
+	if promptHash == "" {
+		return pendingSubagentLaunch{}, false
+	}
+	normalizedType := strings.TrimSpace(subagentType)
+	normalizedModel := strings.TrimSpace(modelID)
+	service.subagentLaunchMu.Lock()
+	defer service.subagentLaunchMu.Unlock()
+	cutoff := time.Now().UTC().Add(-subagentExecutionTimeout)
+	for index, item := range service.pendingSubagents {
+		if item.CreatedAt.Before(cutoff) || item.PromptHash != promptHash || !strings.EqualFold(item.SubagentType, normalizedType) {
+			continue
+		}
+		if isConcreteTaskModelSelection(item.ModelID) && !strings.EqualFold(item.ModelID, normalizedModel) {
+			continue
+		}
+		service.pendingSubagents = append(service.pendingSubagents[:index], service.pendingSubagents[index+1:]...)
+		return item, true
+	}
+	return pendingSubagentLaunch{}, false
+}
+
+func normalizeTaskThinkingEffort(raw string) string {
+	switch normalized := strings.ToLower(strings.TrimSpace(raw)); normalized {
+	case "disabled", "low", "medium", "high", "xhigh", "max":
+		return normalized
+	default:
+		return ""
+	}
+}
+
+func taskThinkingEffortDisplayName(effort string) string {
+	switch normalizeTaskThinkingEffort(effort) {
+	case "disabled":
+		return "Disabled"
+	case "low":
+		return "Low"
+	case "medium":
+		return "Medium"
+	case "high":
+		return "High"
+	case "xhigh":
+		return "XHigh"
+	case "max":
+		return "Max"
+	default:
+		return ""
+	}
+}
+
+func (service *Service) resolveSubagentDispatchThinkingEffort(conversation *ConversationFile) string {
+	if service == nil || service.store == nil || conversation == nil {
+		return ""
+	}
+	parentConversationID := strings.TrimSpace(conversation.ParentConversationID)
+	parentToolCallID := strings.TrimSpace(conversation.ParentToolCallID)
+	if parentConversationID == "" || parentToolCallID == "" {
+		return ""
+	}
+	parent, err := service.store.LoadConversation(parentConversationID)
+	if err != nil || parent == nil {
+		return ""
+	}
+	for index := len(parent.Entries) - 1; index >= 0; index-- {
+		entry := parent.Entries[index]
+		if strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if err := json.Unmarshal(entry.Payload, &payload); err != nil || strings.TrimSpace(payload.Type) != subagentDispatchReservation {
+			continue
+		}
+		if strings.TrimSpace(readStringValue(payload.Value["tool_call_id"])) != parentToolCallID {
+			continue
+		}
+		return normalizeTaskThinkingEffort(readStringValue(payload.Value["effective_thinking_effort"]))
+	}
+	return ""
 }
 
 func countSubagentDispatchReservations(entries []HistoryEntry, callID string, currentTurnOnly bool, turnSeq int64) (int, bool) {

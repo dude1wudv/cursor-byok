@@ -32,6 +32,32 @@
 
 最终希望做到：让你的模型 API 可以自由接入到你想使用的任何工具中。
 
+## plan-docs 波次计划 Skill
+
+仓库内提供兼容 Cursor Agent Skills 的 `plan-docs`。它会在 Plan 模式中把复杂任务整理为依赖图和执行波次，并约束 Agent 只执行最早未完成波次：独立任务可以并行派遣 Subagent，共享文件或简单任务由主线完成。
+
+安装到当前用户的所有 Cursor 项目：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-plan-docs.ps1
+```
+
+检查用户目录中的 Skill 是否与仓库一致：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-plan-docs.ps1 -Check
+```
+
+如果目标位置已有不同版本，先备份并覆盖：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-plan-docs.ps1 -Force
+```
+
+安装后重启 Cursor 或 Reload Window。可以输入 `/plan-docs` 显式调用，也可以在 Plan 模式中提出“生成并行波次计划”“按依赖拆分任务”等请求自动触发。
+
+Skill 唯一源位于 `skills/plan-docs/`；`%USERPROFILE%/.cursor/skills/plan-docs` 只是安装产物，更新仓库后重新运行安装脚本即可同步。
+
 
 
 

@@ -89,6 +89,14 @@ func (service *Service) bootstrapRuntimeConversation(intent InboundIntent) (*Con
 	} else if conversation.TokenDetailsMaxTokens == 0 {
 		conversation.TokenDetailsMaxTokens = projectedConversationMaxTokens
 	}
+	if intent.ExecutePlan && strings.TrimSpace(intent.ExecutePlanText) == "" {
+		structuredState, stateErr := projectConversationStructuredState(conversation)
+		if stateErr != nil {
+			return nil, agentv1.AgentMode_AGENT_MODE_AGENT, 0, nil, stateErr
+		}
+		intent.ExecutePlanText = strings.TrimSpace(structuredState.PlanText)
+		intent.ExecutePlanHash = planContentHash(intent.ExecutePlanText)
+	}
 	turnSeq := conversation.NextTurnSeq
 	if turnSeq <= 0 {
 		turnSeq = 1

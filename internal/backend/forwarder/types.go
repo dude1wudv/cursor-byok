@@ -408,6 +408,13 @@ type InboundIntent struct {
 	HasExplicitMode          bool
 	ModeSource               ModeSource
 	StartsRun                bool
+	ExecutePlan              bool
+	ExecutePlanID            string
+	ExecutePlanFileURI       string
+	ExecutePlanFilePath      string
+	ExecutePlanKickoffID     string
+	ExecutePlanText          string
+	ExecutePlanHash          string
 	SubagentTypeName         string
 	SubagentModelOverrides   map[string]runtimecore.SubagentModelOverrideSelection
 	ConversationState        *agentv1.ConversationStateStructure

@@ -630,6 +630,9 @@ func (service *Service) rewriteTaskToolCallModelForDisplay(stream *ActiveStream,
 	if taskToolCall == nil || taskToolCall.GetArgs() == nil {
 		return toolCall
 	}
+	if isConcreteTaskModelSelection(taskToolCall.GetArgs().GetModel()) {
+		return toolCall
+	}
 	subagentType := taskSubagentTypeNameForDisplay(taskToolCall.GetArgs().GetSubagentType())
 	stream.mu.Lock()
 	parentModelID := strings.TrimSpace(stream.ModelID)
