@@ -77,6 +77,13 @@ func (service *Service) bootstrapRuntimeConversation(intent InboundIntent) (*Con
 	if strings.TrimSpace(intent.SubagentTypeName) != "" {
 		conversation.SubagentTypeName = strings.TrimSpace(intent.SubagentTypeName)
 	}
+	if conversation.SubagentDepth <= 0 {
+		if depth, depthErr := service.resolveSubagentDepth(conversation); depthErr == nil {
+			conversation.SubagentDepth = depth
+		} else if !isChildConversationSubagentTypeName(conversation.SubagentTypeName) {
+			conversation.SubagentDepth = 1
+		}
+	}
 	if contextWindowTokens > 0 {
 		conversation.TokenDetailsMaxTokens = contextWindowTokens
 	} else if conversation.TokenDetailsMaxTokens == 0 {
@@ -130,6 +137,7 @@ func (service *Service) syncConversationRecord(conversationID string, conversati
 		item.ParentConversationID = conversation.ParentConversationID
 		item.ParentToolCallID = conversation.ParentToolCallID
 		item.SubagentTypeName = conversation.SubagentTypeName
+		item.SubagentDepth = conversation.SubagentDepth
 		item.Mode = conversation.Mode
 		item.TokenDetailsUsedTokens = conversation.TokenDetailsUsedTokens
 		item.TokenDetailsMaxTokens = conversation.TokenDetailsMaxTokens

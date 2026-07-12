@@ -2,6 +2,7 @@
 package forwarder
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -54,6 +55,10 @@ func (compiler *DefaultPromptCompiler) Compile(conversation *ConversationFile, m
 		return CompiledConversation{}, err
 	}
 	tools, _, err := compiler.catalog.Load(normalizedMode, subagentTypeName)
+	if err != nil {
+		return CompiledConversation{}, err
+	}
+	tools, _, err = filterTaskToolAtMaximumSubagentDepth(conversation, tools, nil)
 	if err != nil {
 		return CompiledConversation{}, err
 	}
@@ -112,6 +117,10 @@ func (compiler *DefaultPromptCompiler) DerivePromptContexts(conversation *Conver
 	if err != nil {
 		return nil, err
 	}
+	_, toolNames, err = filterTaskToolAtMaximumSubagentDepth(conversation, nil, toolNames)
+	if err != nil {
+		return nil, err
+	}
 	replayMessages, err := compiler.projector.ProjectPromptReplay(conversation)
 	if err != nil {
 		return nil, err
@@ -134,6 +143,29 @@ func (compiler *DefaultPromptCompiler) DerivePromptContexts(conversation *Conver
 		candidates[index].Persist = true
 	}
 	return filterCurrentTurnPromptContexts(conversation, candidates), nil
+}
+
+func filterTaskToolAtMaximumSubagentDepth(conversation *ConversationFile, tools []json.RawMessage, toolNames []string) ([]json.RawMessage, []string, error) {
+	if conversation == nil || conversation.SubagentDepth < subagentMaximumDepth {
+		return tools, toolNames, nil
+	}
+	filteredTools := make([]json.RawMessage, 0, len(tools))
+	for _, tool := range tools {
+		name, err := extractToolName(tool)
+		if err != nil {
+			return nil, nil, err
+		}
+		if name != "Task" {
+			filteredTools = append(filteredTools, tool)
+		}
+	}
+	filteredNames := make([]string, 0, len(toolNames))
+	for _, name := range toolNames {
+		if strings.TrimSpace(name) != "Task" {
+			filteredNames = append(filteredNames, name)
+		}
+	}
+	return filteredTools, filteredNames, nil
 }
 
 func (compiler *DefaultPromptCompiler) stableReplayMessageCount(conversation *ConversationFile, replayMessages []modeladapter.Message) (int, error) {

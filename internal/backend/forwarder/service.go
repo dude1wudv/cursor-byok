@@ -1650,6 +1650,28 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	if !isToolAllowedInMode(mode, subagentTypeName, trimmedToolName) {
 		return service.completePreDispatchToolError(stream, invocation, nil, false, false, fmt.Errorf("tool invocation is not enabled in mode %s: %s", mode.String(), invocation.ToolName))
 	}
+	if trimmedToolName == "Task" {
+		decision, quotaErr := service.validateAndReserveSubagentDispatch(stream, invocation)
+		quotaErrorText := ""
+		if quotaErr != nil {
+			quotaErrorText = quotaErr.Error()
+		}
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "subagent_dispatch_quota", map[string]any{
+			"tool_call_id":  strings.TrimSpace(invocation.CallID),
+			"depth":         decision.Depth,
+			"quota_scope":   decision.QuotaScope,
+			"used":          decision.Used,
+			"limit":         decision.Limit,
+			"resume":        decision.Resume,
+			"duplicate":     decision.Duplicate,
+			"subagent_type": decision.SubagentType,
+			"allowed":       quotaErr == nil,
+			"error":         quotaErrorText,
+		})
+		if quotaErr != nil {
+			return service.completePreDispatchToolError(stream, invocation, nil, false, false, quotaErr)
+		}
+	}
 	var err error
 	invocation, err = service.sanitizeCreatePlanInvocationForCurrentPlan(stream, invocation)
 	if err != nil {

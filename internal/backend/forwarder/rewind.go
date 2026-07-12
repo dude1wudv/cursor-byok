@@ -260,6 +260,7 @@ func applyRunRewindMetadata(conversation *ConversationFile, source *Conversation
 		conversation.ParentConversationID = strings.TrimSpace(source.ParentConversationID)
 		conversation.ParentToolCallID = strings.TrimSpace(source.ParentToolCallID)
 		conversation.SubagentTypeName = strings.TrimSpace(source.SubagentTypeName)
+		conversation.SubagentDepth = source.SubagentDepth
 		if strings.TrimSpace(source.Mode) != "" {
 			conversation.Mode = strings.TrimSpace(source.Mode)
 		}

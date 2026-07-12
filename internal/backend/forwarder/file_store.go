@@ -663,6 +663,9 @@ func mergeConversationMetadata(target *ConversationFile, source *ConversationFil
 	target.ParentConversationID = strings.TrimSpace(source.ParentConversationID)
 	target.ParentToolCallID = strings.TrimSpace(source.ParentToolCallID)
 	target.SubagentTypeName = strings.TrimSpace(source.SubagentTypeName)
+	if source.SubagentDepth > 0 {
+		target.SubagentDepth = source.SubagentDepth
+	}
 	if strings.TrimSpace(source.Mode) != "" {
 		target.Mode = strings.TrimSpace(source.Mode)
 	}
