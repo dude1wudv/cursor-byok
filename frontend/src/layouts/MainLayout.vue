@@ -112,6 +112,8 @@ async function handleOpenAuthorHome() {
   const confirmed = await showModal({
     title: footerAuthorInfo.value.dialogTitle,
     content: footerAuthorInfo.value.dialogContent,
+    detailsTitle: footerAuthorInfo.value.dialogDetailsTitle,
+    detailsContent: footerAuthorInfo.value.dialogDetailsContent,
     confirmText: footerAuthorInfo.value.dialogConfirmText,
     cancelText: footerAuthorInfo.value.dialogCancelText,
     showCancel: true,

@@ -495,6 +495,12 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 		shouldEmitSyntheticThinking := false
 		suppressThinkingCompleted := false
 		completedDuration := event.ThinkingDurationMS
+		if strings.TrimSpace(event.ThinkingSignature) == "" {
+			stream.mu.Lock()
+			suppressThinkingCompleted = stream.ProviderSyntheticThinkingPublished &&
+				strings.TrimSpace(stream.ProviderAccumulatedReasoning) == ""
+			stream.mu.Unlock()
+		}
 		if strings.TrimSpace(event.ThinkingSignature) != "" {
 			stream.mu.Lock()
 			stream.ProviderAccumulatedReasoningSignature = strings.TrimSpace(event.ThinkingSignature)

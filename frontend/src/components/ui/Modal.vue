@@ -5,6 +5,8 @@ const props = defineProps({
   visible: { type: Boolean, default: false },
   title: { type: String, default: "提示" },
   content: { type: String, default: "" },
+  detailsTitle: { type: String, default: "" },
+  detailsContent: { type: String, default: "" },
   confirmText: { type: String, default: "确定" },
   cancelText: { type: String, default: "取消" },
   showCancel: { type: Boolean, default: true },
@@ -47,9 +49,23 @@ function onMaskClick() {
               <h3 class="mb-3 text-base font-medium text-white">
                 {{ title }}
               </h3>
-              <p class="mb-5 max-h-[55vh] overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed text-[#a3a3a3]">
+              <p
+                class="max-h-[55vh] overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed text-[#a3a3a3]"
+                :class="detailsContent ? 'mb-3' : 'mb-5'"
+              >
                 {{ content }}
               </p>
+              <details
+                v-if="detailsContent"
+                class="mb-5 rounded-[6px] border border-[#3a3a3a] bg-[#242424] px-3 py-2 text-sm text-[#a3a3a3]"
+              >
+                <summary class="cursor-pointer select-none text-[#d4d4d4]">
+                  {{ detailsTitle || "详细信息" }}
+                </summary>
+                <div class="mt-2 whitespace-pre-wrap leading-relaxed">
+                  {{ detailsContent }}
+                </div>
+              </details>
               <div class="flex justify-end gap-2">
                 <Button v-if="showCancel" variant="default" @click="handleCancel">{{ cancelText }}</Button>
                 <Button variant="primary" :disabled="confirmDisabled" @click="handleConfirm">{{ confirmText }}</Button>

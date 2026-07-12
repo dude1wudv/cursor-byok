@@ -1087,6 +1087,10 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	thinkingStarted := time.Time{}
 	thinkingActive := false
 	emittedReasoningSignature := ""
+	pendingReasoningSignature := ""
+	pendingReasoningItemID := ""
+	pendingReasoningStatus := ""
+	var pendingReasoningSummary json.RawMessage
 	thinkParser := &openAIThinkTagParser{}
 	toolKey := func(itemID string, outputIndex int) string {
 		if strings.TrimSpace(itemID) != "" {
@@ -1102,25 +1106,55 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		return reason
 	}
 	flushThinkingCompleted := func() error {
-		if !thinkingActive {
+		if !thinkingActive && pendingReasoningSignature == "" {
 			return nil
 		}
-		duration := int32(time.Since(thinkingStarted).Milliseconds())
-		if duration < 0 {
-			duration = 0
+		if !thinkingActive {
+			if summaryText := openAIResponsesReasoningSummaryText(pendingReasoningSummary); summaryText != "" {
+				streamIdle.MarkEffectiveContent()
+				thinkingStarted = time.Now()
+				thinkingActive = true
+				if err := sink(ModelEvent{
+					Kind:          ModelEventKindThinkingDelta,
+					OccurredAt:    time.Now().UTC(),
+					Provider:      "openai",
+					Model:         currentModel,
+					Text:          summaryText,
+					ThinkingStyle: agentv1.ThinkingStyle_THINKING_STYLE_DEFAULT,
+				}); err != nil {
+					return err
+				}
+			}
 		}
-		if err := sink(ModelEvent{
+		duration := int32(0)
+		if thinkingActive {
+			duration = int32(time.Since(thinkingStarted).Milliseconds())
+			if duration < 0 {
+				duration = 0
+			}
+		}
+		event := ModelEvent{
 			Kind:               ModelEventKindThinkingCompleted,
 			OccurredAt:         time.Now().UTC(),
 			Provider:           "openai",
 			Model:              currentModel,
 			ThinkingDurationMS: duration,
-		}); err != nil {
-			return err
+		}
+		if pendingReasoningSignature != "" && pendingReasoningSignature != emittedReasoningSignature {
+			event.ThinkingSignature = pendingReasoningSignature
+			event.ThinkingSignatureSource = ReasoningSignatureSourceOpenAIResponses
+			event.ProviderItemID = pendingReasoningItemID
+			event.ProviderStatus = pendingReasoningStatus
+			event.ProviderSummary = cloneRawJSON(pendingReasoningSummary)
+			emittedReasoningSignature = pendingReasoningSignature
 		}
 		thinkingActive = false
 		thinkingStarted = time.Time{}
-		return nil
+		pendingReasoningSignature = ""
+		pendingReasoningItemID = ""
+		pendingReasoningStatus = ""
+		pendingReasoningSummary = nil
+		return sink(event)
 	}
 	flushTurnFinished := func() error {
 		if !turnFinishedPending {
@@ -1351,33 +1385,21 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		streamIdle.MarkEffectiveContent()
 		return nil
 	}
-	emitReasoningSignature := func(signature string, providerItemID string, providerStatus string, providerSummary json.RawMessage) error {
+	rememberReasoningSignature := func(signature string, providerItemID string, providerStatus string, providerSummary json.RawMessage) error {
 		trimmedSignature := strings.TrimSpace(signature)
 		if trimmedSignature == "" || trimmedSignature == emittedReasoningSignature {
 			return nil
 		}
-		duration := int32(0)
-		if thinkingActive {
-			duration = int32(time.Since(thinkingStarted).Milliseconds())
-			if duration < 0 {
-				duration = 0
+		if pendingReasoningSignature != "" && pendingReasoningSignature != trimmedSignature {
+			if err := flushThinkingCompleted(); err != nil {
+				return err
 			}
-			thinkingActive = false
-			thinkingStarted = time.Time{}
 		}
-		emittedReasoningSignature = trimmedSignature
-		return sink(ModelEvent{
-			Kind:                    ModelEventKindThinkingCompleted,
-			OccurredAt:              time.Now().UTC(),
-			Provider:                "openai",
-			Model:                   currentModel,
-			ThinkingDurationMS:      duration,
-			ThinkingSignature:       trimmedSignature,
-			ThinkingSignatureSource: ReasoningSignatureSourceOpenAIResponses,
-			ProviderItemID:          strings.TrimSpace(providerItemID),
-			ProviderStatus:          strings.TrimSpace(providerStatus),
-			ProviderSummary:         cloneRawJSON(providerSummary),
-		})
+		pendingReasoningSignature = trimmedSignature
+		pendingReasoningItemID = strings.TrimSpace(providerItemID)
+		pendingReasoningStatus = strings.TrimSpace(providerStatus)
+		pendingReasoningSummary = cloneRawJSON(providerSummary)
+		return nil
 	}
 	applyFunctionCallItem := func(item openAIResponsesOutputItem, outputIndex int, complete bool) error {
 		if strings.TrimSpace(item.Type) != "function_call" {
@@ -1424,10 +1446,16 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	applyOutputItem := func(item openAIResponsesOutputItem, outputIndex int, complete bool) error {
 		switch strings.TrimSpace(item.Type) {
 		case "reasoning":
-			return emitReasoningSignature(item.EncryptedContent, item.ID, item.Status, item.Summary)
+			return rememberReasoningSignature(item.EncryptedContent, item.ID, item.Status, item.Summary)
 		case "function_call":
+			if err := flushThinkingCompleted(); err != nil {
+				return err
+			}
 			return applyFunctionCallItem(item, outputIndex, complete)
 		case "image_generation_call":
+			if err := flushThinkingCompleted(); err != nil {
+				return err
+			}
 			accumulator := rememberImageGenerationItem(item, outputIndex)
 			if !complete {
 				return emitImageGenerationStarted(accumulator)
@@ -1591,9 +1619,6 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			if err := flushTaggedContentTail(); err != nil {
 				return fail(err)
 			}
-			if err := flushThinkingCompleted(); err != nil {
-				return fail(err)
-			}
 			if event.Response != nil {
 				for index, item := range event.Response.Output {
 					if err := applyOutputItem(item, index, true); err != nil {
@@ -1604,6 +1629,9 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 				if event.Response.IncompleteDetails != nil && strings.TrimSpace(event.Response.IncompleteDetails.Reason) != "" {
 					finishReason = strings.TrimSpace(event.Response.IncompleteDetails.Reason)
 				}
+			}
+			if err := flushThinkingCompleted(); err != nil {
+				return fail(err)
 			}
 			turnFinishedPending = true
 		case "response.failed", "error":
@@ -1658,6 +1686,26 @@ func maxInt64(value int64, floor int64) int64 {
 		return floor
 	}
 	return value
+}
+
+func openAIResponsesReasoningSummaryText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var text strings.Builder
+	for _, part := range parts {
+		if strings.TrimSpace(part.Type) == "summary_text" {
+			text.WriteString(part.Text)
+		}
+	}
+	return text.String()
 }
 
 func cloneRawJSON(raw json.RawMessage) json.RawMessage {

@@ -1,12 +1,13 @@
 <template>
   <MainLayout />
   <MessageProvider />
-  <AdModelProvider v-if="isMainWindow" />
   <Modal
 
     :visible="modalState.visible"
     :title="modalState.title"
     :content="modalState.content"
+    :details-title="modalState.detailsTitle"
+    :details-content="modalState.detailsContent"
     :confirm-text="modalState.confirmText"
     :cancel-text="modalState.cancelText"
     :show-cancel="modalState.showCancel"
@@ -39,7 +40,6 @@
 </template>
 <script setup>
 import MainLayout from "@/layouts/MainLayout.vue";
-import AdModelProvider from "@/components/AdModelProvider.vue";
 import Modal from "@/components/ui/Modal.vue";
 import MessageProvider from "@/components/ui/MessageProvider.vue";
 import { modalState, resolveModal } from "@/composables/useModal";

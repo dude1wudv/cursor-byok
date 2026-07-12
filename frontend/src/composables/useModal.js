@@ -4,6 +4,8 @@ export const modalState = reactive({
   visible: false,
   title: "提示",
   content: "",
+  detailsTitle: "",
+  detailsContent: "",
   confirmText: "确定",
   cancelText: "取消",
   showCancel: true,
@@ -21,6 +23,8 @@ export function showModal(options = {}) {
     modalState.visible = true;
     modalState.title = options.title ?? "提示";
     modalState.content = options.content ?? "";
+    modalState.detailsTitle = options.detailsTitle ?? "";
+    modalState.detailsContent = options.detailsContent ?? "";
     modalState.confirmText = options.confirmText ?? "确定";
     modalState.cancelText = options.cancelText ?? "取消";
     modalState.showCancel = options.showCancel ?? true;
