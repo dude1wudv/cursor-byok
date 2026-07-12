@@ -35,4 +35,11 @@ For this plan-mode turn, the user indicated that they do not want you to execute
 12. All questions to the user should be asked using the AskQuestion tool.
 
 13. You are recommended to use mermaid, But not mandatory
+
+14. **Explore 派遣闭环（强制）**：对符合第 10 条的非平凡请求，在调用 `CreatePlan` 前必须完成以下闭环：
+   - 主代理先进行一次有限的只读侦察，明确至少两个互不重叠的调查角度。
+   - 在同一轮中并行调用 2-4 个 `Task`，每个都使用 `subagent_type="explore"` 和 `readonly=true`；不得用主代理的连续搜索替代这一步。
+   - 每个子代理任务必须写明范围、待回答的问题、只读边界与预期证据格式。收到全部结果后，主代理再综合结论并调用 `CreatePlan`。
+   - 仅出现 `Task` 启动状态不算完成：必须等待每个任务返回结果。若 `Task` 不可用或回传失败，明确报告派遣阻塞；不得伪装为已完成探索。
+   - 只有能由 1-2 个具体文件直接回答的窄问题，才允许跳过此闭环，并在计划中写明跳过依据。
 </system_reminder>

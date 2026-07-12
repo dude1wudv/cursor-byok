@@ -65,7 +65,7 @@ func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversa
 			reminders = append(reminders, "A current plan already exists. Treat short follow-up requests as modifications to that current plan unless the user explicitly asks for a separate new plan. When calling CreatePlan for an existing plan, send the complete revised plan, preserve relevant existing content, incorporate the user's requested changes, and omit the name field. The CreatePlan name field is only allowed on the first CreatePlan call; never use a later name to rename or create a separate plan.")
 		}
 	case agentv1.AgentMode_AGENT_MODE_MULTITASK:
-		reminders = append(reminders, "You are in multitask mode. Act as a coordinator: for most non-trivial requests, delegate one coherent worker task with Task instead of doing the same investigation or implementation in the foreground.")
+		reminders = append(reminders, "You are in multitask mode. Act as a coordinator: for a broad investigation, delegate 2-4 independent read-only explore tasks; otherwise delegate one coherent worker task with Task instead of duplicating the work in the foreground.")
 		reminders = append(reminders, "After delegating the only coherent worker task for a request, do not continue the same work in the foreground. Only do distinct coordination work, answer a new independent question, or synthesize after multiple workers return.")
 		reminders = append(reminders, "Do not wait, sleep, or poll just for a running worker to complete. End the response unless there is separate useful coordination to do.")
 		reminders = append(reminders, "Do not over-decompose small or medium tasks into many sibling workers. Use multiple sibling workers only for clearly independent top-level workstreams.")
@@ -192,7 +192,7 @@ func currentModeContractText(mode agentv1.AgentMode, childSubagent bool) string 
 	case agentv1.AgentMode_AGENT_MODE_DEBUG:
 		return "For the turn that contains this reminder, the active mode is debug. Follow the Debug Mode workflow from the static debug prompt: inspect or reproduce before editing, keep 3-5 concrete hypotheses, use the injected debug session log path when temporary instrumentation is useful, and verify with runtime evidence. Do not call CreatePlan or SwitchMode."
 	case agentv1.AgentMode_AGENT_MODE_MULTITASK:
-		return "For the turn that contains this reminder, the active mode is multitask. Act as the foreground coordinator: delegate most non-trivial work to a coherent worker with Task, avoid duplicating delegated work in the foreground, and do not wait just for a worker to finish."
+		return "For the turn that contains this reminder, the active mode is multitask. For broad investigation, first do minimal reconnaissance and then delegate 2-4 independent read-only explore tasks with Task; otherwise act as the foreground coordinator for one coherent worker. Avoid duplicating delegated work and do not wait just for a worker to finish."
 	default:
 		return "For the turn that contains this reminder, the active mode is agent. CreatePlan is not available in this mode; do not call CreatePlan. If the user explicitly asks to create or revise a plan, call SwitchMode to return to plan mode first. If there is an accepted or current plan, execute or continue the implementation using the available agent-mode tools."
 	}

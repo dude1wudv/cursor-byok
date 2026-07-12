@@ -42,7 +42,8 @@ tasks:
     summary: 使用本机构建 Linux 程序
     internal: true
     deps:
-      - task: common:go:mod:tidy
+      - task: common:toolchain:check
+      - task: common:go:mod:check
       - task: common:build:frontend
         vars:
           BUILD_FLAGS:

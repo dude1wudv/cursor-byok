@@ -7,6 +7,31 @@ vars:
     sh: 'cd "{{.TASKFILE_DIR}}" && pwd'
 
 tasks:
+  toolchain:check:
+    summary: 校验可复现构建所需工具版本
+    dir: '{{.ROOT_DIR}}'
+    preconditions:
+      - sh: 'case "$(go env GOVERSION)" in go1.25*|go1.26*) exit 0;; *) exit 1;; esac'
+        msg: "需要 Go 1.25 或 1.26。"
+      - sh: 'wails3 version'
+        msg: "需要 wails3；项目版本为 v3.0.0-alpha.74。"
+      - sh: 'yarn --version'
+        msg: "需要 Yarn；锁文件由 Yarn 1.22.22 维护。"
+      - sh: 'protoc --version'
+        msg: "需要 protoc；当前生成基线为 35.0。"
+      - sh: 'protoc-gen-go --version'
+        msg: "需要 protoc-gen-go；当前生成基线为 v1.36.11。"
+      - sh: 'protoc-gen-connect-go --version'
+        msg: "需要 protoc-gen-connect-go；当前生成基线为 1.19.1。"
+    cmds:
+      - go version
+
+  generate:
+    summary: 生成被忽略的 proto 与前端 bindings
+    dir: '{{.ROOT_DIR}}'
+    deps:
+      - task: generate:bindings
+
   extract:proto:
     summary: 从 Cursor 扩展快照提取 proto
     dir: '{{.ROOT_DIR}}'
@@ -35,6 +60,8 @@ tasks:
   generate:proto:
     summary: 生成 proto Go/Connect 代码
     dir: '{{.ROOT_DIR}}'
+    deps:
+      - task: toolchain:check
     sources:
       - proto/*.proto
     generates:
@@ -55,10 +82,16 @@ tasks:
 
   go:mod:tidy:
     summary: 整理 Go 依赖
-    internal: true
     dir: '{{.ROOT_DIR}}'
     cmds:
       - go mod tidy
+
+  go:mod:check:
+    summary: 验证 Go 依赖整洁且不修改文件
+    internal: true
+    dir: '{{.ROOT_DIR}}'
+    cmds:
+      - go list -mod=readonly ./... > /dev/null
 
   install:frontend:deps:
     summary: 安装前端依赖（Yarn）
@@ -69,8 +102,8 @@ tasks:
     generates:
       - node_modules
     preconditions:
-      - sh: yarn --version
-        msg: "未检测到 Yarn，请先安装 Yarn。"
+      - sh: 'yarn --version'
+        msg: "需要 Yarn；锁文件由 Yarn 1.22.22 维护。"
     cmds:
       - yarn install --frozen-lockfile
 
@@ -80,7 +113,7 @@ tasks:
     dir: '{{.ROOT_DIR}}'
     deps:
       - task: generate:proto
-      - task: go:mod:tidy
+      - task: go:mod:check
     sources:
       - "**/*.[jt]s"
       - exclude: frontend/**/*

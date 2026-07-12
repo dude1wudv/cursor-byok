@@ -66,6 +66,7 @@ const (
 	streamTimerNonStreamingRecovery streamTimerKind = "non_streaming_recovery"
 	streamTimerShellForeground      streamTimerKind = "shell_foreground"
 	streamTimerShellTransportClose  streamTimerKind = "shell_transport_close"
+	streamTimerSubagentResult       streamTimerKind = "subagent_result"
 	streamTimerOrphanCancel         streamTimerKind = "orphan_cancel"
 )
 
@@ -1003,6 +1004,12 @@ func (service *Service) handleTimerEvent(stream *ActiveStream, payload *streamTi
 			return nil
 		}
 		return service.recoverShellWithoutTerminal(stream, current, shellRecoveryReasonTransportClosed)
+	case streamTimerSubagentResult:
+		current, ok := snapshotPendingExec(stream, payload.ExecID)
+		if !ok || current.MessageID != payload.MessageID || strings.TrimSpace(current.ExecKind) != "subagent" {
+			return nil
+		}
+		return service.recoverSubagentWithoutResult(stream, current, payload.Reason)
 	case streamTimerOrphanCancel:
 		stream.mu.Lock()
 		subscriberCount := len(stream.Subscribers)

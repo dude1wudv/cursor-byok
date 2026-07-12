@@ -30,6 +30,8 @@ const (
 	providerResumeDebounce         = 200 * time.Millisecond
 	completedExecRetention         = 15 * time.Second
 	nonStreamingExecCloseGrace     = 1500 * time.Millisecond
+	subagentResultGrace            = 2 * time.Second
+	subagentExecutionTimeout       = 30 * time.Minute
 	defaultSummaryCompletedThought = "Chat context summarized"
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
@@ -1016,7 +1018,7 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 }
 
 func shouldRecoverNonStreamingExecOnStreamClose(message *agentv1.ExecClientControlMessage, pending runtimecore.PendingExec) bool {
-	if message == nil || isStreamingPendingExecKind(pending.ExecKind) {
+	if message == nil || isStreamingPendingExecKind(pending.ExecKind) || strings.TrimSpace(pending.ExecKind) == "subagent" {
 		return false
 	}
 	switch message.GetMessage().(type) {
@@ -1180,6 +1182,8 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 		return nil
 	}
 	backgroundShellToolCallID, backgroundShellActionWasNew := observeBackgroundShellAction(stream, intent.ClientMessage)
+	backgroundSubagentToolCallID, backgroundSubagentActionWasNew := observeBackgroundSubagentAction(stream, intent.ClientMessage)
+	subagentCompletions := observeBackgroundSubagentCompletions(stream, intent.ClientMessage)
 	observeBackgroundTaskCompletionAction(stream, intent.ClientMessage)
 	if !checkpointConversationInitialized(stream) {
 		if intent.HasExplicitMode {
@@ -1199,7 +1203,15 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 	if backgroundShellToolCallID != "" && backgroundShellActionWasNew {
 		entries = append(entries, newBackgroundShellActionMetadataEntry(stream.TurnSeq, stream.RequestID, backgroundShellToolCallID, backgroundShellActionSourceClient))
 	}
+	if backgroundSubagentToolCallID != "" && backgroundSubagentActionWasNew {
+		entries = append(entries, newMetadataEntry(stream.TurnSeq, stream.RequestID, "background_subagent_action", map[string]any{
+			"tool_call_id": backgroundSubagentToolCallID,
+		}))
+	}
 	entries = append(entries, backgroundTaskCompletionMetadataEntries(stream.TurnSeq, stream.RequestID, intent.ClientMessage)...)
+	for _, pending := range subagentCompletions {
+		service.scheduleSubagentResultTimeout(stream.RequestID, pending, subagentResultGrace, "background completion arrived without subagent result")
+	}
 	if intent.HasExplicitMode {
 		modeEntry, err := newModeMetadataEntry(stream.TurnSeq, stream.RequestID, intent.Mode, true, intent.ModeSource)
 		if err != nil {
@@ -1746,6 +1758,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		stream.PendingExecs[pendingExec.ExecID] = pendingExec
 		stream.mu.Unlock()
 		service.scheduleShellForegroundRecovery(stream.RequestID, pendingExec)
+		service.scheduleSubagentResultTimeout(stream.RequestID, pendingExec, subagentExecutionTimeout, "execution timeout")
 		removePendingExec := func() {
 			stream.mu.Lock()
 			delete(stream.PendingExecs, pendingExec.ExecID)

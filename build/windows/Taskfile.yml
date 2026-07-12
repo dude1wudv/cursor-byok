@@ -27,7 +27,8 @@ tasks:
     summary: 使用 Go 原生交叉编译构建 Windows 程序
     internal: true
     deps:
-      - task: common:go:mod:tidy
+      - task: common:toolchain:check
+      - task: common:go:mod:check
       - task: common:build:frontend
         vars:
           BUILD_FLAGS:
@@ -144,7 +145,10 @@ tasks:
       - rm -rf "{{.STAGING_DIR}}"
       - mkdir -p "{{.STAGING_DIR}}"
       - cp "{{.OUTPUT}}" "{{.STAGING_DIR}}/"
-      - (cd "{{.STAGING_DIR}}" && zip -qry "../{{.ZIP_NAME}}" .)
+      - cmd: powershell -NoProfile -Command "New-Item -ItemType Directory -Path (Split-Path ([System.IO.Path]::GetFullPath('{{.BIN_DIR}}/{{.ZIP_NAME}}'))) -Force | Out-Null; Compress-Archive -LiteralPath (Resolve-Path '{{.OUTPUT}}').Path -DestinationPath ([System.IO.Path]::GetFullPath('{{.BIN_DIR}}/{{.ZIP_NAME}}')) -Force; if (-not (Test-Path ([System.IO.Path]::GetFullPath('{{.BIN_DIR}}/{{.ZIP_NAME}}')))) { exit 1 }"
+        platforms: [windows]
+      - cmd: (cd "{{.STAGING_DIR}}" && zip -qry "../{{.ZIP_NAME}}" .) && test -f "{{.BIN_DIR}}/{{.ZIP_NAME}}"
+        platforms: [darwin, linux]
       - rm -rf "{{.STAGING_DIR}}"
       - rm -f "{{.OUTPUT}}"
 

@@ -160,6 +160,17 @@ var planModeToolNames = map[string]struct{}{
 	"WebSearch":            {},
 }
 
+var exploreSubagentToolNames = map[string]struct{}{
+	"FetchMcpResource": {},
+	"Glob":             {},
+	"Grep":             {},
+	"Ls":               {},
+	"Read":             {},
+	"ReadLints":        {},
+	"WebFetch":         {},
+	"WebSearch":        {},
+}
+
 var childConversationDisallowedAgentToolNames = map[string]struct{}{
 	"AskQuestion": {},
 }
@@ -187,6 +198,10 @@ func isToolAllowedInMode(mode agentv1.AgentMode, subagentTypeName string, toolNa
 		return false
 	}
 	if isChildConversationSubagentTypeName(subagentTypeName) {
+		if strings.EqualFold(strings.TrimSpace(subagentTypeName), "explore") {
+			_, ok := exploreSubagentToolNames[trimmedToolName]
+			return ok
+		}
 		if _, disallowed := childConversationDisallowedAgentToolNames[trimmedToolName]; disallowed {
 			return false
 		}
