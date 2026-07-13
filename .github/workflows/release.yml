@@ -73,6 +73,13 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           Add-Content $env:GITHUB_PATH "$(go env GOPATH)\bin"
+      - name: Build frontend
+        shell: pwsh
+        run: |
+          corepack enable
+          yarn --cwd frontend install --frozen-lockfile
+          yarn --cwd frontend build
+          if (-not (Test-Path frontend/dist)) { throw 'frontend/dist was not created' }
       - name: Build Windows archive
         shell: pwsh
         run: |
@@ -103,17 +110,40 @@ jobs:
       - name: Install build tools
         run: |
           corepack enable
-          brew install protobuf
+          if ! command -v protoc >/dev/null 2>&1; then
+            version=35.1
+            arch="$(uname -m)"
+            case "$arch" in
+              arm64) platform=aarch_64 ;;
+              x86_64) platform=x86_64 ;;
+              *) echo "Unsupported macOS architecture: $arch" >&2; exit 1 ;;
+            esac
+            curl --fail --location --retry 3 --output "$RUNNER_TEMP/protoc.zip" "https://github.com/protocolbuffers/protobuf/releases/download/v${version}/protoc-${version}-osx-${platform}.zip"
+            unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+            echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP/protoc/bin:$PATH"
+          fi
+          protoc --version
           go install github.com/go-task/task/v3/cmd/task@v3.45.4
           go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.74
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build frontend
+        run: |
+          corepack enable
+          yarn --cwd frontend install --frozen-lockfile
+          yarn --cwd frontend build
+          test -d frontend/dist
       - name: Build, verify, and archive
         run: |
           task release:clean
-          task darwin:package ARCH=amd64 BINARY_NAME=cursor-release-macos-amd64 OUTPUT=bin/cursor-release-macos-amd64 APP_BUNDLE='Cursor助手.app'
-          app='bin/Cursor助手.app'
+          task release:build:macos:amd64
+          archive="bin/release/$(go run ./scripts/release version)/cursor-byok-$(go run ./scripts/release version)-macos-amd64.tar.gz"
+          stage="$RUNNER_TEMP/macos-amd64"
+          mkdir -p "$stage"
+          tar -xzf "$archive" -C "$stage"
+          app="$stage/Cursor助手.app"
           executable="$app/Contents/MacOS/Cursor助手"
           test -d "$app/Contents/MacOS"
           test -d "$app/Contents/Resources"
@@ -121,11 +151,11 @@ jobs:
           test -f "$app/Contents/Resources/icons.icns"
           test -x "$executable"
           codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=4 "$app" 2>&1 | grep -F 'Signature=adhoc'
           file "$executable"
           file "$executable" | grep -Eq 'x86_64|amd64'
           lipo -info "$executable"
           test "$(lipo -archs "$executable")" = x86_64
-          task darwin:create:archive APP_BUNDLE='Cursor助手.app' ARCHIVE_PATH="bin/release/$(go run ./scripts/release version)/cursor-byok-$(go run ./scripts/release version)-macos-amd64.tar.gz"
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
           name: macos-amd64
@@ -153,17 +183,40 @@ jobs:
       - name: Install build tools
         run: |
           corepack enable
-          brew install protobuf
+          if ! command -v protoc >/dev/null 2>&1; then
+            version=35.1
+            arch="$(uname -m)"
+            case "$arch" in
+              arm64) platform=aarch_64 ;;
+              x86_64) platform=x86_64 ;;
+              *) echo "Unsupported macOS architecture: $arch" >&2; exit 1 ;;
+            esac
+            curl --fail --location --retry 3 --output "$RUNNER_TEMP/protoc.zip" "https://github.com/protocolbuffers/protobuf/releases/download/v${version}/protoc-${version}-osx-${platform}.zip"
+            unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+            echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP/protoc/bin:$PATH"
+          fi
+          protoc --version
           go install github.com/go-task/task/v3/cmd/task@v3.45.4
           go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.74
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build frontend
+        run: |
+          corepack enable
+          yarn --cwd frontend install --frozen-lockfile
+          yarn --cwd frontend build
+          test -d frontend/dist
       - name: Build, verify, and archive
         run: |
           task release:clean
-          task darwin:package ARCH=arm64 BINARY_NAME=cursor-release-macos-arm64 OUTPUT=bin/cursor-release-macos-arm64 APP_BUNDLE='Cursor助手.app'
-          app='bin/Cursor助手.app'
+          task release:build:macos:arm64
+          archive="bin/release/$(go run ./scripts/release version)/cursor-byok-$(go run ./scripts/release version)-macos-arm64.tar.gz"
+          stage="$RUNNER_TEMP/macos-arm64"
+          mkdir -p "$stage"
+          tar -xzf "$archive" -C "$stage"
+          app="$stage/Cursor助手.app"
           executable="$app/Contents/MacOS/Cursor助手"
           test -d "$app/Contents/MacOS"
           test -d "$app/Contents/Resources"
@@ -171,11 +224,11 @@ jobs:
           test -f "$app/Contents/Resources/icons.icns"
           test -x "$executable"
           codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=4 "$app" 2>&1 | grep -F 'Signature=adhoc'
           file "$executable"
           file "$executable" | grep -Eq 'arm64|aarch64'
           lipo -info "$executable"
           test "$(lipo -archs "$executable")" = arm64
-          task darwin:create:archive APP_BUNDLE='Cursor助手.app' ARCHIVE_PATH="bin/release/$(go run ./scripts/release version)/cursor-byok-$(go run ./scripts/release version)-macos-arm64.tar.gz"
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
           name: macos-arm64
