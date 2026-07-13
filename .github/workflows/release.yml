@@ -76,6 +76,8 @@ jobs:
       - name: Generate bindings and build frontend
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force frontend/dist | Out-Null
+          Set-Content -NoNewline frontend/dist/.wails-placeholder 'placeholder'
           task common:generate:bindings
           yarn --cwd frontend install --frozen-lockfile
           yarn --cwd frontend build
@@ -131,6 +133,8 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Generate bindings and build frontend
         run: |
+          mkdir -p frontend/dist
+          : > frontend/dist/.wails-placeholder
           task common:generate:bindings
           yarn --cwd frontend install --frozen-lockfile
           yarn --cwd frontend build
@@ -204,6 +208,8 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Generate bindings and build frontend
         run: |
+          mkdir -p frontend/dist
+          : > frontend/dist/.wails-placeholder
           task common:generate:bindings
           yarn --cwd frontend install --frozen-lockfile
           yarn --cwd frontend build
