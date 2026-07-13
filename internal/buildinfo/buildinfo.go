@@ -3,9 +3,9 @@ package buildinfo
 import "strings"
 
 const (
-	ReleaseRepo    = "leookun/cursor-byok"
-	UpdateBaseURL  = "https://github.com/leookun/cursor-byok/releases/latest/download/"
-	ReleasePageURL = "https://github.com/leookun/cursor-byok/releases"
+	ReleaseRepo    = "dude1wudv/cursor-byok"
+	UpdateBaseURL  = "https://github.com/dude1wudv/cursor-byok/releases/latest/download/"
+	ReleasePageURL = "https://github.com/dude1wudv/cursor-byok/releases"
 )
 
 // Version is injected at build time from build/config.yml.
