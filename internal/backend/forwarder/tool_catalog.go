@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"cursor/gen/agentv1"
+	runtimecore "cursor/internal/backend/agent/core"
 	promptassets "cursor/prompt"
 )
 
@@ -160,7 +161,7 @@ var planModeToolNames = map[string]struct{}{
 	"WebSearch":            {},
 }
 
-var exploreSubagentToolNames = map[string]struct{}{
+var readonlySubagentToolNames = map[string]struct{}{
 	"FetchMcpResource": {},
 	"Glob":             {},
 	"Grep":             {},
@@ -198,15 +199,7 @@ func isToolAllowedInMode(mode agentv1.AgentMode, subagentTypeName string, toolNa
 		return false
 	}
 	if isChildConversationSubagentTypeName(subagentTypeName) {
-		if strings.EqualFold(strings.TrimSpace(subagentTypeName), "explore") {
-			_, ok := exploreSubagentToolNames[trimmedToolName]
-			return ok
-		}
-		if _, disallowed := childConversationDisallowedAgentToolNames[trimmedToolName]; disallowed {
-			return false
-		}
-		_, ok := agentModeToolNames[trimmedToolName]
-		return ok
+		return isToolAllowedForSubagentMode(mode, subagentTypeName, trimmedToolName)
 	}
 	supported := supportedToolNamesForMode(mode)
 	if supported == nil {
@@ -214,6 +207,65 @@ func isToolAllowedInMode(mode agentv1.AgentMode, subagentTypeName string, toolNa
 	}
 	_, ok := supported[trimmedToolName]
 	return ok
+}
+
+func isToolAllowedForSubagentMode(mode agentv1.AgentMode, subagentTypeName string, toolName string) bool {
+	readonly := normalizeMode(mode) == agentv1.AgentMode_AGENT_MODE_PLAN
+	return isToolAllowedForSubagentCapability(subagentTypeName, readonly, toolName)
+}
+
+func isToolAllowedForSubagent(subagentTypeName string, toolName string) bool {
+	return isToolAllowedForSubagentCapability(subagentTypeName, strings.EqualFold(strings.TrimSpace(subagentTypeName), "explore"), toolName)
+}
+
+func isToolAllowedForSubagentCapability(subagentTypeName string, readonly bool, toolName string) bool {
+	capability, err := runtimecore.ResolveSubagentCapability(subagentTypeName, readonly)
+	if err != nil {
+		return false
+	}
+	if capability.Readonly {
+		_, ok := readonlySubagentToolNames[toolName]
+		return ok
+	}
+	if _, disallowed := childConversationDisallowedAgentToolNames[toolName]; disallowed {
+		return false
+	}
+	_, ok := agentModeToolNames[toolName]
+	return ok
+}
+
+func validateTaskSubagentCapability(argsJSON []byte) error {
+	args, err := runtimecore.DecodeArgsMap(argsJSON)
+	if err != nil {
+		return fmt.Errorf("decode Task args: %w", err)
+	}
+	value, found := args["readonly"]
+	if !found {
+		value, found = args["readOnly"]
+	}
+	readonly, ok := value.(bool)
+	if !found || !ok {
+		return fmt.Errorf("task readonly is required")
+	}
+	_, err = runtimecore.ResolveSubagentCapability(runtimecore.ReadStringArg(args, "subagent_type", "subagentType"), readonly)
+	return err
+}
+
+func validateSubagentToolInvocation(mode agentv1.AgentMode, subagentTypeName string, toolName string, argsJSON []byte) error {
+	if !isToolAllowedInMode(mode, subagentTypeName, toolName) {
+		return fmt.Errorf("tool invocation is not enabled in mode %s: %s", mode.String(), toolName)
+	}
+	if !isChildConversationSubagentTypeName(subagentTypeName) || normalizeMode(mode) != agentv1.AgentMode_AGENT_MODE_PLAN || strings.TrimSpace(toolName) != "FetchMcpResource" {
+		return nil
+	}
+	args, err := runtimecore.DecodeArgsMap(argsJSON)
+	if err != nil {
+		return fmt.Errorf("decode FetchMcpResource args: %w", err)
+	}
+	if strings.TrimSpace(runtimecore.ReadStringArg(args, "downloadPath", "download_path")) != "" {
+		return fmt.Errorf("FetchMcpResource downloadPath is not allowed for readonly subagents")
+	}
+	return nil
 }
 
 func isChildConversationSubagentTypeName(subagentTypeName string) bool {

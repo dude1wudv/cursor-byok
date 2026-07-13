@@ -1,0 +1,308 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v* tag to release; its version must match build/config.yml.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_PLATFORMS: macos-arm64,macos-amd64,windows-amd64
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: '1.25.x'
+      - name: Require the configured tag
+        run: |
+          tag="$RELEASE_TAG"
+          version="$(go run ./scripts/release version -config build/config.yml)"
+          expected="v$version"
+          case "$tag" in v*) ;; *) echo "Release must use a v* tag, got $tag." >&2; exit 1;; esac
+          test "${{ github.event_name }}" != push || test "${{ github.ref_type }}" = tag
+          git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null
+          if [ "$tag" != "$expected" ]; then
+            echo "Requested tag $tag does not match build/config.yml ($expected)." >&2
+            exit 1
+          fi
+
+  windows-amd64:
+    name: Windows amd64
+    needs: validate-tag
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: '1.25.x'
+      - uses: actions/setup-node@1e60f620b9541d1c3235c52bd30e4c4be5e2b0f7
+        with:
+          node-version: '22.x'
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          corepack enable
+          choco install protoc -y --no-progress
+          go install github.com/go-task/task/v3/cmd/task@v3.45.4
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.74
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
+          Add-Content $env:GITHUB_PATH "$(go env GOPATH)\bin"
+      - name: Build Windows archive
+        shell: pwsh
+        run: |
+          task release:clean
+          task release:build:windows:amd64
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: windows-amd64
+          path: bin/release/*/cursor-byok-*-windows-amd64.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-amd64:
+    name: macOS amd64
+    needs: validate-tag
+    runs-on: macos-13
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: '1.25.x'
+      - uses: actions/setup-node@1e60f620b9541d1c3235c52bd30e4c4be5e2b0f7
+        with:
+          node-version: '22.x'
+      - name: Install build tools
+        run: |
+          corepack enable
+          brew install protobuf
+          go install github.com/go-task/task/v3/cmd/task@v3.45.4
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.74
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Import Developer ID certificate
+        env:
+          MACOS_DEVELOPER_ID_CERTIFICATE_P12: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_P12 }}
+          MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          test -n "$MACOS_DEVELOPER_ID_CERTIFICATE_P12"
+          test -n "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD"
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          printf '%s' "$MACOS_DEVELOPER_ID_CERTIFICATE_P12" | base64 -D > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
+          security list-keychain -d user -s "$keychain"
+      - name: Build, sign, notarize, and staple
+        env:
+          MACOS_DEVELOPER_ID_SIGNING_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
+        run: |
+          for value in "$MACOS_DEVELOPER_ID_SIGNING_IDENTITY" "$APPLE_NOTARY_KEY_ID" "$APPLE_NOTARY_ISSUER_ID" "$APPLE_NOTARY_PRIVATE_KEY"; do test -n "$value"; done
+          task release:clean
+          task darwin:package ARCH=amd64 BINARY_NAME=cursor-release-macos-amd64 OUTPUT=bin/cursor-release-macos-amd64 APP_BUNDLE='Cursor助手.app' MACOS_SIGN_IDENTITY="$MACOS_DEVELOPER_ID_SIGNING_IDENTITY"
+          printf '%s' "$APPLE_NOTARY_PRIVATE_KEY" | base64 -D > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --keepParent 'bin/Cursor助手.app' "$RUNNER_TEMP/notarization.zip"
+          notary_result="$RUNNER_TEMP/notary-result.json"
+          if ! xcrun notarytool submit "$RUNNER_TEMP/notarization.zip" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --output-format json > "$notary_result"; then
+            echo 'Notarization failed; submission result follows.' >&2
+            cat "$notary_result" >&2 || true
+            submission_id="$(python3 - "$notary_result" <<'PY'
+          import json, pathlib, sys
+          try:
+              print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get('id', ''))
+          except (OSError, json.JSONDecodeError):
+              pass
+          PY
+          )"
+            if [ -n "$submission_id" ]; then
+              xcrun notarytool log "$submission_id" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" > "$RUNNER_TEMP/notary-log.json" || true
+              cat "$RUNNER_TEMP/notary-log.json" >&2 || true
+            fi
+            exit 1
+          fi
+          xcrun stapler staple 'bin/Cursor助手.app'
+          codesign --verify --deep --strict --verbose=2 'bin/Cursor助手.app'
+          spctl --assess --type execute --verbose=4 'bin/Cursor助手.app'
+          xcrun stapler validate 'bin/Cursor助手.app'
+          task darwin:create:archive APP_BUNDLE='Cursor助手.app' ARCHIVE_PATH="bin/release/$(go run ./scripts/release version)/cursor-byok-$(go run ./scripts/release version)-macos-amd64.tar.gz"
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: macos-amd64
+          path: bin/release/*/cursor-byok-*-macos-amd64.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-arm64:
+    name: macOS arm64
+    needs: validate-tag
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Require hosted arm64 runner
+        run: test "$(uname -m)" = arm64 || { echo 'macos-14 did not provide an arm64 runner; refusing to publish a mislabeled asset.' >&2; exit 1; }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: '1.25.x'
+      - uses: actions/setup-node@1e60f620b9541d1c3235c52bd30e4c4be5e2b0f7
+        with:
+          node-version: '22.x'
+      - name: Install build tools
+        run: |
+          corepack enable
+          brew install protobuf
+          go install github.com/go-task/task/v3/cmd/task@v3.45.4
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.74
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Import Developer ID certificate
+        env:
+          MACOS_DEVELOPER_ID_CERTIFICATE_P12: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_P12 }}
+          MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          test -n "$MACOS_DEVELOPER_ID_CERTIFICATE_P12"
+          test -n "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD"
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          printf '%s' "$MACOS_DEVELOPER_ID_CERTIFICATE_P12" | base64 -D > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
+          security list-keychain -d user -s "$keychain"
+      - name: Build, sign, notarize, and staple
+        env:
+          MACOS_DEVELOPER_ID_SIGNING_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
+        run: |
+          for value in "$MACOS_DEVELOPER_ID_SIGNING_IDENTITY" "$APPLE_NOTARY_KEY_ID" "$APPLE_NOTARY_ISSUER_ID" "$APPLE_NOTARY_PRIVATE_KEY"; do test -n "$value"; done
+          task release:clean
+          task darwin:package ARCH=arm64 BINARY_NAME=cursor-release-macos-arm64 OUTPUT=bin/cursor-release-macos-arm64 APP_BUNDLE='Cursor助手.app' MACOS_SIGN_IDENTITY="$MACOS_DEVELOPER_ID_SIGNING_IDENTITY"
+          printf '%s' "$APPLE_NOTARY_PRIVATE_KEY" | base64 -D > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --keepParent 'bin/Cursor助手.app' "$RUNNER_TEMP/notarization.zip"
+          notary_result="$RUNNER_TEMP/notary-result.json"
+          if ! xcrun notarytool submit "$RUNNER_TEMP/notarization.zip" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --output-format json > "$notary_result"; then
+            echo 'Notarization failed; submission result follows.' >&2
+            cat "$notary_result" >&2 || true
+            submission_id="$(python3 - "$notary_result" <<'PY'
+          import json, pathlib, sys
+          try:
+              print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get('id', ''))
+          except (OSError, json.JSONDecodeError):
+              pass
+          PY
+          )"
+            if [ -n "$submission_id" ]; then
+              xcrun notarytool log "$submission_id" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" > "$RUNNER_TEMP/notary-log.json" || true
+              cat "$RUNNER_TEMP/notary-log.json" >&2 || true
+            fi
+            exit 1
+          fi
+          xcrun stapler staple 'bin/Cursor助手.app'
+          codesign --verify --deep --strict --verbose=2 'bin/Cursor助手.app'
+          spctl --assess --type execute --verbose=4 'bin/Cursor助手.app'
+          xcrun stapler validate 'bin/Cursor助手.app'
+          task darwin:create:archive APP_BUNDLE='Cursor助手.app' ARCHIVE_PATH="bin/release/$(go run ./scripts/release version)/cursor-byok-$(go run ./scripts/release version)-macos-arm64.tar.gz"
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: macos-arm64
+          path: bin/release/*/cursor-byok-*-macos-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish release
+    needs: [windows-amd64, macos-amd64, macos-arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: '1.25.x'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: bin/release
+          merge-multiple: true
+      - name: Verify release assets and generate update manifest
+        run: |
+          version="$(go run ./scripts/release version -config build/config.yml)"
+          tag="v$version"
+          if [ "$RELEASE_TAG" != "$tag" ]; then
+            echo "Validated release tag $RELEASE_TAG does not match build/config.yml ($tag)." >&2
+            exit 1
+          fi
+          release_dir="bin/release/$version"
+          mkdir -p "$release_dir"
+          find bin/release -type f -name 'cursor-byok-*' -not -path "$release_dir/*" -exec mv {} "$release_dir" \;
+          go run ./scripts/release verify -config build/config.yml -assets-dir "$release_dir" -base-name cursor-byok -platforms "$RELEASE_PLATFORMS"
+          go run ./scripts/release manifest -config build/config.yml -assets-dir "$release_dir" -out "$release_dir/update.json" -repo "${{ github.repository }}" -base-name cursor-byok -notes release-notes.md -platforms "$RELEASE_PLATFORMS"
+          python3 - "$release_dir" "$version" <<'PY'
+          import hashlib, json, pathlib, sys
+          directory, version = map(pathlib.Path, sys.argv[1:])
+          manifest = json.loads((directory / 'update.json').read_text())
+          suffixes = {'macos-arm64': '.tar.gz', 'macos-amd64': '.tar.gz', 'windows-amd64': '.zip'}
+          assert set(manifest['platforms']) == set(suffixes), manifest['platforms']
+          for platform, suffix in suffixes.items():
+              name = f'cursor-byok-{version}-{platform}{suffix}'
+              path = directory / name
+              assert path.is_file(), name
+              checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+              assert manifest['platforms'][platform]['checksum'] == f'sha256:{checksum}', name
+          PY
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(go run ./scripts/release version -config build/config.yml)"
+          tag="v$version"
+          release_dir="bin/release/$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$tag" --notes-file release-notes.md
+          else
+            gh release create "$tag" --title "$tag" --notes-file release-notes.md
+          fi
+          gh release upload "$tag" "$release_dir"/* --clobber

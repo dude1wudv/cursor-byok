@@ -1721,10 +1721,13 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	stream.ToolInvocationCount++
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
-	if !isToolAllowedInMode(mode, subagentTypeName, trimmedToolName) {
-		return service.completePreDispatchToolError(stream, invocation, nil, false, false, fmt.Errorf("tool invocation is not enabled in mode %s: %s", mode.String(), invocation.ToolName))
+	if err := validateSubagentToolInvocation(mode, subagentTypeName, trimmedToolName, invocation.ArgsJSON); err != nil {
+		return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
 	}
 	if trimmedToolName == "Task" {
+		if err := validateTaskSubagentCapability(invocation.ArgsJSON); err != nil {
+			return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
+		}
 		decision, quotaErr := service.validateAndReserveSubagentDispatch(stream, invocation)
 		quotaErrorText := ""
 		if quotaErr != nil {

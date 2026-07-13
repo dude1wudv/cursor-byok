@@ -101,6 +101,8 @@ tasks:
             ref: .OUTPUT
           BINARY_NAME:
             ref: .BINARY_NAME
+          MACOS_SIGN_IDENTITY:
+            ref: .MACOS_SIGN_IDENTITY
 
   package:dmg:
     summary: 打包 macOS DMG（可通过 APP_BUNDLE/DMG_NAME 指定输出文件名）
@@ -116,6 +118,8 @@ tasks:
             ref: .BINARY_NAME
           APP_BUNDLE:
             ref: .APP_BUNDLE
+          MACOS_SIGN_IDENTITY:
+            ref: .MACOS_SIGN_IDENTITY
           BUILD_FLAGS:
             ref: .BUILD_FLAGS
           EXTRA_TAGS:
@@ -155,6 +159,8 @@ tasks:
             ref: .BINARY_NAME
           APP_BUNDLE:
             ref: .APP_BUNDLE
+          MACOS_SIGN_IDENTITY:
+            ref: .MACOS_SIGN_IDENTITY
           BUILD_FLAGS:
             ref: .BUILD_FLAGS
           EXTRA_TAGS:
@@ -200,10 +206,24 @@ tasks:
       - cp build/darwin/icons.icns "{{.BIN_DIR}}/{{.APP_BUNDLE}}/Contents/Resources"
       - cp "{{.BINARY_PATH}}" "{{.BIN_DIR}}/{{.APP_BUNDLE}}/Contents/MacOS/{{.EXECUTABLE_NAME}}"
       - cp build/darwin/Info.plist "{{.BIN_DIR}}/{{.APP_BUNDLE}}/Contents"
-      - task: codesign:adhoc
+      - task: '{{if .MACOS_SIGN_IDENTITY}}codesign:developer-id{{else}}codesign:adhoc{{end}}'
         vars:
           APP_BUNDLE:
             ref: .APP_BUNDLE
+          MACOS_SIGN_IDENTITY:
+            ref: .MACOS_SIGN_IDENTITY
+
+  codesign:developer-id:
+    summary: 使用 Developer ID 签名（CI 发布）
+    internal: true
+    vars:
+      APP_BUNDLE: '{{.APP_BUNDLE | default (printf "%s.app" .APP_NAME)}}'
+      MACOS_SIGN_IDENTITY: '{{.MACOS_SIGN_IDENTITY}}'
+    preconditions:
+      - sh: test -n "{{.MACOS_SIGN_IDENTITY}}"
+        msg: "MACOS_SIGN_IDENTITY is required for Developer ID signing."
+    cmds:
+      - codesign --force --deep --options runtime --timestamp --sign "{{.MACOS_SIGN_IDENTITY}}" "{{.BIN_DIR}}/{{.APP_BUNDLE}}"
 
   codesign:adhoc:
     summary: 使用临时签名（开发测试）

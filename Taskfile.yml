@@ -13,6 +13,7 @@ vars:
     sh: 'go run ./scripts/release version -config ./build/config.yml'
   RELEASE_REPO: "dude1wudv/cursor-byok"
   RELEASE_BASE_NAME: "cursor-byok"
+  RELEASE_PLATFORMS: "macos-arm64,macos-amd64,windows-amd64"
   RELEASE_SOURCE_PATH: "release-notes.md"
   RELEASE_DIR: '{{.BIN_DIR}}/release/{{.APP_VERSION}}'
   RELEASE_NOTES_PATH: '{{.RELEASE_DIR}}/.release-notes.md'
@@ -279,7 +280,7 @@ tasks:
     summary: 生成 update.json
     internal: true
     cmds:
-      - go run ./scripts/release manifest -config ./build/config.yml -assets-dir "{{.RELEASE_DIR}}" -out "{{.RELEASE_DIR}}/update.json" -repo "{{.RELEASE_REPO}}" -base-name "{{.RELEASE_BASE_NAME}}" -notes "{{.RELEASE_NOTES_PATH}}"
+      - go run ./scripts/release manifest -config ./build/config.yml -assets-dir "{{.RELEASE_DIR}}" -out "{{.RELEASE_DIR}}/update.json" -repo "{{.RELEASE_REPO}}" -base-name "{{.RELEASE_BASE_NAME}}" -notes "{{.RELEASE_NOTES_PATH}}" -platforms "{{.RELEASE_PLATFORMS}}"
 
   release:prepare:
     summary: 在当前主机上生成对应的发布资产
@@ -292,7 +293,7 @@ tasks:
       - task: '{{if eq OS "darwin"}}release:prepare:darwin{{else}}release:prepare:linux{{end}}'
 
   release:prepare:darwin:
-    summary: 在 macOS 上生成 macOS/Windows/Linux 发布资产
+    summary: 在 macOS 上生成当前目标平台发布资产
     preconditions:
       - sh: '[ "{{OS}}" = "darwin" ]'
         msg: "release:prepare:darwin 仅支持在 macOS 上执行。"
@@ -305,7 +306,6 @@ tasks:
       - task: release:build:macos:arm64
       - task: release:build:macos:amd64
       - task: release:build:windows:amd64
-      - task: release:build:linux:amd64
 
   release:prepare:linux:
     summary: 在当前主机上生成 Linux 发布资产
@@ -321,20 +321,12 @@ tasks:
       - task: release:build:linux:amd64
 
   release:verify:assets:
-    summary: 验证当前版本发布资产是否齐全
+    summary: 验证当前目标平台的发布资产是否齐全
     preconditions:
       - sh: test -f "{{.RELEASE_NOTES_PATH}}"
         msg: "未找到发布说明，请先执行对应的 release:prepare 任务。"
-      - sh: test -f "{{.RELEASE_DIR}}/{{.RELEASE_BASE_NAME}}-{{.APP_VERSION}}-macos-arm64.tar.gz"
-        msg: "缺少 macOS arm64 发布资产。"
-      - sh: test -f "{{.RELEASE_DIR}}/{{.RELEASE_BASE_NAME}}-{{.APP_VERSION}}-macos-amd64.tar.gz"
-        msg: "缺少 macOS amd64 发布资产。"
-      - sh: test -f "{{.RELEASE_DIR}}/{{.RELEASE_BASE_NAME}}-{{.APP_VERSION}}-windows-amd64.zip"
-        msg: "缺少 Windows amd64 发布资产。"
-      - sh: test -f "{{.RELEASE_DIR}}/{{.RELEASE_BASE_NAME}}-{{.APP_VERSION}}-linux-amd64.tar.gz"
-        msg: "缺少 Linux amd64 发布资产。"
     cmds:
-      - echo "release assets verified"
+      - go run ./scripts/release verify -config ./build/config.yml -assets-dir "{{.RELEASE_DIR}}" -base-name "{{.RELEASE_BASE_NAME}}" -platforms "{{.RELEASE_PLATFORMS}}"
 
   release:sync:readme:
     summary: 同步 README 到公开发布仓库（发布日志来源固定为 release-notes.md）
@@ -472,11 +464,18 @@ tasks:
         version = "{{.APP_VERSION}}"
         tag = f"v{version}"
         notes = pathlib.Path("{{.RELEASE_NOTES_PATH}}").read_text(encoding="utf-8")
-        assets = sorted([
-            pathlib.Path("{{.RELEASE_DIR}}/update.json"),
-            *pathlib.Path("{{.RELEASE_DIR}}").glob("*.tar.gz"),
-            *pathlib.Path("{{.RELEASE_DIR}}").glob("*.zip"),
-        ])
+        platform_suffixes = {
+            "macos-arm64": ".tar.gz",
+            "macos-amd64": ".tar.gz",
+            "windows-amd64": ".zip",
+            "linux-amd64": ".tar.gz",
+        }
+        platforms = "{{.RELEASE_PLATFORMS}}".split(",")
+        assets = [pathlib.Path("{{.RELEASE_DIR}}/update.json")]
+        assets.extend(
+            pathlib.Path("{{.RELEASE_DIR}}") / f"{{.RELEASE_BASE_NAME}}-{version}-{platform}{platform_suffixes[platform]}"
+            for platform in platforms
+        )
 
         get_cmd = [
             "gh", "api",

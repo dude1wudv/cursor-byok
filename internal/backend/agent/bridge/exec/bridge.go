@@ -771,14 +771,21 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 	if err != nil {
 		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode Task args failed: %w", err)
 	}
-	subagentType := strings.TrimSpace(readStringArg(args, "subagent_type", "subagentType"))
-	if subagentType == "" {
-		return nil, runtimecore.PendingExec{}, fmt.Errorf("task subagent_type is required")
+	readonly, err := readBoolPtrArg(args, "readonly", "readOnly")
+	if err != nil {
+		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode Task readonly failed: %w", err)
 	}
+	if readonly == nil {
+		return nil, runtimecore.PendingExec{}, fmt.Errorf("task readonly is required")
+	}
+	capability, err := runtimecore.ResolveSubagentCapability(readStringArg(args, "subagent_type", "subagentType"), *readonly)
+	if err != nil {
+		return nil, runtimecore.PendingExec{}, err
+	}
+	subagentType := capability.Type
 	messageID := bridge.nextID()
 	now := time.Now().UTC()
 	execID := fmt.Sprintf("exec-subagent-%d", now.UnixNano())
-	readonly := readBoolArg(args, "readonly", "readOnly")
 	parentConversationID := strings.TrimSpace(openContext.ConversationID)
 	taskRequestedModelID := strings.TrimSpace(readStringArg(args, "model", "model_id", "modelId"))
 	modelID := taskRequestedModelID
@@ -810,10 +817,10 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 						SubagentType:         subagentType,
 						ModelId:              modelID,
 						Prompt:               strings.TrimSpace(readStringArg(args, "prompt")),
-						Readonly:             readonly,
+						Readonly:             capability.Readonly,
 						ResumeAgentId:        stringPtr(strings.TrimSpace(readStringArg(args, "resume"))),
 						ParentConversationId: stringPtrIfNonEmpty(parentConversationID),
-						Mode:                 taskModeFromReadonly(readonly),
+						Mode:                 taskModeFromReadonly(capability.Readonly),
 					},
 				},
 			},

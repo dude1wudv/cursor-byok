@@ -40,11 +40,12 @@ func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversa
 		normalizedMode = agentv1.AgentMode_AGENT_MODE_AGENT
 	}
 	if conversation != nil && isChildConversationSubagentTypeName(conversation.SubagentTypeName) {
+		readonly := normalizedMode == agentv1.AgentMode_AGENT_MODE_PLAN
 		return appendCurrentTurnAttentionReminders(PromptReminders{
 			SystemParts: reminders,
 			PromptContexts: []PromptContextMessage{
-				newPromptContextReminder(promptContextSourceSubagentContract, subagentContractText()),
-				newPromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, true)),
+				newPromptContextReminder(promptContextSourceSubagentContract, subagentContractText(readonly)),
+				newPromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, true, readonly)),
 			},
 		}, latestUserText)
 	}
@@ -77,7 +78,7 @@ func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversa
 	result := PromptReminders{
 		SystemParts: reminders,
 		PromptContexts: []PromptContextMessage{
-			newPromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, false)),
+			newPromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, false, false)),
 		},
 	}
 	if normalizedMode == agentv1.AgentMode_AGENT_MODE_PLAN {
@@ -172,17 +173,25 @@ func newPromptContextReminder(source string, content string) PromptContextMessag
 	)
 }
 
-func subagentContractText() string {
+func subagentContractText(readonly bool) string {
+	responsibility := "You are a writable implementation child. Make the requested changes only in the owned_paths named in your task, then verify those changes before reporting the result. Do not stop at investigation."
+	if readonly {
+		responsibility = "You are a read-only investigation child. Do not modify files, start processes, or save downloaded resources; report only concise findings to the parent agent."
+	}
 	return strings.Join([]string{
-		"The turn that contains this reminder runs inside a subagent child conversation. Work as an investigator for the parent agent, not as the final user-facing assistant.",
+		"The turn that contains this reminder runs inside a subagent child conversation. Work for the parent agent, not as the final user-facing assistant.",
+		responsibility,
 		"Return a short textual result: lead with the conclusion, keep only the key evidence, and do not produce a long response.",
 		"Use the available agent tools when they materially improve correctness or efficiency. Do not ask the user questions. If required information is missing, report the gap to the parent agent instead of asking the user directly.",
 	}, "\n\n")
 }
 
-func currentModeContractText(mode agentv1.AgentMode, childSubagent bool) string {
+func currentModeContractText(mode agentv1.AgentMode, childSubagent bool, childReadonly bool) string {
 	if childSubagent {
-		return "For the turn that contains this reminder, the active mode is a subagent child conversation. Use the available agent tools, but do not call AskQuestion. Return only a concise investigation result for the parent agent."
+		if childReadonly {
+			return "For the turn that contains this reminder, the active mode is a read-only subagent child conversation. Do not modify files, use shell tools, call MCP tools, or download resources to disk. Return only a concise investigation result for the parent agent."
+		}
+		return "For the turn that contains this reminder, the active mode is a writable subagent child conversation. Complete the implementation in the task's owned_paths, verify it, and then return a concise result for the parent agent."
 	}
 	switch normalizeMode(mode) {
 	case agentv1.AgentMode_AGENT_MODE_PLAN:

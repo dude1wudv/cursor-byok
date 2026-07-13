@@ -41,6 +41,8 @@ type assetSpec struct {
 	suffix   string
 }
 
+var defaultReleasePlatforms = "macos-arm64,macos-amd64,windows-amd64,linux-amd64"
+
 var releaseAssets = []assetSpec{
 	{platform: "macos-arm64", suffix: ".tar.gz"},
 	{platform: "macos-amd64", suffix: ".tar.gz"},
@@ -50,7 +52,7 @@ var releaseAssets = []assetSpec{
 
 func main() {
 	if len(os.Args) < 2 {
-		exitf("usage: go run ./scripts/release <version|notes|manifest> [flags]")
+		exitf("usage: go run ./scripts/release <version|notes|manifest|verify> [flags]")
 	}
 
 	switch os.Args[1] {
@@ -60,6 +62,8 @@ func main() {
 		runNotes(os.Args[2:])
 	case "manifest":
 		runManifest(os.Args[2:])
+	case "verify":
+		runVerify(os.Args[2:])
 	default:
 		exitf("unknown subcommand: %s", os.Args[1])
 	}
@@ -113,6 +117,7 @@ func runManifest(args []string) {
 	repo := flags.String("repo", "", "GitHub repo in owner/repo form")
 	baseName := flags.String("base-name", "cursor-byok", "release asset basename")
 	notesPath := flags.String("notes", "", "release notes file")
+	platforms := flags.String("platforms", defaultReleasePlatforms, "comma-separated target platforms")
 	_ = flags.Parse(args)
 
 	if strings.TrimSpace(*assetsDir) == "" {
@@ -138,22 +143,14 @@ func runManifest(args []string) {
 		exitErr(err)
 	}
 
-	manifest := updateManifest{
-		Version:      version,
-		ReleaseDate:  time.Now().UTC().Format(time.RFC3339),
-		ReleaseNotes: notes,
-		Platforms:    map[string]updateManifestAsset{},
-		Mandatory:    false,
+	assets, err := releaseAssetsFor(*platforms)
+	if err != nil {
+		exitErr(err)
 	}
 
-	for _, spec := range releaseAssets {
-		filename := fmt.Sprintf("%s-%s-%s%s", *baseName, version, spec.platform, spec.suffix)
-		fullpath := filepath.Join(*assetsDir, filename)
-		asset, err := buildManifestAsset(fullpath, *repo, version, filename)
-		if err != nil {
-			exitErr(err)
-		}
-		manifest.Platforms[spec.platform] = asset
+	manifest, err := newUpdateManifest(version, notes, *assetsDir, *repo, *baseName, assets, time.Now().UTC())
+	if err != nil {
+		exitErr(err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(*outputPath), 0o755); err != nil {
@@ -169,6 +166,88 @@ func runManifest(args []string) {
 	if err := os.WriteFile(*outputPath, content, 0o644); err != nil {
 		exitErr(err)
 	}
+}
+
+func runVerify(args []string) {
+	flags := flag.NewFlagSet("verify", flag.ExitOnError)
+	configPath := flags.String("config", "build/config.yml", "path to build config")
+	assetsDir := flags.String("assets-dir", "", "directory containing release assets")
+	baseName := flags.String("base-name", "cursor-byok", "release asset basename")
+	platforms := flags.String("platforms", defaultReleasePlatforms, "comma-separated target platforms")
+	_ = flags.Parse(args)
+
+	if strings.TrimSpace(*assetsDir) == "" {
+		exitf("assets-dir is required")
+	}
+	version, err := readVersion(*configPath)
+	if err != nil {
+		exitErr(err)
+	}
+	assets, err := releaseAssetsFor(*platforms)
+	if err != nil {
+		exitErr(err)
+	}
+	if err := verifyReleaseAssets(*assetsDir, *baseName, version, assets); err != nil {
+		exitErr(err)
+	}
+}
+
+func releaseAssetsFor(platforms string) ([]assetSpec, error) {
+	requested := strings.Split(strings.TrimSpace(platforms), ",")
+	if len(requested) == 0 || (len(requested) == 1 && strings.TrimSpace(requested[0]) == "") {
+		return nil, errors.New("at least one release platform is required")
+	}
+
+	byPlatform := make(map[string]assetSpec, len(releaseAssets))
+	for _, asset := range releaseAssets {
+		byPlatform[asset.platform] = asset
+	}
+
+	assets := make([]assetSpec, 0, len(requested))
+	seen := make(map[string]bool, len(requested))
+	for _, platform := range requested {
+		platform = strings.TrimSpace(platform)
+		asset, ok := byPlatform[platform]
+		if !ok {
+			return nil, fmt.Errorf("unsupported release platform %q", platform)
+		}
+		if seen[platform] {
+			return nil, fmt.Errorf("release platform %q was specified more than once", platform)
+		}
+		seen[platform] = true
+		assets = append(assets, asset)
+	}
+	return assets, nil
+}
+
+func newUpdateManifest(version, notes, assetsDir, repo, baseName string, assets []assetSpec, releaseTime time.Time) (updateManifest, error) {
+	manifest := updateManifest{
+		Version:      version,
+		ReleaseDate:  releaseTime.UTC().Format(time.RFC3339),
+		ReleaseNotes: notes,
+		Platforms:    map[string]updateManifestAsset{},
+		Mandatory:    false,
+	}
+
+	for _, spec := range assets {
+		filename := fmt.Sprintf("%s-%s-%s%s", baseName, version, spec.platform, spec.suffix)
+		asset, err := buildManifestAsset(filepath.Join(assetsDir, filename), repo, version, filename)
+		if err != nil {
+			return updateManifest{}, fmt.Errorf("release asset %s: %w", filename, err)
+		}
+		manifest.Platforms[spec.platform] = asset
+	}
+	return manifest, nil
+}
+
+func verifyReleaseAssets(assetsDir, baseName, version string, assets []assetSpec) error {
+	for _, spec := range assets {
+		filename := fmt.Sprintf("%s-%s-%s%s", baseName, version, spec.platform, spec.suffix)
+		if _, err := os.Stat(filepath.Join(assetsDir, filename)); err != nil {
+			return fmt.Errorf("release asset %s: %w", filename, err)
+		}
+	}
+	return nil
 }
 
 func readVersion(configPath string) (string, error) {

@@ -507,7 +507,7 @@
             "type": "string"
           },
           "readonly": {
-            "description": "If true, the subagent will run in readonly mode (\"Ask mode\") with restricted write operations and no MCP access.",
+            "description": "Required child access: explore requires readonly=true; generalPurpose may be readonly or writable. Unsupported types and explore with readonly=false are rejected before dispatch.",
             "type": "boolean"
           },
           "resume": {
@@ -515,19 +515,19 @@
             "type": "string"
           },
           "subagent_type": {
-            "description": "Subagent type to use for this task. Must be one of: generalPurpose, explore, shell, browser-use.",
+            "description": "Required child type: explore (readonly only) or generalPurpose (readonly or writable).",
             "enum": [
               "generalPurpose",
-              "explore",
-              "shell",
-              "browser-use"
+              "explore"
             ],
             "type": "string"
           }
         },
         "required": [
           "description",
-          "prompt"
+          "prompt",
+          "readonly",
+          "subagent_type"
         ],
         "type": "object"
       }

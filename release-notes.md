@@ -1,2 +1,2 @@
-- 修复 Subagent 在 `fast`、inherit 或渠道 override 场景显示内部渠道 ID 的问题，现统一显示配置名称或 provider 模型名
-- 保持子代理实际模型路由不变，并让实时进度、完成态与历史回放使用同一模型名称
+- 修复子代理任务的可写与只读权限边界，确保执行能力按会话模式正确生效。
+- 新增 Windows amd64、macOS arm64 与 macOS amd64 的发布、校验和更新清单链路；macOS 正式包在 CI 中使用 Developer ID 签名并经 Apple 公证。
