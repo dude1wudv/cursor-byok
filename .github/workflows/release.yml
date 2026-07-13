@@ -73,6 +73,13 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           Add-Content $env:GITHUB_PATH "$(go env GOPATH)\bin"
+      - name: Generate bindings and build frontend
+        shell: pwsh
+        run: |
+          task common:generate:bindings
+          yarn --cwd frontend install --frozen-lockfile
+          yarn --cwd frontend build
+          if (-not (Test-Path frontend/dist)) { throw 'frontend/dist was not created' }
       - name: Build Windows archive
         shell: pwsh
         run: |
@@ -122,6 +129,12 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Generate bindings and build frontend
+        run: |
+          task common:generate:bindings
+          yarn --cwd frontend install --frozen-lockfile
+          yarn --cwd frontend build
+          test -d frontend/dist
       - name: Build, verify, and archive
         run: |
           task release:clean
@@ -189,6 +202,12 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Generate bindings and build frontend
+        run: |
+          task common:generate:bindings
+          yarn --cwd frontend install --frozen-lockfile
+          yarn --cwd frontend build
+          test -d frontend/dist
       - name: Build, verify, and archive
         run: |
           task release:clean
