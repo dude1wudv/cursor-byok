@@ -66,20 +66,13 @@ jobs:
       - name: Install build tools
         shell: pwsh
         run: |
-          corepack enable
+          npm install --global yarn@1.22.22
           choco install protoc -y --no-progress
           go install github.com/go-task/task/v3/cmd/task@v3.45.4
           go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.74
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           Add-Content $env:GITHUB_PATH "$(go env GOPATH)\bin"
-      - name: Build frontend
-        shell: pwsh
-        run: |
-          corepack enable
-          yarn --cwd frontend install --frozen-lockfile
-          yarn --cwd frontend build
-          if (-not (Test-Path frontend/dist)) { throw 'frontend/dist was not created' }
       - name: Build Windows archive
         shell: pwsh
         run: |
@@ -109,7 +102,7 @@ jobs:
           node-version: '22.x'
       - name: Install build tools
         run: |
-          corepack enable
+          npm install --global yarn@1.22.22
           if ! command -v protoc >/dev/null 2>&1; then
             version=35.1
             arch="$(uname -m)"
@@ -129,12 +122,6 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - name: Build frontend
-        run: |
-          corepack enable
-          yarn --cwd frontend install --frozen-lockfile
-          yarn --cwd frontend build
-          test -d frontend/dist
       - name: Build, verify, and archive
         run: |
           task release:clean
@@ -182,7 +169,7 @@ jobs:
           node-version: '22.x'
       - name: Install build tools
         run: |
-          corepack enable
+          npm install --global yarn@1.22.22
           if ! command -v protoc >/dev/null 2>&1; then
             version=35.1
             arch="$(uname -m)"
@@ -202,12 +189,6 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - name: Build frontend
-        run: |
-          corepack enable
-          yarn --cwd frontend install --frozen-lockfile
-          yarn --cwd frontend build
-          test -d frontend/dist
       - name: Build, verify, and archive
         run: |
           task release:clean
