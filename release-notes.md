@@ -1,2 +1,3 @@
 - 修复子代理任务的可写与只读权限边界，确保执行能力按会话模式正确生效。
-- 新增 Windows amd64、macOS arm64 与 macOS amd64 的发布、校验和更新清单链路；macOS 默认使用 ad-hoc 签名发布，配置完整 Apple Developer ID 与公证凭据后，CI 才会使用 Developer ID 签名并经 Apple 公证。
+- 新增 Windows amd64、macOS arm64 与 macOS amd64 的发布、校验和更新清单链路。
+- macOS `.tar.gz` 使用 ad-hoc 签名，未经过 Apple 公证。首次打开若被 Gatekeeper 拦截，请右键点按“打开”；确认来源后也可执行 `xattr -cr "Cursor助手.app"`。

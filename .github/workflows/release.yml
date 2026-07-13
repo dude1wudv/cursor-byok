@@ -27,37 +27,7 @@ jobs:
     name: Validate release tag
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      macos_signing_mode: ${{ steps.macos-signing-mode.outputs.mode }}
     steps:
-      - name: Select macOS signing mode
-        id: macos-signing-mode
-        env:
-          MACOS_DEVELOPER_ID_CERTIFICATE_P12: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_P12 }}
-          MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
-          MACOS_DEVELOPER_ID_SIGNING_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_SIGNING_IDENTITY }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
-        run: |
-          configured=0
-          for value in "$MACOS_DEVELOPER_ID_CERTIFICATE_P12" "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$MACOS_DEVELOPER_ID_SIGNING_IDENTITY" "$APPLE_NOTARY_KEY_ID" "$APPLE_NOTARY_ISSUER_ID" "$APPLE_NOTARY_PRIVATE_KEY"; do
-            test -z "$value" || configured=$((configured + 1))
-          done
-          case "$configured" in
-            0)
-              echo 'macOS signing mode: adhoc (no Apple credentials configured).'
-              echo 'mode=adhoc' >> "$GITHUB_OUTPUT"
-              ;;
-            6)
-              echo 'macOS signing mode: developer-id (all Apple credentials configured).'
-              echo 'mode=developer-id' >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "macOS signing configuration is partial ($configured of 6 credentials set); configure all six or none." >&2
-              exit 1
-              ;;
-          esac
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ env.RELEASE_TAG }}
@@ -139,59 +109,22 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - name: Import Developer ID certificate
-        if: needs.validate-tag.outputs.macos_signing_mode == 'developer-id'
-        env:
-          MACOS_DEVELOPER_ID_CERTIFICATE_P12: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_P12 }}
-          MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+      - name: Build, verify, and archive
         run: |
-          keychain="$RUNNER_TEMP/build.keychain-db"
-          printf '%s' "$MACOS_DEVELOPER_ID_CERTIFICATE_P12" | base64 -D > "$RUNNER_TEMP/certificate.p12"
-          security create-keychain -p "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
-          security list-keychain -d user -s "$keychain"
-      - name: Build, sign, and archive
-        env:
-          MACOS_SIGNING_MODE: ${{ needs.validate-tag.outputs.macos_signing_mode }}
-          MACOS_DEVELOPER_ID_SIGNING_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_SIGNING_IDENTITY }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
-        run: |
-          echo "macOS signing mode: $MACOS_SIGNING_MODE"
           task release:clean
-          if [ "$MACOS_SIGNING_MODE" = developer-id ]; then
-            task darwin:package ARCH=amd64 BINARY_NAME=cursor-release-macos-amd64 OUTPUT=bin/cursor-release-macos-amd64 APP_BUNDLE='Cursor助手.app' MACOS_SIGN_IDENTITY="$MACOS_DEVELOPER_ID_SIGNING_IDENTITY"
-            printf '%s' "$APPLE_NOTARY_PRIVATE_KEY" | base64 -D > "$RUNNER_TEMP/AuthKey.p8"
-            ditto -c -k --keepParent 'bin/Cursor助手.app' "$RUNNER_TEMP/notarization.zip"
-            notary_result="$RUNNER_TEMP/notary-result.json"
-            if ! xcrun notarytool submit "$RUNNER_TEMP/notarization.zip" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --output-format json > "$notary_result"; then
-              echo 'Notarization failed; submission result follows.' >&2
-              cat "$notary_result" >&2 || true
-              submission_id="$(python3 - "$notary_result" <<'PY'
-          import json, pathlib, sys
-          try:
-              print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get('id', ''))
-          except (OSError, json.JSONDecodeError):
-              pass
-          PY
-          )"
-              if [ -n "$submission_id" ]; then
-                xcrun notarytool log "$submission_id" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" > "$RUNNER_TEMP/notary-log.json" || true
-                cat "$RUNNER_TEMP/notary-log.json" >&2 || true
-              fi
-              exit 1
-            fi
-            xcrun stapler staple 'bin/Cursor助手.app'
-            spctl --assess --type execute --verbose=4 'bin/Cursor助手.app'
-            xcrun stapler validate 'bin/Cursor助手.app'
-          else
-            task darwin:package ARCH=amd64 BINARY_NAME=cursor-release-macos-amd64 OUTPUT=bin/cursor-release-macos-amd64 APP_BUNDLE='Cursor助手.app'
-          fi
-          codesign --verify --deep --strict --verbose=2 'bin/Cursor助手.app'
+          task darwin:package ARCH=amd64 BINARY_NAME=cursor-release-macos-amd64 OUTPUT=bin/cursor-release-macos-amd64 APP_BUNDLE='Cursor助手.app'
+          app='bin/Cursor助手.app'
+          executable="$app/Contents/MacOS/Cursor助手"
+          test -d "$app/Contents/MacOS"
+          test -d "$app/Contents/Resources"
+          test -f "$app/Contents/Info.plist"
+          test -f "$app/Contents/Resources/icons.icns"
+          test -x "$executable"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          file "$executable"
+          file "$executable" | grep -Eq 'x86_64|amd64'
+          lipo -info "$executable"
+          test "$(lipo -archs "$executable")" = x86_64
           task darwin:create:archive APP_BUNDLE='Cursor助手.app' ARCHIVE_PATH="bin/release/$(go run ./scripts/release version)/cursor-byok-$(go run ./scripts/release version)-macos-amd64.tar.gz"
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
@@ -226,59 +159,22 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - name: Import Developer ID certificate
-        if: needs.validate-tag.outputs.macos_signing_mode == 'developer-id'
-        env:
-          MACOS_DEVELOPER_ID_CERTIFICATE_P12: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_P12 }}
-          MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+      - name: Build, verify, and archive
         run: |
-          keychain="$RUNNER_TEMP/build.keychain-db"
-          printf '%s' "$MACOS_DEVELOPER_ID_CERTIFICATE_P12" | base64 -D > "$RUNNER_TEMP/certificate.p12"
-          security create-keychain -p "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD" "$keychain"
-          security list-keychain -d user -s "$keychain"
-      - name: Build, sign, and archive
-        env:
-          MACOS_SIGNING_MODE: ${{ needs.validate-tag.outputs.macos_signing_mode }}
-          MACOS_DEVELOPER_ID_SIGNING_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_SIGNING_IDENTITY }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
-        run: |
-          echo "macOS signing mode: $MACOS_SIGNING_MODE"
           task release:clean
-          if [ "$MACOS_SIGNING_MODE" = developer-id ]; then
-            task darwin:package ARCH=arm64 BINARY_NAME=cursor-release-macos-arm64 OUTPUT=bin/cursor-release-macos-arm64 APP_BUNDLE='Cursor助手.app' MACOS_SIGN_IDENTITY="$MACOS_DEVELOPER_ID_SIGNING_IDENTITY"
-            printf '%s' "$APPLE_NOTARY_PRIVATE_KEY" | base64 -D > "$RUNNER_TEMP/AuthKey.p8"
-            ditto -c -k --keepParent 'bin/Cursor助手.app' "$RUNNER_TEMP/notarization.zip"
-            notary_result="$RUNNER_TEMP/notary-result.json"
-            if ! xcrun notarytool submit "$RUNNER_TEMP/notarization.zip" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --output-format json > "$notary_result"; then
-              echo 'Notarization failed; submission result follows.' >&2
-              cat "$notary_result" >&2 || true
-              submission_id="$(python3 - "$notary_result" <<'PY'
-          import json, pathlib, sys
-          try:
-              print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get('id', ''))
-          except (OSError, json.JSONDecodeError):
-              pass
-          PY
-          )"
-              if [ -n "$submission_id" ]; then
-                xcrun notarytool log "$submission_id" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" > "$RUNNER_TEMP/notary-log.json" || true
-                cat "$RUNNER_TEMP/notary-log.json" >&2 || true
-              fi
-              exit 1
-            fi
-            xcrun stapler staple 'bin/Cursor助手.app'
-            spctl --assess --type execute --verbose=4 'bin/Cursor助手.app'
-            xcrun stapler validate 'bin/Cursor助手.app'
-          else
-            task darwin:package ARCH=arm64 BINARY_NAME=cursor-release-macos-arm64 OUTPUT=bin/cursor-release-macos-arm64 APP_BUNDLE='Cursor助手.app'
-          fi
-          codesign --verify --deep --strict --verbose=2 'bin/Cursor助手.app'
+          task darwin:package ARCH=arm64 BINARY_NAME=cursor-release-macos-arm64 OUTPUT=bin/cursor-release-macos-arm64 APP_BUNDLE='Cursor助手.app'
+          app='bin/Cursor助手.app'
+          executable="$app/Contents/MacOS/Cursor助手"
+          test -d "$app/Contents/MacOS"
+          test -d "$app/Contents/Resources"
+          test -f "$app/Contents/Info.plist"
+          test -f "$app/Contents/Resources/icons.icns"
+          test -x "$executable"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          file "$executable"
+          file "$executable" | grep -Eq 'arm64|aarch64'
+          lipo -info "$executable"
+          test "$(lipo -archs "$executable")" = arm64
           task darwin:create:archive APP_BUNDLE='Cursor助手.app' ARCHIVE_PATH="bin/release/$(go run ./scripts/release version)/cursor-byok-$(go run ./scripts/release version)-macos-arm64.tar.gz"
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
