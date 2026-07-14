@@ -34,7 +34,8 @@ const (
 	completedExecRetention         = 15 * time.Second
 	nonStreamingExecCloseGrace     = 1500 * time.Millisecond
 	subagentResultGrace            = 2 * time.Second
-	subagentExecutionTimeout       = 30 * time.Minute
+	subagentInactivityTimeout      = 10 * time.Minute
+	subagentMaximumRuntime         = 90 * time.Minute
 	defaultSummaryCompletedThought = "Chat context summarized"
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
@@ -1257,7 +1258,7 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 	}
 	backgroundShellToolCallID, backgroundShellActionWasNew := observeBackgroundShellAction(stream, intent.ClientMessage)
 	backgroundSubagentToolCallID, backgroundSubagentActionWasNew := observeBackgroundSubagentAction(stream, intent.ClientMessage)
-	subagentCompletions := observeBackgroundSubagentCompletions(stream, intent.ClientMessage)
+	subagentProgresses, subagentCompletions := observeBackgroundSubagentCompletions(stream, intent.ClientMessage)
 	observeBackgroundTaskCompletionAction(stream, intent.ClientMessage)
 	if !checkpointConversationInitialized(stream) {
 		if intent.HasExplicitMode {
@@ -1283,6 +1284,9 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 		}))
 	}
 	entries = append(entries, backgroundTaskCompletionMetadataEntries(stream.TurnSeq, stream.RequestID, intent.ClientMessage)...)
+	for _, pending := range subagentProgresses {
+		service.scheduleSubagentLeaseTimeout(stream.RequestID, pending)
+	}
 	for _, pending := range subagentCompletions {
 		service.scheduleSubagentResultTimeout(stream.RequestID, pending, subagentResultGrace, "background completion arrived without subagent result")
 	}
@@ -1852,12 +1856,13 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		pendingExec.ReasoningSignature = invocation.ReasoningSignature
 		pendingExec.ReasoningSignatureSource = invocation.ReasoningSignatureSource
 		pendingExec = initializePendingExecForTracking(pendingExec)
+		pendingExec = initializePendingSubagentLease(pendingExec, time.Now().UTC())
 		stream.mu.Lock()
 		pendingExec.ProviderPass = stream.ProviderPassCount
 		stream.PendingExecs[pendingExec.ExecID] = pendingExec
 		stream.mu.Unlock()
 		service.scheduleShellForegroundRecovery(stream.RequestID, pendingExec)
-		service.scheduleSubagentResultTimeout(stream.RequestID, pendingExec, subagentExecutionTimeout, "execution timeout")
+		service.scheduleSubagentLeaseTimeout(stream.RequestID, pendingExec)
 		removePendingExec := func() {
 			stream.mu.Lock()
 			delete(stream.PendingExecs, pendingExec.ExecID)

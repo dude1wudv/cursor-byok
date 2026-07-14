@@ -1051,6 +1051,15 @@ func (service *Service) handleTimerEvent(stream *ActiveStream, payload *streamTi
 		if !ok || current.MessageID != payload.MessageID || strings.TrimSpace(current.ExecKind) != "subagent" {
 			return nil
 		}
+		if !subagentAwaitingResult(current.StreamState) {
+			delay, reason := subagentTimeoutDelayAndReason(current, time.Now().UTC())
+			if delay > 0 {
+				service.scheduleSubagentResultTimeout(stream.RequestID, current, delay, reason)
+				return nil
+			}
+			payload.Reason = reason
+			service.cancelActiveSubagentRuns(stream, current, reason)
+		}
 		return service.recoverSubagentWithoutResult(stream, current, payload.Reason)
 	case streamTimerOrphanCancel:
 		stream.mu.Lock()

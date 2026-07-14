@@ -236,6 +236,12 @@ type PendingExec struct {
 	StreamState string
 	// OpenedAt 表示执行桥请求发出的时间。
 	OpenedAt time.Time
+	// LastSubagentProgressAt 记录最近一次可信子代理进度事件时间。
+	LastSubagentProgressAt time.Time
+	// SubagentLeaseDeadline 表示子代理在无新进度时的回收期限。
+	SubagentLeaseDeadline time.Time
+	// SubagentHardDeadline 表示子代理不可续期的最大总运行期限。
+	SubagentHardDeadline time.Time
 	// FirstChunkAt 表示 shellStream 首个输出块时间。
 	FirstChunkAt time.Time
 	// ChunkCount 表示 shellStream 已接收的输出块数量。

@@ -11,9 +11,11 @@ import (
 )
 
 const (
-	subagentDispatchLimit       = 4
-	subagentMaximumDepth        = 3
-	subagentDispatchReservation = "subagent_dispatch_reserved"
+	subagentDispatchLimit                = 4
+	subagentMaximumDepth                 = 3
+	subagentDispatchReservation          = "subagent_dispatch_reserved"
+	subagentTimeoutReasonInactivityLease = "inactivity lease expired"
+	subagentTimeoutReasonMaximumRuntime  = "maximum runtime exceeded"
 )
 
 type pendingSubagentLaunch struct {
@@ -172,7 +174,7 @@ func (service *Service) registerPendingSubagentLaunch(launch pendingSubagentLaun
 	}
 	service.subagentLaunchMu.Lock()
 	defer service.subagentLaunchMu.Unlock()
-	cutoff := time.Now().UTC().Add(-subagentExecutionTimeout)
+	cutoff := time.Now().UTC().Add(-subagentMaximumRuntime)
 	retained := service.pendingSubagents[:0]
 	for _, item := range service.pendingSubagents {
 		if item.CreatedAt.After(cutoff) {
@@ -194,7 +196,7 @@ func (service *Service) consumePendingSubagentLaunch(subagentType string, modelI
 	normalizedModel := strings.TrimSpace(modelID)
 	service.subagentLaunchMu.Lock()
 	defer service.subagentLaunchMu.Unlock()
-	cutoff := time.Now().UTC().Add(-subagentExecutionTimeout)
+	cutoff := time.Now().UTC().Add(-subagentMaximumRuntime)
 	for index, item := range service.pendingSubagents {
 		if item.CreatedAt.Before(cutoff) || item.PromptHash != promptHash || !strings.EqualFold(item.SubagentType, normalizedType) {
 			continue
@@ -290,6 +292,48 @@ func countSubagentDispatchReservations(entries []HistoryEntry, callID string, cu
 	return len(seen), duplicate
 }
 
+func initializePendingSubagentLease(pending runtimecore.PendingExec, now time.Time) runtimecore.PendingExec {
+	if strings.TrimSpace(pending.ExecKind) != "subagent" {
+		return pending
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if pending.OpenedAt.IsZero() {
+		pending.OpenedAt = now
+	}
+	if pending.LastSubagentProgressAt.IsZero() {
+		pending.LastSubagentProgressAt = pending.OpenedAt
+	}
+	if pending.SubagentLeaseDeadline.IsZero() {
+		pending.SubagentLeaseDeadline = pending.LastSubagentProgressAt.Add(subagentInactivityTimeout)
+	}
+	if pending.SubagentHardDeadline.IsZero() {
+		pending.SubagentHardDeadline = pending.OpenedAt.Add(subagentMaximumRuntime)
+	}
+	return pending
+}
+
+func subagentTimeoutDelayAndReason(pending runtimecore.PendingExec, now time.Time) (time.Duration, string) {
+	pending = initializePendingSubagentLease(pending, now)
+	deadline := pending.SubagentLeaseDeadline
+	reason := subagentTimeoutReasonInactivityLease
+	if deadline.IsZero() || (!pending.SubagentHardDeadline.IsZero() && pending.SubagentHardDeadline.Before(deadline)) {
+		deadline = pending.SubagentHardDeadline
+		reason = subagentTimeoutReasonMaximumRuntime
+	}
+	return deadline.Sub(now), reason
+}
+
+func subagentAwaitingResult(streamState string) bool {
+	switch strings.TrimSpace(streamState) {
+	case "completed_without_result", "failed_without_result", "aborted_without_result":
+		return true
+	default:
+		return false
+	}
+}
+
 func observeBackgroundSubagentAction(stream *ActiveStream, message *agentv1.AgentClientMessage) (string, bool) {
 	if stream == nil || message == nil || message.GetConversationAction() == nil {
 		return "", false
@@ -315,17 +359,19 @@ func observeBackgroundSubagentAction(stream *ActiveStream, message *agentv1.Agen
 	return toolCallID, wasNew
 }
 
-func observeBackgroundSubagentCompletions(stream *ActiveStream, message *agentv1.AgentClientMessage) []runtimecore.PendingExec {
+func observeBackgroundSubagentCompletions(stream *ActiveStream, message *agentv1.AgentClientMessage) ([]runtimecore.PendingExec, []runtimecore.PendingExec) {
 	if stream == nil || message == nil || message.GetConversationAction() == nil {
-		return nil
+		return nil, nil
 	}
 	item, ok := message.GetConversationAction().GetAction().(*agentv1.ConversationAction_BackgroundTaskCompletionAction)
 	if !ok || item.BackgroundTaskCompletionAction == nil {
-		return nil
+		return nil, nil
 	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	pendingCompletions := make([]runtimecore.PendingExec, 0, len(item.BackgroundTaskCompletionAction.GetCompletions()))
+	now := time.Now().UTC()
+	progresses := make([]runtimecore.PendingExec, 0, len(item.BackgroundTaskCompletionAction.GetCompletions()))
+	completions := make([]runtimecore.PendingExec, 0, len(item.BackgroundTaskCompletionAction.GetCompletions()))
 	for _, completion := range item.BackgroundTaskCompletionAction.GetCompletions() {
 		if completion == nil || completion.GetKind() != agentv1.BackgroundTaskKind_BACKGROUND_TASK_KIND_SUBAGENT {
 			continue
@@ -335,9 +381,15 @@ func observeBackgroundSubagentCompletions(stream *ActiveStream, message *agentv1
 			continue
 		}
 		if completion.GetReason() == agentv1.BackgroundTaskCompletionReason_BACKGROUND_TASK_COMPLETION_REASON_TASK_PROGRESS {
+			if subagentAwaitingResult(pending.StreamState) {
+				continue
+			}
+			pending = initializePendingSubagentLease(pending, now)
 			pending.StreamState = "backgrounded"
+			pending.LastSubagentProgressAt = now
+			pending.SubagentLeaseDeadline = now.Add(subagentInactivityTimeout)
 			stream.PendingExecs[pending.ExecID] = pending
-			stream.UpdatedAt = time.Now().UTC()
+			progresses = append(progresses, pending)
 			continue
 		}
 		switch completion.GetStatus() {
@@ -351,12 +403,12 @@ func observeBackgroundSubagentCompletions(stream *ActiveStream, message *agentv1
 			continue
 		}
 		stream.PendingExecs[pending.ExecID] = pending
-		pendingCompletions = append(pendingCompletions, pending)
+		completions = append(completions, pending)
 	}
-	if len(pendingCompletions) > 0 {
-		stream.UpdatedAt = time.Now().UTC()
+	if len(progresses) > 0 || len(completions) > 0 {
+		stream.UpdatedAt = now
 	}
-	return pendingCompletions
+	return progresses, completions
 }
 
 func findSubagentPendingLocked(stream *ActiveStream, identifier string) (runtimecore.PendingExec, bool) {
@@ -373,6 +425,17 @@ func findSubagentPendingLocked(stream *ActiveStream, identifier string) (runtime
 		}
 	}
 	return runtimecore.PendingExec{}, false
+}
+
+func (service *Service) scheduleSubagentLeaseTimeout(requestID string, pending runtimecore.PendingExec) {
+	if strings.TrimSpace(pending.ExecKind) != "subagent" {
+		return
+	}
+	delay, reason := subagentTimeoutDelayAndReason(pending, time.Now().UTC())
+	if delay <= 0 {
+		delay = time.Nanosecond
+	}
+	service.scheduleSubagentResultTimeout(requestID, pending, delay, reason)
 }
 
 func (service *Service) scheduleSubagentResultTimeout(requestID string, pending runtimecore.PendingExec, delay time.Duration, reason string) {
@@ -392,6 +455,50 @@ func (service *Service) scheduleSubagentResultTimeout(requestID string, pending 
 		pending.MessageID,
 		strings.TrimSpace(reason),
 	)
+}
+
+func (service *Service) cancelActiveSubagentRuns(parent *ActiveStream, pending runtimecore.PendingExec, reason string) {
+	if service == nil || service.broker == nil || parent == nil {
+		return
+	}
+	parentConversationID := strings.TrimSpace(parent.ConversationID)
+	parentToolCallID := strings.TrimSpace(pending.ToolCallID)
+	if parentConversationID == "" || parentToolCallID == "" {
+		return
+	}
+	type candidate struct {
+		requestID string
+		stream    *ActiveStream
+	}
+	candidates := make([]candidate, 0, 1)
+	service.broker.mu.RLock()
+	for requestID, stream := range service.broker.streams {
+		if stream != nil && stream != parent {
+			candidates = append(candidates, candidate{requestID: requestID, stream: stream})
+		}
+	}
+	service.broker.mu.RUnlock()
+	for _, item := range candidates {
+		item.stream.mu.Lock()
+		conversation := item.stream.CheckpointConversation
+		matches := conversation != nil &&
+			strings.TrimSpace(conversation.ParentConversationID) == parentConversationID &&
+			strings.TrimSpace(conversation.ParentToolCallID) == parentToolCallID
+		terminal := isTerminalStreamStatus(item.stream.Status) ||
+			item.stream.Phase == TurnPhaseCanceled || item.stream.Phase == TurnPhaseCompleted || item.stream.Phase == TurnPhaseFailed
+		item.stream.mu.Unlock()
+		if !matches || terminal {
+			continue
+		}
+		_ = service.postStreamCommandAsync(item.stream, streamCommand{
+			Kind: streamCommandCancel,
+			Intent: InboundIntent{
+				Kind:         "cancel",
+				RequestID:    item.requestID,
+				CancelReason: firstNonEmpty(strings.TrimSpace(reason), "subagent lease expired"),
+			},
+		})
+	}
 }
 
 func (service *Service) recoverSubagentWithoutResult(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
