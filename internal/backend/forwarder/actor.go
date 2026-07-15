@@ -512,14 +512,8 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 			shouldEmitSyntheticThinking = strings.TrimSpace(stream.ProviderAccumulatedReasoning) == "" &&
 				strings.TrimSpace(event.ThinkingSignatureSource) == modeladapter.ReasoningSignatureSourceOpenAIResponses
 			if shouldEmitSyntheticThinking {
-				if stream.ProviderSyntheticThinkingStartedAt.IsZero() {
-					stream.ProviderSyntheticThinkingStartedAt = time.Now().UTC()
-				}
 				if completedDuration <= 0 {
-					completedDuration = int32(time.Since(stream.ProviderSyntheticThinkingStartedAt).Milliseconds())
-					if completedDuration <= 0 {
-						completedDuration = 1
-					}
+					completedDuration = 1
 				}
 				if !stream.ProviderSyntheticThinkingPublished {
 					stream.ProviderSyntheticThinkingPublished = true

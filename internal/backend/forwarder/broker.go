@@ -120,11 +120,11 @@ func (broker *StreamBroker) Get(requestID string) (*ActiveStream, bool) {
 	return stream, ok
 }
 
-// Subscribe 为指定 request 注册一个新订阅者，并返回用于唤醒 backlog 消费的信号通道。
-func (broker *StreamBroker) Subscribe(requestID string) (string, <-chan struct{}, error) {
+// Subscribe 为指定 request 注册当前订阅者，接管旧连接并从已成功发送的高水位继续。
+func (broker *StreamBroker) Subscribe(requestID string) (string, <-chan struct{}, <-chan struct{}, int, error) {
 	normalizedRequestID := strings.TrimSpace(requestID)
 	if normalizedRequestID == "" {
-		return "", nil, fmt.Errorf("request_id is required")
+		return "", nil, nil, 0, fmt.Errorf("request_id is required")
 	}
 	stream, ok := broker.Get(normalizedRequestID)
 	if !ok || stream == nil {
@@ -133,19 +133,29 @@ func (broker *StreamBroker) Subscribe(requestID string) (string, <-chan struct{}
 		var err error
 		stream, err = broker.OpenStream(normalizedRequestID, "", 0, "", "", agentv1.AgentMode_AGENT_MODE_AGENT, "")
 		if err != nil {
-			return "", nil, err
+			return "", nil, nil, 0, err
 		}
 	}
 	subscriberID := fmt.Sprintf("sub-%d", broker.nextID.Add(1))
-	subscriber := &StreamSubscriber{Signal: make(chan struct{}, subscriberSignalBufferSize)}
+	subscriber := &StreamSubscriber{
+		Signal: make(chan struct{}, subscriberSignalBufferSize),
+		Done:   make(chan struct{}),
+	}
 
 	stream.mu.Lock()
 	broker.stopTerminalCleanupTimerLocked(stream)
+	for previousID, previous := range stream.Subscribers {
+		delete(stream.Subscribers, previousID)
+		if previous != nil {
+			close(previous.Done)
+		}
+	}
 	stream.Subscribers[subscriberID] = subscriber
+	cursor := stream.DeliveredCursor
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 
-	return subscriberID, subscriber.Signal, nil
+	return subscriberID, subscriber.Signal, subscriber.Done, cursor, nil
 }
 
 func (broker *StreamBroker) stopTerminalCleanupTimerLocked(stream *ActiveStream) {
@@ -345,6 +355,24 @@ func (broker *StreamBroker) ReadFromCursor(requestID string, cursor int) ([]Stre
 		return nil, nil
 	}
 	return append([]StreamEvent(nil), stream.Backlog[cursor:]...), nil
+}
+
+// AdvanceCursor 仅允许当前订阅者推进成功发送高水位。
+func (broker *StreamBroker) AdvanceCursor(requestID string, subscriberID string, cursor int) bool {
+	stream, ok := broker.Get(requestID)
+	if !ok || stream == nil {
+		return false
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if _, ok := stream.Subscribers[strings.TrimSpace(subscriberID)]; !ok {
+		return false
+	}
+	if cursor > stream.DeliveredCursor {
+		stream.DeliveredCursor = cursor
+		stream.UpdatedAt = time.Now().UTC()
+	}
+	return true
 }
 
 // Complete 把活动流标记为成功完成，并发布一个成功 endstream 事件。

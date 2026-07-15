@@ -115,6 +115,7 @@ type StreamEvent struct {
 
 type StreamSubscriber struct {
 	Signal chan struct{}
+	Done   chan struct{}
 }
 
 type ActiveStream struct {
@@ -128,6 +129,7 @@ type ActiveStream struct {
 	Mode                   agentv1.AgentMode
 	LatestUserText         string
 	Status                 StreamStatus
+	RunAccepted            bool
 	ThinkingEffort         string
 	SubagentModelOverrides map[string]runtimecore.SubagentModelOverrideSelection
 
@@ -153,7 +155,6 @@ type ActiveStream struct {
 	ProviderAccumulatedReasoningItemID          string
 	ProviderAccumulatedReasoningStatus          string
 	ProviderAccumulatedReasoningSummary         json.RawMessage
-	ProviderSyntheticThinkingStartedAt          time.Time
 	ProviderSyntheticThinkingPublished          bool
 	ProviderFinishReason                        string
 	ProviderUsage                               turnUsageSnapshot
@@ -161,6 +162,7 @@ type ActiveStream struct {
 	PendingCompaction                           *PendingCompaction
 
 	Backlog                     []StreamEvent
+	DeliveredCursor             int
 	Subscribers                 map[string]*StreamSubscriber
 	CheckpointConversation      *ConversationFile
 	PendingExecs                map[string]runtimecore.PendingExec

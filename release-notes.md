@@ -1,13 +1,3 @@
-- 支持 `AgentService/Run` 与保留的 `RunSSE` 重连流，按 `request_id` 去重重复 Run，避免重复 provider pass。
-- Task 子代理省略 `readonly` 时，generalPurpose 默认可写；explore / longContextRead 始终只读。
-- Task 模型新增 `gpt-5.6-luna`；未配置 Grok 时才回退到已配置的 Luna，二者都不可用则明确失败。
-- 子代理写入终态 `tool_result` 或缺结果恢复时记录 `subagent_dispatch_closed`，已关闭派发不再占用四槽配额。
-- 修复 provider 返回 HTTP 502 或流中途 `unexpected EOF` 时立即停止的问题，改为每分钟重试、最多 5 次，并从 checkpoint 继续。
-- 子代理无进度与最大运行时限调整为 60 / 120 分钟；到期仅交回父代理探活，不再自动取消仍运行的 child。
-- 子代理模型移除 `fast`，新增并推荐 `grok-4.5`，同时保留 Terra / Sol 的显式选择。
-- 修复 Windows 环境在 `PATH` 缺少系统目录时无法找到 `certutil.exe` 的问题，改为从 `SystemRoot` / `windir` 解析绝对路径。
-- 新增可选的 `longContextRead` 只读子代理渠道，用于高速扫描大规模上下文；默认禁用，不影响日常 `explore` 或编码任务。
-- 模型配置页支持选择快速长上下文阅读渠道，并提供 Grok 4.5 的 OpenAI Chat Completions 预设。
-- 修复子代理任务的可写与只读权限边界，确保执行能力按会话模式正确生效。
-- 新增 Windows amd64、macOS arm64 与 macOS amd64 的发布、校验和更新清单链路。
-- macOS `.tar.gz` 使用 ad-hoc 签名，未经过 Apple 公证。首次打开若被 Gatekeeper 拦截，请右键点按“打开”；确认来源后也可执行 `xattr -cr "Cursor助手.app"`。
+- 修复 0.0.48 首次 `Run` 被误判为重复请求、导致无法开始对话的问题。
+- `Run` / `RunSSE` 重连从已成功发送的 `DeliveredCursor` 高水位续传，并由新连接接管单一订阅。
+- 修正仅加密 reasoning 的计时，不再跨 provider pass 累积。

@@ -465,12 +465,13 @@ func (service *Service) RunSSE(ctx context.Context, req *connect.Request[aiserve
 	if requestID == "" {
 		return buildRunSSECustomError(connect.CodeInvalidArgument, "请求参数无效", fmt.Errorf("request_id is required"))
 	}
-	subscriberID, signal, err := service.broker.Subscribe(requestID)
+	subscriberID, signal, subscriberDone, cursor, err := service.broker.Subscribe(requestID)
 	if err != nil {
 		return buildRunSSECustomError(connect.CodeInvalidArgument, "请求参数无效", err)
 	}
 	service.debug.LogRunSSE(ctx, requestID, "", "subscribe", map[string]any{
 		"subscriber_id": subscriberID,
+		"resume_cursor": cursor,
 	})
 	defer func() {
 		remaining := service.broker.Unsubscribe(requestID, subscriberID)
@@ -489,8 +490,15 @@ func (service *Service) RunSSE(ctx context.Context, req *connect.Request[aiserve
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	cursor := 0
 	for {
+		select {
+		case <-subscriberDone:
+			service.debug.LogRunSSE(ctx, requestID, "", "subscriber_replaced", map[string]any{
+				"cursor": cursor,
+			})
+			return nil
+		default:
+		}
 		backlog, err := service.broker.ReadFromCursor(requestID, cursor)
 		if err != nil {
 			service.debug.LogRunSSE(ctx, requestID, "", "read_error", map[string]any{
@@ -518,6 +526,9 @@ func (service *Service) RunSSE(ctx context.Context, req *connect.Request[aiserve
 					})
 				}
 				cursor++
+				if !service.broker.AdvanceCursor(requestID, subscriberID, cursor) {
+					return nil
+				}
 				if event.End {
 					service.debug.LogRunSSE(ctx, requestID, "", "terminal", map[string]any{
 						"cursor":                 cursor,
@@ -530,6 +541,11 @@ func (service *Service) RunSSE(ctx context.Context, req *connect.Request[aiserve
 			continue
 		}
 		select {
+		case <-subscriberDone:
+			service.debug.LogRunSSE(ctx, requestID, "", "subscriber_replaced", map[string]any{
+				"cursor": cursor,
+			})
+			return nil
 		case <-ctx.Done():
 			service.debug.LogRunSSE(ctx, requestID, "", "client_context_done", map[string]any{
 				"cursor": cursor,
@@ -752,12 +768,18 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	intent.UserMessage = normalizeUserMessageForStorage(intent.UserMessage)
 	if stream, ok := service.broker.Get(intent.RequestID); ok && stream != nil {
 		stream.mu.Lock()
-		duplicate := strings.TrimSpace(stream.ConversationID) == strings.TrimSpace(intent.ConversationID) && !isTerminalStreamStatus(stream.Status)
+		runAccepted := stream.RunAccepted
 		providerActive := stream.ProviderActive
+		providerPassCount := stream.ProviderPassCount
+		duplicate := runAccepted &&
+			strings.TrimSpace(stream.ConversationID) == strings.TrimSpace(intent.ConversationID) &&
+			!isTerminalStreamStatus(stream.Status)
 		stream.mu.Unlock()
 		if duplicate {
 			service.debug.LogRuntime(context.Background(), intent.RequestID, intent.ConversationID, "run_request_deduplicated", map[string]any{
-				"provider_active": providerActive,
+				"run_accepted":        runAccepted,
+				"provider_active":     providerActive,
+				"provider_pass_count": providerPassCount,
 			})
 			return nil
 		}
@@ -855,6 +877,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	service.updateStreamMCPToolServers(stream, intent.RequestContext)
 	clearPendingProviderCompletion(stream)
 	stream.mu.Lock()
+	stream.RunAccepted = false
 	stream.ThinkingEffort = strings.TrimSpace(intent.ThinkingEffort)
 	stream.SubagentModelOverrides = cloneSubagentModelOverrides(intent.SubagentModelOverrides)
 	stream.PendingProviderAction = providerActionNone
@@ -877,7 +900,6 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.ProviderAccumulatedReasoningItemID = ""
 	stream.ProviderAccumulatedReasoningStatus = ""
 	stream.ProviderAccumulatedReasoningSummary = nil
-	stream.ProviderSyntheticThinkingStartedAt = time.Time{}
 	stream.ProviderSyntheticThinkingPublished = false
 	stream.ProviderFinishReason = ""
 	stream.ProviderUsage = turnUsageSnapshot{}
@@ -906,9 +928,36 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		return err
 	}
 	if intent.Prewarm {
+		stream.mu.Lock()
+		stream.RunAccepted = true
+		providerActive := stream.ProviderActive
+		providerPassCount := stream.ProviderPassCount
+		stream.UpdatedAt = time.Now().UTC()
+		stream.mu.Unlock()
+		service.debug.LogRuntime(context.Background(), intent.RequestID, intent.ConversationID, "run_request_accepted", map[string]any{
+			"run_accepted":        true,
+			"prewarm":             true,
+			"provider_active":     providerActive,
+			"provider_pass_count": providerPassCount,
+		})
 		return nil
 	}
-	return service.requestProviderAction(stream, providerActionStart)
+	if err := service.requestProviderAction(stream, providerActionStart); err != nil {
+		return err
+	}
+	stream.mu.Lock()
+	stream.RunAccepted = true
+	providerActive := stream.ProviderActive
+	providerPassCount := stream.ProviderPassCount
+	stream.UpdatedAt = time.Now().UTC()
+	stream.mu.Unlock()
+	service.debug.LogRuntime(context.Background(), intent.RequestID, intent.ConversationID, "run_request_accepted", map[string]any{
+		"run_accepted":        true,
+		"prewarm":             false,
+		"provider_active":     providerActive,
+		"provider_pass_count": providerPassCount,
+	})
+	return nil
 }
 
 func (service *Service) loadPreviousSummaryReplay(conversationID string) ([][]byte, bool, error) {
@@ -1421,9 +1470,7 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 	stream.ProviderAccumulatedReasoningItemID = ""
 	stream.ProviderAccumulatedReasoningStatus = ""
 	stream.ProviderAccumulatedReasoningSummary = nil
-	if stream.ProviderSyntheticThinkingStartedAt.IsZero() {
-		stream.ProviderSyntheticThinkingStartedAt = time.Now().UTC()
-	}
+	stream.ProviderSyntheticThinkingPublished = false
 	stream.ProviderFinishReason = ""
 	stream.ProviderUsage = turnUsageSnapshot{}
 	stream.ToolInvocationCount = 0
