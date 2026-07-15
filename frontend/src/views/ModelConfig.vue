@@ -2,6 +2,7 @@
 import Button from "@/components/ui/Button.vue";
 import Card from "@/components/ui/Card.vue";
 import ModelAdapterTestCard from "@/components/ModelAdapterTestCard.vue";
+import Select from "@/components/ui/Select.vue";
 import { showModal } from "@/composables/useModal";
 import {
   appState,
@@ -12,6 +13,7 @@ import {
   openModelEditorWindow,
   reloadUserConfig,
   runModelAdapterTest,
+  saveLongContextReadChannelID,
   startModelAdapterTest,
   toUserError,
 } from "@/state/appState";
@@ -35,6 +37,13 @@ let batchStopRequested = false;
 const filteredAdapters = computed(() =>
   appState.modelAdapters.filter((adapter) => adapter.type === activeType.value),
 );
+const longContextReadChannelOptions = computed(() => [
+  { label: "禁用（默认）", value: "" },
+  ...appState.modelAdapters.map((adapter) => ({
+    label: `${adapter.displayName} · ${adapter.modelID}`,
+    value: adapter.id,
+  })),
+]);
 const batchButtonText = computed(() => {
   if (batchStopping.value) {
     return "停止中...";
@@ -103,6 +112,13 @@ async function openEditor(index = -1) {
     await openModelEditorWindow(index, adapter);
   } catch (error) {
     await showActionError("打开失败", toUserError(error));
+  }
+}
+
+async function handleLongContextReadChannelChange(value) {
+  const result = await saveLongContextReadChannelID(value);
+  if (!result.ok) {
+    await showActionError("保存失败", result.error);
   }
 }
 
@@ -248,6 +264,25 @@ onBeforeUnmount(() => {
           <Button variant="primary" :disabled="appState.configSaving || batchTesting" @click="openEditor()">新增模型</Button>
         </div>
       </div>
+      <Card class="mt-3">
+        <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div class="min-w-0">
+            <div class="text-sm font-medium text-white">快速长上下文阅读（可选）</div>
+            <div class="mt-1 text-xs leading-5 text-[#8f8f8f]">
+              仅在高速扫描大规模上下文时由主代理显式 Task 调用；默认禁用，不用于日常 explore 或编码。
+            </div>
+          </div>
+          <div class="w-full shrink-0 md:w-[320px]">
+            <Select
+              v-model="appState.longContextReadChannelID"
+              :options="longContextReadChannelOptions"
+              :disabled="appState.configSaving"
+              aria-label="快速长上下文阅读渠道"
+              @change="handleLongContextReadChannelChange"
+            />
+          </div>
+        </div>
+      </Card>
     </div>
 
     <div class="min-h-0 flex-1">

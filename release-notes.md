@@ -1,3 +1,6 @@
+- 修复 Windows 环境在 `PATH` 缺少系统目录时无法找到 `certutil.exe` 的问题，改为从 `SystemRoot` / `windir` 解析绝对路径。
+- 新增可选的 `longContextRead` 只读子代理渠道，用于高速扫描大规模上下文；默认禁用，不影响日常 `explore` 或编码任务。
+- 模型配置页支持选择快速长上下文阅读渠道，并提供 Grok 4.5 的 OpenAI Chat Completions 预设。
 - 修复子代理任务的可写与只读权限边界，确保执行能力按会话模式正确生效。
 - 新增 Windows amd64、macOS arm64 与 macOS amd64 的发布、校验和更新清单链路。
 - macOS `.tar.gz` 使用 ad-hoc 签名，未经过 Apple 公证。首次打开若被 Gatekeeper 拦截，请右键点按“打开”；确认来源后也可执行 `xattr -cr "Cursor助手.app"`。

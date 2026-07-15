@@ -140,6 +140,12 @@ const fieldTips = {
   tooltipData: "模型列表 hover 时显示的备注说明。",
 };
 
+function applyGrok45Preset() {
+  draft.type = "openai";
+  draft.modelID = "grok-4.5";
+  draft.openAIEndpoint = OPENAI_ENDPOINT_CHAT_COMPLETIONS;
+}
+
 async function loadContext() {
   try {
     const ctx = await getModelEditorContext();
@@ -283,6 +289,7 @@ onMounted(async () => {
     <div class="flex shrink-0 items-center justify-between px-4 pb-2">
       <h2 class="text-base font-medium text-white">{{ title }}</h2>
       <div class="flex items-center gap-2">
+        <Button variant="default" @click="applyGrok45Preset">Grok 4.5 预设</Button>
         <Button variant="default" @click="handleCancel">取消</Button>
         <Button variant="default" :disabled="isCurrentConfigTesting || appState.configSaving" @click="handleTest">
           {{ isCurrentConfigTesting ? "测试中..." : "保存并测试" }}

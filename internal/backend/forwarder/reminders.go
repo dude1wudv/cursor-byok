@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"cursor/gen/agentv1"
+	runtimecore "cursor/internal/backend/agent/core"
 	modeladapter "cursor/internal/backend/agent/model"
 	promptassets "cursor/prompt"
 )
@@ -44,7 +45,7 @@ func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversa
 		return appendCurrentTurnAttentionReminders(PromptReminders{
 			SystemParts: reminders,
 			PromptContexts: []PromptContextMessage{
-				newPromptContextReminder(promptContextSourceSubagentContract, subagentContractText(readonly)),
+				newPromptContextReminder(promptContextSourceSubagentContract, subagentContractText(readonly, conversation.SubagentTypeName)),
 				newPromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, true, readonly)),
 			},
 		}, latestUserText)
@@ -173,10 +174,13 @@ func newPromptContextReminder(source string, content string) PromptContextMessag
 	)
 }
 
-func subagentContractText(readonly bool) string {
+func subagentContractText(readonly bool, subagentType string) string {
 	responsibility := "You are a writable implementation child. Make the requested changes only in the owned_paths named in your task, then verify those changes before reporting the result. Do not stop at investigation."
 	if readonly {
 		responsibility = "You are a read-only investigation child. Do not modify files, start processes, or save downloaded resources; report only concise findings to the parent agent."
+	}
+	if strings.TrimSpace(subagentType) == runtimecore.SubagentTypeLongContextRead {
+		responsibility = "You are the read-only fast long-context investigation child. Use this run only to scan a large codebase, long logs, or many documents quickly. Do not modify files or perform ordinary implementation work. Return compressed conclusions with precise file paths and line evidence."
 	}
 	return strings.Join([]string{
 		"The turn that contains this reminder runs inside a subagent child conversation. Work for the parent agent, not as the final user-facing assistant.",

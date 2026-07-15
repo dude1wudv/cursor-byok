@@ -85,6 +85,23 @@ func (manager *Manager) Save(ctx context.Context, cfg Config) (Config, error) {
 	return normalized, nil
 }
 
+func (manager *Manager) LongContextReadChannel() (string, bool) {
+	if manager == nil {
+		return "", false
+	}
+	cfg := manager.Current()
+	channelID := strings.TrimSpace(cfg.LongContextReadChannelID)
+	if channelID == "" {
+		return "", true
+	}
+	for _, adapter := range cfg.ModelAdapters {
+		if strings.TrimSpace(adapter.ID) == channelID {
+			return channelID, true
+		}
+	}
+	return channelID, false
+}
+
 func (manager *Manager) LastAgentModelHash() string {
 	if manager == nil {
 		return ""

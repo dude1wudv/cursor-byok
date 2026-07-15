@@ -539,6 +539,7 @@ function normalizeConfig(source) {
     backendListenAddr: asString(raw.configBackendListenAddr) || asString(raw.backendListenAddr),
     proxyListenAddr: asString(raw.configProxyListenAddr) || asString(raw.proxyListenAddr),
     modelAdapters: normalizeModelAdapters(raw.modelAdapters),
+    longContextReadChannelID: asString(raw.longContextReadChannelID),
     routing: {
       mode: normalizeRouteMode(routing.mode),
     },
@@ -584,6 +585,7 @@ function buildConfigPayload(source = appState) {
     backendListenAddr: normalized.backendListenAddr,
     proxyListenAddr: normalized.proxyListenAddr,
     modelAdapters: normalized.modelAdapters.map(({ id, ...adapter }) => adapter),
+    longContextReadChannelID: normalized.longContextReadChannelID,
     routing: normalized.routing,
     homeMetrics: normalized.homeMetrics,
     lastAgentModelHash: normalized.lastAgentModelHash,
@@ -594,9 +596,11 @@ function applyConfigToState(config, { modelAdaptersOnly = false } = {}) {
   const normalized = normalizeConfig(config);
   if (modelAdaptersOnly) {
     appState.modelAdapters = normalized.modelAdapters;
+    appState.longContextReadChannelID = normalized.longContextReadChannelID;
     return normalized;
   }
   appState.modelAdapters = normalized.modelAdapters;
+  appState.longContextReadChannelID = normalized.longContextReadChannelID;
   appState.configBackendListenAddr = normalized.backendListenAddr;
   appState.configProxyListenAddr = normalized.proxyListenAddr;
   appState.routingMode = normalized.routing.mode;
@@ -827,6 +831,7 @@ const cachedConfig = normalizeConfig(cachedState);
 export const appState = reactive({
   appVersion: "",
   modelAdapters: cachedConfig.modelAdapters,
+  longContextReadChannelID: cachedConfig.longContextReadChannelID,
   modelAdapterTestResults: {},
   configBackendListenAddr: cachedConfig.backendListenAddr,
   configProxyListenAddr: cachedConfig.proxyListenAddr,
@@ -1122,6 +1127,28 @@ export async function saveIncludeCacheWriteInHitRate(value) {
   return result;
 }
 
+export async function saveLongContextReadChannelID(value) {
+  const currentConfig = await loadPersistedUserConfig();
+  const previousValue = currentConfig.longContextReadChannelID;
+  const nextValue = asString(value);
+  if (nextValue && !currentConfig.modelAdapters.some((adapter) => adapter.id === nextValue)) {
+    appState.longContextReadChannelID = previousValue;
+    return {
+      ok: false,
+      error: "快速长上下文阅读渠道已失效，请重新选择或禁用",
+    };
+  }
+  appState.longContextReadChannelID = nextValue;
+  const result = await persistConfigPayload({
+    ...currentConfig,
+    longContextReadChannelID: nextValue,
+  });
+  if (!result.ok) {
+    appState.longContextReadChannelID = previousValue;
+  }
+  return result;
+}
+
 export async function saveRoutingMode(mode) {
   const currentConfig = await loadPersistedUserConfig();
   return persistConfigPayload({
@@ -1143,6 +1170,10 @@ export async function saveModelAdapterAt(index, adapter) {
   const nextAdapters = normalizeModelAdapters(currentConfig.modelAdapters);
   const nextAdapter = normalizeModelAdapter(adapter);
   const targetIndex = index >= 0 && index < nextAdapters.length ? index : nextAdapters.length;
+  const previousAdapter = nextAdapters[targetIndex];
+  const selectedChannelChanged = previousAdapter
+    && currentConfig.longContextReadChannelID === previousAdapter.id
+    && buildModelAdapterIdentityKey(previousAdapter) !== buildModelAdapterIdentityKey(nextAdapter);
 
   if (index >= 0 && index < nextAdapters.length) {
     nextAdapters.splice(index, 1, nextAdapter);
@@ -1154,6 +1185,7 @@ export async function saveModelAdapterAt(index, adapter) {
     {
       ...currentConfig,
       modelAdapters: nextAdapters,
+      longContextReadChannelID: selectedChannelChanged ? "" : currentConfig.longContextReadChannelID,
     },
     { modelAdaptersOnly: true },
   );
@@ -1178,12 +1210,16 @@ export async function deleteModelAdapterAt(index) {
     };
   }
 
+  const removedAdapter = nextAdapters[index];
   nextAdapters.splice(index, 1);
 
   return persistConfigPayload(
     {
       ...currentConfig,
       modelAdapters: nextAdapters,
+      longContextReadChannelID: currentConfig.longContextReadChannelID === removedAdapter.id
+        ? ""
+        : currentConfig.longContextReadChannelID,
     },
     { modelAdaptersOnly: true },
   );

@@ -57,6 +57,7 @@ type Config struct {
 	BackendListenAddr         string               `json:"backendListenAddr" yaml:"backendListenAddr"`
 	ProxyListenAddr           string               `json:"proxyListenAddr" yaml:"proxyListenAddr"`
 	ModelAdapters             []ModelAdapterConfig `json:"modelAdapters" yaml:"modelAdapters"`
+	LongContextReadChannelID  string               `json:"longContextReadChannelID" yaml:"longContextReadChannelID"`
 	Routing                   RoutingConfig        `json:"routing" yaml:"routing"`
 	HomeMetrics               HomeMetricsConfig    `json:"homeMetrics" yaml:"homeMetrics"`
 	LastAgentModelHash        string               `json:"lastAgentModelHash" yaml:"lastAgentModelHash"`
@@ -100,6 +101,19 @@ func NormalizeConfig(input Config) (Config, error) {
 		return Config{}, err
 	}
 	output.ModelAdapters = adapters
+	output.LongContextReadChannelID = strings.TrimSpace(input.LongContextReadChannelID)
+	if output.LongContextReadChannelID != "" {
+		found := false
+		for _, adapter := range adapters {
+			if adapter.ID == output.LongContextReadChannelID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return Config{}, errors.New("快速长上下文阅读渠道已失效，请重新选择或禁用")
+		}
+	}
 	return output, nil
 }
 

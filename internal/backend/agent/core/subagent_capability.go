@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+const SubagentTypeLongContextRead = "longContextRead"
+
 // SubagentCapability is the normalized authorization for a Task child.
 type SubagentCapability struct {
 	Type     string
@@ -18,7 +20,7 @@ func ResolveSubagentCapability(subagentType string, readonly bool) (SubagentCapa
 		Readonly: readonly,
 	}
 	switch capability.Type {
-	case "explore":
+	case "explore", SubagentTypeLongContextRead:
 		if !capability.Readonly {
 			return SubagentCapability{}, fmt.Errorf("subagent type %q must be readonly", capability.Type)
 		}

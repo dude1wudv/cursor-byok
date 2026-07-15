@@ -37,9 +37,11 @@ type ExecApplyResult struct {
 
 // OpenExecContext 表示执行桥打开请求时需要的最小上下文。
 type OpenExecContext struct {
-	ConversationID         string
-	ModelID                string
-	SubagentModelOverrides map[string]runtimecore.SubagentModelOverrideSelection
+	ConversationID              string
+	ModelID                     string
+	SubagentModelOverrides      map[string]runtimecore.SubagentModelOverrideSelection
+	LongContextReadChannelID    string
+	LongContextReadChannelValid bool
 }
 
 // ExecBridge 定义执行桥接口。
@@ -799,9 +801,21 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 			case "model":
 				modelID = strings.TrimSpace(override.ModelID)
 			case "inherit":
-				modelID = strings.TrimSpace(openContext.ModelID)
+				if subagentType != runtimecore.SubagentTypeLongContextRead {
+					modelID = strings.TrimSpace(openContext.ModelID)
+				}
 			}
 		}
+	}
+	if subagentType == runtimecore.SubagentTypeLongContextRead && !isConcreteTaskModelSelection(modelID) {
+		channelID := strings.TrimSpace(openContext.LongContextReadChannelID)
+		if channelID == "" {
+			return nil, runtimecore.PendingExec{}, fmt.Errorf("快速长上下文阅读未启用：请在模型配置中选择渠道，或禁用该 Task 类型")
+		}
+		if !openContext.LongContextReadChannelValid {
+			return nil, runtimecore.PendingExec{}, fmt.Errorf("快速长上下文阅读渠道已失效，请重新选择或禁用")
+		}
+		modelID = channelID
 	}
 	if modelID == "" {
 		modelID = strings.TrimSpace(openContext.ModelID)

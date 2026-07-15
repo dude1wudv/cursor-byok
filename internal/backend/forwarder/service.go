@@ -155,6 +155,10 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 }
 
 func rewriteTaskInvocationModelForExecution(invocation runtimecore.ToolInvocation, parentModelID string, overrides map[string]runtimecore.SubagentModelOverrideSelection) runtimecore.ToolInvocation {
+	return rewriteTaskInvocationModelForExecutionWithLongContext(invocation, parentModelID, overrides, "", false)
+}
+
+func rewriteTaskInvocationModelForExecutionWithLongContext(invocation runtimecore.ToolInvocation, parentModelID string, overrides map[string]runtimecore.SubagentModelOverrideSelection, longContextReadChannelID string, longContextReadChannelValid bool) runtimecore.ToolInvocation {
 	if strings.TrimSpace(invocation.ToolName) != "Task" {
 		return invocation
 	}
@@ -167,18 +171,23 @@ func rewriteTaskInvocationModelForExecution(invocation runtimecore.ToolInvocatio
 	if isConcreteTaskModelSelection(requestedModelID) {
 		return invocation
 	}
-	override, _, ok := runtimecore.LookupSubagentModelOverride(overrides, subagentType)
-	if !ok {
-		return invocation
-	}
 	effectiveModelID := ""
-	switch strings.TrimSpace(override.Selection) {
-	case "model":
-		effectiveModelID = strings.TrimSpace(override.ModelID)
-	case "inherit":
-		effectiveModelID = strings.TrimSpace(parentModelID)
-	default:
-		return invocation
+	if override, _, ok := runtimecore.LookupSubagentModelOverride(overrides, subagentType); ok {
+		switch strings.TrimSpace(override.Selection) {
+		case "model":
+			effectiveModelID = strings.TrimSpace(override.ModelID)
+		case "inherit":
+			if subagentType != runtimecore.SubagentTypeLongContextRead {
+				effectiveModelID = strings.TrimSpace(parentModelID)
+			}
+		case "disabled":
+			return invocation
+		default:
+			return invocation
+		}
+	}
+	if subagentType == runtimecore.SubagentTypeLongContextRead && effectiveModelID == "" && longContextReadChannelValid {
+		effectiveModelID = strings.TrimSpace(longContextReadChannelID)
 	}
 	if effectiveModelID == "" {
 		return invocation
@@ -284,6 +293,21 @@ type Service struct {
 type agentModelMemory interface {
 	LastAgentModelHash() string
 	SaveLastAgentModelHash(context.Context, string) error
+}
+
+type longContextReadChannelProvider interface {
+	LongContextReadChannel() (string, bool)
+}
+
+func (service *Service) longContextReadChannel() (string, bool) {
+	if service == nil || service.resolver == nil {
+		return "", false
+	}
+	provider, ok := service.resolver.(longContextReadChannelProvider)
+	if !ok {
+		return "", false
+	}
+	return provider.LongContextReadChannel()
 }
 
 // NewService 使用默认依赖创建 forwarder 服务。
@@ -1787,12 +1811,13 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		return service.completePreDispatchToolError(stream, invocation, nil, false, false, fmt.Errorf("unsupported tool invocation: %s", invocation.ToolName))
 	}
 	var subagentOverrides map[string]runtimecore.SubagentModelOverrideSelection
+	longContextReadChannelID, longContextReadChannelValid := service.longContextReadChannel()
 	if isExecInvocation {
 		subagentOverrides = cloneSubagentModelOverrides(stream.SubagentModelOverrides)
 		if resolutionPayload := taskSubagentModelResolutionPayload(invocation, stream.ModelID, subagentOverrides); resolutionPayload != nil {
 			service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "subagent_model_override_resolved", resolutionPayload)
 		}
-		invocation = rewriteTaskInvocationModelForExecution(invocation, stream.ModelID, subagentOverrides)
+		invocation = rewriteTaskInvocationModelForExecutionWithLongContext(invocation, stream.ModelID, subagentOverrides, longContextReadChannelID, longContextReadChannelValid)
 	}
 	bufferExecDispatch := isExecInvocation && shouldBufferExecDispatch(invocation.ToolName)
 	suppressStartedToolCall := shouldSuppressStartedToolCallAfterPartial(stream, trimmedToolName, invocation.CallID)
@@ -1844,9 +1869,11 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	}
 	if isExecInvocation {
 		serverMessage, pendingExec, err := service.execBridge.OpenExec(execbridge.OpenExecContext{
-			ConversationID:         stream.ConversationID,
-			ModelID:                stream.ModelID,
-			SubagentModelOverrides: subagentOverrides,
+			ConversationID:              stream.ConversationID,
+			ModelID:                     stream.ModelID,
+			SubagentModelOverrides:      subagentOverrides,
+			LongContextReadChannelID:    longContextReadChannelID,
+			LongContextReadChannelValid: longContextReadChannelValid,
 		}, invocation)
 		if err != nil {
 			return service.completePreDispatchToolError(stream, invocation, startedToolCall, startedToolCall != nil, startedEmitted, err)
