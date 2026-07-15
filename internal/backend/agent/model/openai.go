@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"cursor/gen/agentv1"
 	runtimecore "cursor/internal/backend/agent/core"
@@ -485,6 +486,9 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 		return err
 	}
+	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 {
+		bodyMap["max_output_tokens"] = req.MaxTokens
+	}
 	body = bodyMap
 	requestURL := OpenAIEndpointURL(baseURL, req.OpenAIEndpoint)
 	recordLLMRequestArtifact(req, "openai", modelID, "POST", requestURL, body)
@@ -916,14 +920,12 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			return err
 		}
 		requestBody := openAIResponsesRequestBody{
-			Model:        modelID,
-			Instructions: instructions,
-			Input:        input,
-			Stream:       true,
-			Store:        false,
-		}
-		if shouldSendOpenAIMaxOutputTokens(modelID) {
-			requestBody.MaxOutputTokens = req.MaxTokens
+			Model:           modelID,
+			Instructions:    instructions,
+			Input:           input,
+			Stream:          true,
+			Store:           false,
+			MaxOutputTokens: req.MaxTokens,
 		}
 		if key := openAIPromptCacheKey(req, modelID); key != "" {
 			requestBody.PromptCacheKey = key
@@ -962,6 +964,9 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		finishedAt = time.Now().UTC()
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 		return err
+	}
+	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 {
+		bodyMap["max_output_tokens"] = req.MaxTokens
 	}
 	body = bodyMap
 
@@ -1050,16 +1055,19 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		} `json:"error,omitempty"`
 	}
 	type openAIResponsesStreamEvent struct {
-		Type            string                     `json:"type"`
-		RequestID       string                     `json:"request_id"`
-		Delta           string                     `json:"delta"`
-		Arguments       string                     `json:"arguments"`
-		PartialImageB64 string                     `json:"partial_image_b64"`
-		OutputFormat    string                     `json:"output_format"`
-		OutputIndex     int                        `json:"output_index"`
-		ItemID          string                     `json:"item_id"`
-		Item            *openAIResponsesOutputItem `json:"item,omitempty"`
-		Response        *openAIResponsesResponse   `json:"response,omitempty"`
+		Type            string                        `json:"type"`
+		RequestID       string                        `json:"request_id"`
+		Delta           string                        `json:"delta"`
+		Text            string                        `json:"text"`
+		Arguments       string                        `json:"arguments"`
+		PartialImageB64 string                        `json:"partial_image_b64"`
+		OutputFormat    string                        `json:"output_format"`
+		OutputIndex     int                           `json:"output_index"`
+		SummaryIndex    int                           `json:"summary_index"`
+		ItemID          string                        `json:"item_id"`
+		Part            *openAIResponsesOutputContent `json:"part,omitempty"`
+		Item            *openAIResponsesOutputItem    `json:"item,omitempty"`
+		Response        *openAIResponsesResponse      `json:"response,omitempty"`
 		Error           *struct {
 			Message string `json:"message"`
 			Type    string `json:"type"`
@@ -1082,6 +1090,8 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	firstEventAt := time.Time{}
 	finishReason := ""
 	turnFinishedPending := false
+	terminalSeen := false
+	responseIncomplete := false
 	emittedToolInvocation := false
 	emittedText := false
 	thinkingStarted := time.Time{}
@@ -1091,6 +1101,8 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	pendingReasoningItemID := ""
 	pendingReasoningStatus := ""
 	var pendingReasoningSummary json.RawMessage
+	reasoningSummaryParts := make(map[int]string)
+	reasoningSummaryText := ""
 	thinkParser := &openAIThinkTagParser{}
 	toolKey := func(itemID string, outputIndex int) string {
 		if strings.TrimSpace(itemID) != "" {
@@ -1174,6 +1186,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			CacheReadPresent:  cacheReadPresent,
 			CacheWritePresent: cacheWritePresent,
 			FinishReason:      effectiveFinishReason(),
+			Incomplete:        responseIncomplete,
 		})
 	}
 	emitTextDelta := func(text string) error {
@@ -1210,6 +1223,34 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			Text:          reasoning,
 			ThinkingStyle: agentv1.ThinkingStyle_THINKING_STYLE_DEFAULT,
 		})
+	}
+	emitReasoningSummaryPart := func(summaryIndex int, text string, complete bool) error {
+		if text == "" {
+			return nil
+		}
+		seen := reasoningSummaryParts[summaryIndex]
+		if complete {
+			if strings.HasPrefix(text, seen) {
+				text = strings.TrimPrefix(text, seen)
+			} else if seen != "" {
+				return nil
+			}
+		}
+		if text == "" {
+			return nil
+		}
+		if seen == "" && reasoningSummaryText != "" && needsReasoningPartSeparator(reasoningSummaryText, text) {
+			if err := emitThinkingDelta("\n\n"); err != nil {
+				return err
+			}
+			reasoningSummaryText += "\n\n"
+		}
+		if err := emitThinkingDelta(text); err != nil {
+			return err
+		}
+		reasoningSummaryParts[summaryIndex] += text
+		reasoningSummaryText += text
+		return nil
 	}
 	emitTaggedContentParts := func(parts []openAIContentPart) error {
 		for _, part := range parts {
@@ -1491,21 +1532,14 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		}
 		payloadLine := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payloadLine == "[DONE]" {
+			if !terminalSeen {
+				return fail(fmt.Errorf("openai responses stream ended before terminal response event"))
+			}
 			if err := flushTaggedContentTail(); err != nil {
 				return fail(err)
 			}
 			if err := flushThinkingCompleted(); err != nil {
 				return fail(err)
-			}
-			for key, accumulator := range tools {
-				if err := completeTool(key, accumulator); err != nil {
-					return fail(err)
-				}
-			}
-			for key, accumulator := range imageGenerations {
-				if err := completeImageGeneration(key, accumulator); err != nil {
-					return fail(err)
-				}
 			}
 			if err := flushTurnFinished(); err != nil {
 				return fail(err)
@@ -1593,11 +1627,27 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 					return fail(err)
 				}
 			}
-		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+			if event.Part != nil && strings.TrimSpace(event.Part.Type) == "summary_text" {
+				if err := emitReasoningSummaryPart(event.SummaryIndex, event.Part.Text, strings.HasSuffix(event.Type, ".done")); err != nil {
+					return fail(err)
+				}
+			}
+		case "response.reasoning_summary_text.delta":
+			if err := emitReasoningSummaryPart(event.SummaryIndex, event.Delta, false); err != nil {
+				return fail(err)
+			}
+		case "response.reasoning_summary_text.done":
+			if err := emitReasoningSummaryPart(event.SummaryIndex, event.Text, true); err != nil {
+				return fail(err)
+			}
+		case "response.reasoning_text.delta":
 			if err := emitThinkingDelta(event.Delta); err != nil {
 				return fail(err)
 			}
 		case "response.completed", "response.incomplete":
+			terminalSeen = true
+			responseIncomplete = strings.TrimSpace(event.Type) == "response.incomplete"
 			if event.Response != nil && !emittedText {
 				if strings.TrimSpace(event.Response.OutputText) != "" {
 					if err := emitTaggedContentParts(thinkParser.Consume(event.Response.OutputText)); err != nil {
@@ -1621,7 +1671,8 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			}
 			if event.Response != nil {
 				for index, item := range event.Response.Output {
-					if err := applyOutputItem(item, index, true); err != nil {
+					completeItem := !responseIncomplete || strings.TrimSpace(item.Status) == "completed"
+					if err := applyOutputItem(item, index, completeItem); err != nil {
 						return fail(err)
 					}
 				}
@@ -1629,6 +1680,9 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 				if event.Response.IncompleteDetails != nil && strings.TrimSpace(event.Response.IncompleteDetails.Reason) != "" {
 					finishReason = strings.TrimSpace(event.Response.IncompleteDetails.Reason)
 				}
+			}
+			if responseIncomplete && strings.TrimSpace(finishReason) == "" {
+				finishReason = "incomplete"
 			}
 			if err := flushThinkingCompleted(); err != nil {
 				return fail(err)
@@ -1638,21 +1692,14 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			return fail(errorFromEvent(event))
 		}
 	}
-	for key, accumulator := range tools {
-		if err := completeTool(key, accumulator); err != nil {
-			return fail(err)
-		}
-	}
-	for key, accumulator := range imageGenerations {
-		if err := completeImageGeneration(key, accumulator); err != nil {
-			return fail(err)
-		}
-	}
 	if err := scanner.Err(); err != nil {
 		if idleErr := streamIdle.Err(); idleErr != nil {
 			return fail(idleErr)
 		}
 		return fail(err)
+	}
+	if !terminalSeen {
+		return fail(fmt.Errorf("openai responses stream ended before terminal response event"))
 	}
 	if err := flushTaggedContentTail(); err != nil {
 		return fail(err)
@@ -1688,6 +1735,12 @@ func maxInt64(value int64, floor int64) int64 {
 	return value
 }
 
+func needsReasoningPartSeparator(previous string, next string) bool {
+	return previous != "" && next != "" &&
+		strings.TrimRightFunc(previous, unicode.IsSpace) == previous &&
+		strings.TrimLeftFunc(next, unicode.IsSpace) == next
+}
+
 func openAIResponsesReasoningSummaryText(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -1701,9 +1754,13 @@ func openAIResponsesReasoningSummaryText(raw json.RawMessage) string {
 	}
 	var text strings.Builder
 	for _, part := range parts {
-		if strings.TrimSpace(part.Type) == "summary_text" {
-			text.WriteString(part.Text)
+		if strings.TrimSpace(part.Type) != "summary_text" || part.Text == "" {
+			continue
 		}
+		if needsReasoningPartSeparator(text.String(), part.Text) {
+			text.WriteString("\n\n")
+		}
+		text.WriteString(part.Text)
 	}
 	return text.String()
 }

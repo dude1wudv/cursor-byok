@@ -33,11 +33,13 @@ const (
 	providerResumeDebounce         = 200 * time.Millisecond
 	providerRetryInterval          = time.Minute
 	providerRetryLimit             = 5
+	providerContinuationLimit      = 3
 	completedExecRetention         = 15 * time.Second
 	nonStreamingExecCloseGrace     = 1500 * time.Millisecond
 	subagentResultGrace            = 2 * time.Second
 	subagentInactivityTimeout      = 60 * time.Minute
-	subagentMaximumRuntime         = 120 * time.Minute
+	subagentLaunchCorrelationTTL   = 120 * time.Minute
+	subagentMaximumRuntime         = subagentLaunchCorrelationTTL
 	defaultSummaryCompletedThought = "Chat context summarized"
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
@@ -807,6 +809,10 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	if err != nil {
 		return err
 	}
+	if isChildConversationSubagentTypeName(intent.SubagentTypeName) && !hasMatchedLaunch && strings.TrimSpace(conversation.ParentConversationID) == "" {
+		prompt := userMessageText(intent.UserMessage)
+		return fmt.Errorf("subagent launch correlation mismatch: prompt_bytes=%d prompt_sha256=%s", len([]byte(prompt)), planContentHash(prompt))
+	}
 	if hasMatchedLaunch {
 		conversation.ParentConversationID = matchedLaunch.ParentConversationID
 		conversation.ParentToolCallID = matchedLaunch.ParentToolCallID
@@ -893,6 +899,8 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.CurrentCompactionToken = 0
 	stream.ProviderRetryCount = 0
 	stream.ProviderLastRetryError = ""
+	stream.ProviderContinuationCount = 0
+	stream.ProviderIncomplete = false
 	stream.ProviderAccumulatedText = ""
 	stream.ProviderAccumulatedReasoning = ""
 	stream.ProviderAccumulatedReasoningSignature = ""
@@ -902,6 +910,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.ProviderAccumulatedReasoningSummary = nil
 	stream.ProviderSyntheticThinkingPublished = false
 	stream.ProviderFinishReason = ""
+	stream.ProviderIncomplete = false
 	stream.ProviderUsage = turnUsageSnapshot{}
 	stream.ToolInvocationCount = 0
 	stream.UpdatedAt = time.Now().UTC()
@@ -1101,8 +1110,10 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		if err := service.closeSubagentDispatch(stream, pending, "tool_result"); err != nil {
 			return err
 		}
+		service.removePendingSubagentLaunch(stream.ConversationID, pending.ToolCallID)
 	}
-	if err := service.publishToolCallCompleted(intent.RequestID, result.ToolCallID, pending.ModelCallID, result.ToolCall); err != nil {
+	displayToolCall := stripTaskPromptForDisplay(result.ToolCall)
+	if err := service.publishToolCallCompleted(intent.RequestID, result.ToolCallID, pending.ModelCallID, displayToolCall); err != nil {
 		return err
 	}
 	if err := service.syncSummaryCarryForward(stream.ConversationID, intent.RequestID, pending.ModelCallID); err != nil {
@@ -1158,6 +1169,12 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 	markExecCompleted(stream, pending)
 	if strings.TrimSpace(pending.ExecKind) == "execute_hook_pre_compact" {
 		return service.handlePreCompactTerminal(stream, pending.ProviderPass, "")
+	}
+	if strings.TrimSpace(pending.ExecKind) == "subagent" {
+		if err := service.closeSubagentDispatch(stream, pending, "control_terminal"); err != nil {
+			return err
+		}
+		service.removePendingSubagentLaunch(stream.ConversationID, pending.ToolCallID)
 	}
 	if strings.TrimSpace(result.ToolResultPayload) != "" {
 		if err := service.appendToolResult(stream, pending.ToolCallID, deriveToolNameFromPendingExec(pending), pending.ArgsJSON, result.ToolResultPayload, pending.ReasoningContent, nil); err != nil {
@@ -1351,7 +1368,7 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 	}
 	backgroundShellToolCallID, backgroundShellActionWasNew := observeBackgroundShellAction(stream, intent.ClientMessage)
 	backgroundSubagentToolCallID, backgroundSubagentActionWasNew := observeBackgroundSubagentAction(stream, intent.ClientMessage)
-	subagentProgresses, subagentCompletions := observeBackgroundSubagentCompletions(stream, intent.ClientMessage)
+	_, subagentCompletions := observeBackgroundSubagentCompletions(stream, intent.ClientMessage)
 	observeBackgroundTaskCompletionAction(stream, intent.ClientMessage)
 	if !checkpointConversationInitialized(stream) {
 		if intent.HasExplicitMode {
@@ -1377,9 +1394,6 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 		}))
 	}
 	entries = append(entries, backgroundTaskCompletionMetadataEntries(stream.TurnSeq, stream.RequestID, intent.ClientMessage)...)
-	for _, pending := range subagentProgresses {
-		service.scheduleSubagentLeaseTimeout(stream.RequestID, pending)
-	}
 	for _, pending := range subagentCompletions {
 		service.scheduleSubagentResultTimeout(stream.RequestID, pending, subagentResultGrace, "background completion arrived without subagent result")
 	}
@@ -1472,6 +1486,7 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 	stream.ProviderAccumulatedReasoningSummary = nil
 	stream.ProviderSyntheticThinkingPublished = false
 	stream.ProviderFinishReason = ""
+	stream.ProviderIncomplete = false
 	stream.ProviderUsage = turnUsageSnapshot{}
 	stream.ToolInvocationCount = 0
 	modelCallID := stream.CurrentModelCallID
@@ -1843,6 +1858,10 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		if quotaErr != nil {
 			return service.completePreDispatchToolError(stream, invocation, nil, false, false, quotaErr)
 		}
+		stream.mu.Lock()
+		parentThinkingEffort := stream.ThinkingEffort
+		stream.mu.Unlock()
+		invocation = rewriteTaskInvocationThinkingEffort(invocation, parentThinkingEffort)
 	}
 	var err error
 	invocation, err = service.sanitizeCreatePlanInvocationForCurrentPlan(stream, invocation)
@@ -1885,19 +1904,27 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "subagent_model_override_resolved", resolutionPayload)
 		}
 		invocation = rewriteTaskInvocationModelForExecutionWithLongContext(invocation, stream.ModelID, subagentOverrides, longContextReadChannelID, longContextReadChannelValid)
+		if trimmedToolName == "Task" {
+			if err := service.recordEffectiveSubagentDispatch(stream, invocation); err != nil {
+				pending := runtimecore.PendingExec{ToolCallID: invocation.CallID, ExecKind: "subagent"}
+				service.rollbackSubagentDispatch(stream, pending, "effective_metadata_failed")
+				return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
+			}
+		}
 	}
 	bufferExecDispatch := isExecInvocation && shouldBufferExecDispatch(invocation.ToolName)
 	suppressStartedToolCall := shouldSuppressStartedToolCallAfterPartial(stream, trimmedToolName, invocation.CallID)
 	startedToolCall := service.buildTaskToolCallForDisplay(invocation)
+	historyToolCall := buildStartedToolCall(invocation)
 	startedEmitted := suppressStartedToolCall
 	ensureLoopActive := func() error {
 		return providerLoopInterruptErr(nil, stream, invocation.ModelCallID)
 	}
-	if startedToolCall != nil {
+	if historyToolCall != nil {
 		if err := ensureLoopActive(); err != nil {
 			return err
 		}
-		toolCallPayload, err := protojson.Marshal(startedToolCall)
+		toolCallPayload, err := protojson.Marshal(historyToolCall)
 		if err != nil {
 			return err
 		}
@@ -1943,9 +1970,14 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			LongContextReadChannelValid: longContextReadChannelValid,
 		}, invocation)
 		if err != nil {
-			return service.completePreDispatchToolError(stream, invocation, startedToolCall, startedToolCall != nil, startedEmitted, err)
+			if trimmedToolName == "Task" {
+				pending := runtimecore.PendingExec{ToolCallID: invocation.CallID, ExecKind: "subagent"}
+				service.rollbackSubagentDispatch(stream, pending, "open_exec_failed")
+			}
+			return service.completePreDispatchToolError(stream, invocation, startedToolCall, historyToolCall != nil, startedEmitted, err)
 		}
 		pendingExec.ModelCallID = invocation.ModelCallID
+		service.logTaskDispatchPayloads(stream, invocation, startedToolCall, serverMessage)
 		pendingExec.ReasoningContent = invocation.ReasoningContent
 		pendingExec.ReasoningSignature = invocation.ReasoningSignature
 		pendingExec.ReasoningSignatureSource = invocation.ReasoningSignatureSource
@@ -1955,64 +1987,75 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		pendingExec.ProviderPass = stream.ProviderPassCount
 		stream.PendingExecs[pendingExec.ExecID] = pendingExec
 		stream.mu.Unlock()
-		service.scheduleShellForegroundRecovery(stream.RequestID, pendingExec)
-		service.scheduleSubagentLeaseTimeout(stream.RequestID, pendingExec)
-		removePendingExec := func() {
+		scheduleExecRecovery := func() {
+			service.scheduleShellForegroundRecovery(stream.RequestID, pendingExec)
+			service.scheduleSubagentLeaseTimeout(stream.RequestID, pendingExec)
+		}
+		removePendingExec := func(reason string) {
+			if strings.TrimSpace(pendingExec.ExecKind) == "subagent" {
+				service.rollbackSubagentDispatch(stream, pendingExec, reason)
+				return
+			}
 			stream.mu.Lock()
 			delete(stream.PendingExecs, pendingExec.ExecID)
 			stream.mu.Unlock()
 		}
+		failExecDispatch := func(cause error) error {
+			removePendingExec("dispatch_failed")
+			if strings.TrimSpace(pendingExec.ExecKind) != "subagent" {
+				return cause
+			}
+			return service.completePreDispatchToolError(
+				stream,
+				invocation,
+				startedToolCall,
+				historyToolCall != nil,
+				startedEmitted,
+				fmt.Errorf("Task dispatch failed: %w", cause),
+			)
+		}
 		if err := ensureLoopActive(); err != nil {
-			removePendingExec()
-			return err
+			return failExecDispatch(err)
 		}
 		if bufferExecDispatch {
 			if err := ensureLoopActive(); err != nil {
-				removePendingExec()
-				return err
+				return failExecDispatch(err)
 			}
 			if err := service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage}); err != nil {
-				removePendingExec()
-				return err
+				return failExecDispatch(err)
 			}
+			scheduleExecRecovery()
 			if err := ensureLoopActive(); err != nil {
-				removePendingExec()
-				return err
+				return failExecDispatch(err)
 			}
 			if err := service.broker.Publish(stream.RequestID, StreamEvent{
 				Message: buildToolCallStartedMessage(invocation.CallID, invocation.ModelCallID, startedToolCall),
 			}); err != nil {
-				removePendingExec()
-				return err
+				return failExecDispatch(err)
 			}
 			startedEmitted = true
 			service.recordExecDispatchMetadata(stream, pendingExec, true, startedEmitted, "exec_then_started_then_checkpoint")
 			if err := ensureLoopActive(); err != nil {
-				removePendingExec()
-				return err
+				return failExecDispatch(err)
 			}
 			if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
-				removePendingExec()
-				return err
+				return failExecDispatch(err)
 			}
 			return nil
 		}
 		if err := ensureLoopActive(); err != nil {
-			removePendingExec()
-			return err
+			return failExecDispatch(err)
 		}
 		if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
-			removePendingExec()
-			return err
+			return failExecDispatch(err)
 		}
 		if err := ensureLoopActive(); err != nil {
-			removePendingExec()
-			return err
+			return failExecDispatch(err)
 		}
 		if err := service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage}); err != nil {
-			removePendingExec()
-			return err
+			return failExecDispatch(err)
 		}
+		scheduleExecRecovery()
 		service.recordExecDispatchMetadata(stream, pendingExec, false, startedEmitted, "started_then_checkpoint_then_exec")
 		return nil
 	}
@@ -2039,6 +2082,23 @@ func shouldSuppressStartedToolCallAfterPartial(stream *ActiveStream, toolName st
 	}
 	_, ok := stream.PartialToolCallIDs[trimmedCallID]
 	return ok
+}
+
+func (service *Service) logTaskDispatchPayloads(stream *ActiveStream, invocation runtimecore.ToolInvocation, startedToolCall *agentv1.ToolCall, serverMessage *agentv1.AgentServerMessage) {
+	if service == nil || stream == nil || strings.TrimSpace(invocation.ToolName) != "Task" {
+		return
+	}
+	var args map[string]any
+	_ = json.Unmarshal(invocation.ArgsJSON, &args)
+	prompt := readStringMapValue(args, "prompt")
+	startedMessage := buildToolCallStartedMessage(invocation.CallID, invocation.ModelCallID, startedToolCall)
+	service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "subagent_dispatch_payload_sizes", map[string]any{
+		"tool_call_id":        strings.TrimSpace(invocation.CallID),
+		"prompt_utf8_bytes":   len([]byte(prompt)),
+		"prompt_sha256":       planContentHash(prompt),
+		"started_proto_bytes": proto.Size(startedMessage),
+		"exec_proto_bytes":    proto.Size(serverMessage),
+	})
 }
 
 func (service *Service) recordExecDispatchMetadata(stream *ActiveStream, pending runtimecore.PendingExec, buffered bool, startedEmitted bool, dispatchOrder string) {
@@ -2069,7 +2129,7 @@ func (service *Service) recordExecDispatchMetadata(stream *ActiveStream, pending
 // 避免客户端在参数仍未稳定前过早起计时，同时保留显式的工具开始信号。
 func shouldBufferExecDispatch(toolName string) bool {
 	switch strings.TrimSpace(toolName) {
-	case "Read", "Grep", "Glob":
+	case "Read", "Grep", "Glob", "Task":
 		return true
 	default:
 		return false
@@ -2371,16 +2431,25 @@ func (service *Service) rewriteCheckpointTaskModelsForDisplay(state *agentv1.Con
 			if taskToolCall == nil || taskToolCall.GetArgs() == nil {
 				continue
 			}
-			modelID := taskToolCall.GetArgs().GetModel()
+			taskArgs := taskToolCall.GetArgs()
+			stepChanged := false
+			if taskArgs.GetPrompt() != "" {
+				taskArgs.Prompt = ""
+				stepChanged = true
+			}
+			modelID := taskArgs.GetModel()
 			baseModelID, suffix, hasSuffix := strings.Cut(modelID, " · ")
 			displayName := service.resolveRequestedModelName(nil, baseModelID)
-			if displayName == "" || displayName == baseModelID {
+			if displayName != "" && displayName != baseModelID {
+				if hasSuffix {
+					displayName += " · " + suffix
+				}
+				taskArgs.Model = stringPtr(displayName)
+				stepChanged = true
+			}
+			if !stepChanged {
 				continue
 			}
-			if hasSuffix {
-				displayName += " · " + suffix
-			}
-			taskToolCall.Args.Model = stringPtr(displayName)
 			encodedStep, err := proto.Marshal(step)
 			if err != nil {
 				continue
@@ -2416,8 +2485,12 @@ func (service *Service) publishCheckpoint(requestID string, _ string) error {
 	service.rewriteCheckpointTaskModelsForDisplay(state)
 	state.PendingToolCalls = buildPendingToolCalls(pendingExecs, pendingInteractions)
 	service.rewriteCheckpointTokenDetailsForClient(stream, conversation, state)
+	message := buildCheckpointMessage(state)
+	service.debug.LogRuntime(context.Background(), requestID, conversation.ConversationID, "checkpoint_payload_size", map[string]any{
+		"proto_bytes": proto.Size(message),
+	})
 	return service.broker.Publish(requestID, StreamEvent{
-		Message: buildCheckpointMessage(state),
+		Message: message,
 	})
 }
 
@@ -3419,6 +3492,17 @@ func pendingAssistantToolShape(pending runtimecore.PendingExec) (string, []byte,
 			return "", nil, false
 		}
 		return "Write", argsJSON, true
+	case "subagent":
+		var args map[string]any
+		if err := json.Unmarshal(pending.ArgsJSON, &args); err != nil {
+			return "", nil, false
+		}
+		args["prompt"] = ""
+		argsJSON, err := json.Marshal(args)
+		if err != nil {
+			return "", nil, false
+		}
+		return "Task", argsJSON, true
 	default:
 		toolName := strings.TrimSpace(deriveToolNameFromPendingExec(pending))
 		if toolName == "" {

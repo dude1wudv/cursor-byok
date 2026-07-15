@@ -375,7 +375,8 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 	usagePresent := false
 	cacheReadPresent := false
 	cacheWritePresent := false
-	finishReason := "message_stop"
+	finishReason := ""
+	terminalSeen := false
 	firstEventAt := time.Time{}
 	fail := func(streamErr error) error {
 		finishedAt = time.Now().UTC()
@@ -628,6 +629,7 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 			// 当前 MVP 阶段只在 message_stop 时统一收口，不在这里重复发 turn finished。
 			return nil
 		case "message_stop":
+			terminalSeen = true
 			if err := flushTaggedTextTail(); err != nil {
 				return err
 			}
@@ -684,6 +686,9 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 			return fail(idleErr)
 		}
 		return fail(err)
+	}
+	if !terminalSeen {
+		return fail(fmt.Errorf("anthropic stream ended before message_stop"))
 	}
 	if err := flushTaggedTextTail(); err != nil {
 		return fail(err)

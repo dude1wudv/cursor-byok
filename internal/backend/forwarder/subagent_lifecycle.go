@@ -3,17 +3,20 @@ package forwarder
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
 	"cursor/gen/agentv1"
 	runtimecore "cursor/internal/backend/agent/core"
+	modeladapter "cursor/internal/backend/agent/model"
 )
 
 const (
 	subagentDispatchLimit                = 4
 	subagentMaximumDepth                 = 3
 	subagentDispatchReservation          = "subagent_dispatch_reserved"
+	subagentDispatchEffective            = "subagent_dispatch_effective"
 	subagentDispatchClosed               = "subagent_dispatch_closed"
 	subagentTimeoutReasonInactivityLease = "inactivity lease expired"
 	subagentTimeoutReasonMaximumRuntime  = "maximum runtime exceeded"
@@ -179,7 +182,7 @@ func (service *Service) registerPendingSubagentLaunch(launch pendingSubagentLaun
 	}
 	service.subagentLaunchMu.Lock()
 	defer service.subagentLaunchMu.Unlock()
-	cutoff := time.Now().UTC().Add(-subagentMaximumRuntime)
+	cutoff := time.Now().UTC().Add(-subagentLaunchCorrelationTTL)
 	retained := service.pendingSubagents[:0]
 	for _, item := range service.pendingSubagents {
 		if item.CreatedAt.After(cutoff) {
@@ -201,7 +204,7 @@ func (service *Service) consumePendingSubagentLaunch(subagentType string, modelI
 	normalizedModel := strings.TrimSpace(modelID)
 	service.subagentLaunchMu.Lock()
 	defer service.subagentLaunchMu.Unlock()
-	cutoff := time.Now().UTC().Add(-subagentMaximumRuntime)
+	cutoff := time.Now().UTC().Add(-subagentLaunchCorrelationTTL)
 	for index, item := range service.pendingSubagents {
 		if item.CreatedAt.Before(cutoff) || item.PromptHash != promptHash || !strings.EqualFold(item.SubagentType, normalizedType) {
 			continue
@@ -240,6 +243,75 @@ func taskThinkingEffortDisplayName(effort string) string {
 		return "Max"
 	default:
 		return ""
+	}
+}
+
+func rewriteTaskInvocationThinkingEffort(invocation runtimecore.ToolInvocation, parentThinkingEffort string) runtimecore.ToolInvocation {
+	if strings.TrimSpace(invocation.ToolName) != "Task" {
+		return invocation
+	}
+	var args map[string]any
+	if json.Unmarshal(invocation.ArgsJSON, &args) != nil || normalizeTaskThinkingEffort(readStringMapValue(args, "thinking_effort", "thinkingEffort")) != "" {
+		return invocation
+	}
+	effort := normalizeTaskThinkingEffort(parentThinkingEffort)
+	if effort == "" {
+		return invocation
+	}
+	args["thinking_effort"] = effort
+	encoded, err := json.Marshal(args)
+	if err == nil {
+		invocation.ArgsJSON = encoded
+	}
+	return invocation
+}
+
+func (service *Service) recordEffectiveSubagentDispatch(stream *ActiveStream, invocation runtimecore.ToolInvocation) error {
+	if service == nil || stream == nil || strings.TrimSpace(invocation.ToolName) != "Task" {
+		return nil
+	}
+	var args map[string]any
+	if err := json.Unmarshal(invocation.ArgsJSON, &args); err != nil {
+		return fmt.Errorf("decode effective Task args: %w", err)
+	}
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, subagentDispatchEffective, map[string]any{
+			"tool_call_id":              strings.TrimSpace(invocation.CallID),
+			"effective_model_id":        readStringMapValue(args, "model", "model_id", "modelId"),
+			"effective_thinking_effort": normalizeTaskThinkingEffort(readStringMapValue(args, "thinking_effort", "thinkingEffort")),
+		}),
+	})
+	return err
+}
+
+func (service *Service) removePendingSubagentLaunch(parentConversationID string, toolCallID string) {
+	if service == nil || strings.TrimSpace(toolCallID) == "" {
+		return
+	}
+	service.subagentLaunchMu.Lock()
+	defer service.subagentLaunchMu.Unlock()
+	retained := service.pendingSubagents[:0]
+	for _, item := range service.pendingSubagents {
+		if strings.TrimSpace(item.ParentConversationID) == strings.TrimSpace(parentConversationID) &&
+			strings.TrimSpace(item.ParentToolCallID) == strings.TrimSpace(toolCallID) {
+			continue
+		}
+		retained = append(retained, item)
+	}
+	service.pendingSubagents = retained
+}
+
+func (service *Service) rollbackSubagentDispatch(stream *ActiveStream, pending runtimecore.PendingExec, reason string) {
+	if service == nil || stream == nil || strings.TrimSpace(pending.ToolCallID) == "" {
+		return
+	}
+	stream.mu.Lock()
+	delete(stream.PendingExecs, pending.ExecID)
+	stream.mu.Unlock()
+	clearStreamTimer(stream, providerTimerKey(streamTimerSubagentResult, pending.ExecID))
+	service.removePendingSubagentLaunch(stream.ConversationID, pending.ToolCallID)
+	if err := service.closeSubagentDispatch(stream, pending, firstNonEmpty(strings.TrimSpace(reason), "dispatch_failed")); err != nil {
+		log.Printf("forwarder subagent rollback metadata failed request_id=%s tool_call_id=%s err=%v", strings.TrimSpace(stream.RequestID), strings.TrimSpace(pending.ToolCallID), err)
 	}
 }
 
@@ -329,20 +401,18 @@ func initializePendingSubagentLease(pending runtimecore.PendingExec, now time.Ti
 		pending.SubagentLeaseDeadline = pending.LastSubagentProgressAt.Add(subagentInactivityTimeout)
 	}
 	if pending.SubagentHardDeadline.IsZero() {
-		pending.SubagentHardDeadline = pending.OpenedAt.Add(subagentMaximumRuntime)
+		pending.SubagentHardDeadline = pending.OpenedAt.Add(subagentLaunchCorrelationTTL)
 	}
 	return pending
 }
 
 func subagentTimeoutDelayAndReason(pending runtimecore.PendingExec, now time.Time) (time.Duration, string) {
+	legacyHardDeadline := pending.OpenedAt.IsZero() && !pending.SubagentHardDeadline.IsZero()
 	pending = initializePendingSubagentLease(pending, now)
-	deadline := pending.SubagentLeaseDeadline
-	reason := subagentTimeoutReasonInactivityLease
-	if deadline.IsZero() || (!pending.SubagentHardDeadline.IsZero() && pending.SubagentHardDeadline.Before(deadline)) {
-		deadline = pending.SubagentHardDeadline
-		reason = subagentTimeoutReasonMaximumRuntime
+	if legacyHardDeadline && pending.SubagentHardDeadline.Before(pending.SubagentLeaseDeadline) {
+		return pending.SubagentHardDeadline.Sub(now), subagentTimeoutReasonMaximumRuntime
 	}
-	return deadline.Sub(now), reason
+	return pending.SubagentLeaseDeadline.Sub(now), subagentTimeoutReasonInactivityLease
 }
 
 func subagentAwaitingResult(streamState string) bool {
@@ -351,6 +421,68 @@ func subagentAwaitingResult(streamState string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func isEffectiveChildSubagentActivity(event modeladapter.ModelEvent) bool {
+	switch event.Kind {
+	case modeladapter.ModelEventKindTextDelta, modeladapter.ModelEventKindThinkingDelta:
+		return strings.TrimSpace(event.Text) != ""
+	case modeladapter.ModelEventKindPartialToolCall:
+		return strings.TrimSpace(event.ToolCallID) != "" && event.ToolCall != nil
+	case modeladapter.ModelEventKindToolCallDelta:
+		return strings.TrimSpace(event.ToolCallID) != "" && event.ToolCallDelta != nil
+	case modeladapter.ModelEventKindToolLikeCompleted:
+		return event.ToolInvocation != nil
+	default:
+		return false
+	}
+}
+
+func (service *Service) renewParentSubagentLeaseFromChild(child *ActiveStream, event modeladapter.ModelEvent) {
+	if service == nil || service.broker == nil || child == nil || !isEffectiveChildSubagentActivity(event) {
+		return
+	}
+	child.mu.Lock()
+	conversation := child.CheckpointConversation
+	parentConversationID := ""
+	parentToolCallID := ""
+	if conversation != nil {
+		parentConversationID = strings.TrimSpace(conversation.ParentConversationID)
+		parentToolCallID = strings.TrimSpace(conversation.ParentToolCallID)
+	}
+	child.mu.Unlock()
+	if parentConversationID == "" || parentToolCallID == "" {
+		return
+	}
+
+	parents := make([]*ActiveStream, 0, 1)
+	service.broker.mu.RLock()
+	for _, candidate := range service.broker.streams {
+		if candidate != nil && candidate != child {
+			parents = append(parents, candidate)
+		}
+	}
+	service.broker.mu.RUnlock()
+	now := time.Now().UTC()
+	for _, parent := range parents {
+		parent.mu.Lock()
+		if strings.TrimSpace(parent.ConversationID) != parentConversationID {
+			parent.mu.Unlock()
+			continue
+		}
+		pending, found := findSubagentPendingLocked(parent, parentToolCallID)
+		if !found || subagentAwaitingResult(pending.StreamState) {
+			parent.mu.Unlock()
+			continue
+		}
+		pending = initializePendingSubagentLease(pending, now)
+		pending.LastSubagentProgressAt = now
+		pending.SubagentLeaseDeadline = now.Add(subagentInactivityTimeout)
+		parent.PendingExecs[pending.ExecID] = pending
+		parent.UpdatedAt = now
+		parent.mu.Unlock()
+		return
 	}
 }
 
@@ -403,7 +535,11 @@ func observeBackgroundSubagentCompletions(stream *ActiveStream, message *agentv1
 		if resumeID := strings.TrimSpace(completion.GetThreadId()); resumeID != "" {
 			pending.SubagentResumeID = resumeID
 		}
-		if completion.GetReason() == agentv1.BackgroundTaskCompletionReason_BACKGROUND_TASK_COMPLETION_REASON_TASK_PROGRESS {
+		effectiveProgress := completion.GetReason() == agentv1.BackgroundTaskCompletionReason_BACKGROUND_TASK_COMPLETION_REASON_TASK_PROGRESS ||
+			(completion.GetReason() == agentv1.BackgroundTaskCompletionReason_BACKGROUND_TASK_COMPLETION_REASON_UNSPECIFIED &&
+				completion.GetStatus() == agentv1.BackgroundTaskStatus_BACKGROUND_TASK_STATUS_UNSPECIFIED &&
+				(strings.TrimSpace(completion.GetTitle()) != "" || strings.TrimSpace(completion.GetDetail()) != ""))
+		if effectiveProgress {
 			if subagentAwaitingResult(pending.StreamState) {
 				continue
 			}
@@ -559,6 +695,7 @@ func (service *Service) closeSubagentDispatch(stream *ActiveStream, pending runt
 	if service == nil || stream == nil || strings.TrimSpace(pending.ToolCallID) == "" {
 		return nil
 	}
+	service.removePendingSubagentLaunch(stream.ConversationID, pending.ToolCallID)
 	stream.mu.Lock()
 	conversation := cloneConversationFile(stream.CheckpointConversation)
 	turnSeq := stream.TurnSeq

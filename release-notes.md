@@ -1,3 +1,8 @@
 - 修复 0.0.48 首次 `Run` 被误判为重复请求、导致无法开始对话的问题。
 - `Run` / `RunSSE` 重连从已成功发送的 `DeliveredCursor` 高水位续传，并由新连接接管单一订阅。
 - 修正仅加密 reasoning 的计时，不再跨 provider pass 累积。
+- 修复 OpenAI Responses 多段 reasoning summary 丢失换行的问题。
+- provider 输出达到上限时保留已生成内容并受控续写，缺失合法终态时不再伪装成功。
+- 子代理按最后一次有效活动执行 60 分钟空闲租约，不再因总运行时长超过 2 小时被回收。
+- 长 Task 改为先交付执行负载再发布状态，去除 checkpoint/display 中的重复 prompt，并在启动失败时释放配额。
+- Task 卡片统一显示实际模型与继承后的思考强度，started、completed 和 reload 状态保持一致。

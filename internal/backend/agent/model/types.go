@@ -226,6 +226,8 @@ type ModelEvent struct {
 	ToolInvocation *runtimecore.ToolInvocation
 	// FinishReason 表示回合结束原因。
 	FinishReason string
+	// Incomplete 表示 provider 以受控未完成终态结束，而非合法完成。
+	Incomplete bool
 	// Err 表示 provider 错误。
 	Err error
 }

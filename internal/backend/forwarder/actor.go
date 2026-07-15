@@ -465,6 +465,7 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 	if stream == nil {
 		return nil
 	}
+	service.renewParentSubagentLeaseFromChild(stream, event)
 	stream.mu.Lock()
 	requestID := stream.RequestID
 	conversationID := stream.ConversationID
@@ -539,7 +540,7 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 		if toolCallID == "" || event.ToolCall == nil {
 			return nil
 		}
-		displayToolCall := service.rewriteTaskToolCallModelForDisplay(stream, event.ToolCall)
+		displayToolCall := stripTaskPromptForDisplay(service.rewriteTaskToolCallModelForDisplay(stream, event.ToolCall))
 		stream.mu.Lock()
 		if stream.PartialToolCallIDs == nil {
 			stream.PartialToolCallIDs = make(map[string]struct{})
@@ -593,6 +594,7 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 	case modeladapter.ModelEventKindTurnFinished:
 		stream.mu.Lock()
 		stream.ProviderFinishReason = strings.TrimSpace(event.FinishReason)
+		stream.ProviderIncomplete = event.Incomplete
 		stream.ProviderUsage = turnUsageSnapshot{
 			Provider:          event.Provider,
 			Model:             event.Model,
@@ -625,32 +627,37 @@ func (service *Service) rewriteTaskToolCallModelForDisplay(stream *ActiveStream,
 	if taskToolCall == nil || taskToolCall.GetArgs() == nil {
 		return toolCall
 	}
-	effectiveModelID := strings.TrimSpace(taskToolCall.GetArgs().GetModel())
+	rawModel := strings.TrimSpace(taskToolCall.GetArgs().GetModel())
+	effectiveModelID, suffix, hasSuffix := strings.Cut(rawModel, " · ")
+	stream.mu.Lock()
+	parentModelID := strings.TrimSpace(stream.ModelID)
+	parentThinkingEffort := normalizeTaskThinkingEffort(stream.ThinkingEffort)
+	overrides := cloneSubagentModelOverrides(stream.SubagentModelOverrides)
+	stream.mu.Unlock()
 	if !isConcreteTaskModelSelection(effectiveModelID) {
 		subagentType := taskSubagentTypeNameForDisplay(taskToolCall.GetArgs().GetSubagentType())
-		stream.mu.Lock()
-		parentModelID := strings.TrimSpace(stream.ModelID)
-		overrides := cloneSubagentModelOverrides(stream.SubagentModelOverrides)
-		stream.mu.Unlock()
 		effectiveModelID = effectiveTaskDisplayModelID(subagentType, parentModelID, overrides)
 	}
 	if effectiveModelID == "" {
 		return toolCall
 	}
 	displayName := service.resolveRequestedModelName(nil, effectiveModelID)
-	if displayName == "" || displayName == effectiveModelID {
+	if displayName == "" {
+		displayName = effectiveModelID
+	}
+	if hasSuffix {
+		displayName += " · " + suffix
+	} else if effort := taskThinkingEffortDisplayName(parentThinkingEffort); effort != "" {
+		displayName += " · " + effort
+	}
+	if displayName == rawModel {
 		return toolCall
 	}
-	effectiveModelID = displayName
 	cloned, ok := proto.Clone(toolCall).(*agentv1.ToolCall)
-	if !ok || cloned == nil {
+	if !ok || cloned == nil || cloned.GetTaskToolCall() == nil || cloned.GetTaskToolCall().GetArgs() == nil {
 		return toolCall
 	}
-	clonedTaskToolCall := cloned.GetTaskToolCall()
-	if clonedTaskToolCall == nil || clonedTaskToolCall.GetArgs() == nil {
-		return toolCall
-	}
-	clonedTaskToolCall.Args.Model = &effectiveModelID
+	cloned.GetTaskToolCall().Args.Model = &displayName
 	return cloned
 }
 
@@ -659,7 +666,20 @@ func (service *Service) buildTaskToolCallForDisplay(invocation runtimecore.ToolI
 	if toolCall == nil || toolCall.GetTaskToolCall() == nil || toolCall.GetTaskToolCall().GetArgs() == nil {
 		return toolCall
 	}
-	return service.rewriteTaskToolCallModelForResolvedID(toolCall, toolCall.GetTaskToolCall().GetArgs().GetModel())
+	resolved := service.rewriteTaskToolCallModelForResolvedID(toolCall, toolCall.GetTaskToolCall().GetArgs().GetModel())
+	return stripTaskPromptForDisplay(resolved)
+}
+
+func stripTaskPromptForDisplay(toolCall *agentv1.ToolCall) *agentv1.ToolCall {
+	if toolCall == nil || toolCall.GetTaskToolCall() == nil || toolCall.GetTaskToolCall().GetArgs() == nil || toolCall.GetTaskToolCall().GetArgs().GetPrompt() == "" {
+		return toolCall
+	}
+	cloned, ok := proto.Clone(toolCall).(*agentv1.ToolCall)
+	if !ok || cloned == nil || cloned.GetTaskToolCall() == nil || cloned.GetTaskToolCall().GetArgs() == nil {
+		return toolCall
+	}
+	cloned.GetTaskToolCall().Args.Prompt = ""
+	return cloned
 }
 
 func (service *Service) rewriteTaskToolCallModelForResolvedID(toolCall *agentv1.ToolCall, modelID string) *agentv1.ToolCall {
@@ -712,6 +732,15 @@ func effectiveTaskDisplayModelID(subagentType string, parentModelID string, over
 		}
 	}
 	return ""
+}
+
+func isOutputLimitIncomplete(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "max_output_tokens", "max_tokens", "length":
+		return true
+	default:
+		return false
+	}
 }
 
 func isRetryableProviderError(err error) bool {
@@ -799,6 +828,7 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 	accumulatedReasoningStatus := stream.ProviderAccumulatedReasoningStatus
 	accumulatedReasoningSummary := append([]byte(nil), stream.ProviderAccumulatedReasoningSummary...)
 	finishReason := stream.ProviderFinishReason
+	providerIncomplete := stream.ProviderIncomplete
 	usage := stream.ProviderUsage
 	hadToolInvocation := stream.ToolInvocationCount > 0
 	terminalToolInvocation := stream.ProviderTerminalToolInvocation
@@ -814,6 +844,7 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 	stream.ProviderAccumulatedReasoningStatus = ""
 	stream.ProviderAccumulatedReasoningSummary = nil
 	stream.ProviderFinishReason = ""
+	stream.ProviderIncomplete = false
 	stream.ProviderUsage = turnUsageSnapshot{}
 	stream.ProviderTerminalToolInvocation = false
 	stream.ToolInvocationCount = 0
@@ -847,6 +878,56 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 	if err := service.flushAssistantText(stream, conversationID, turnSeq, requestID, accumulatedText, accumulatedReasoning, accumulatedReasoningSignature, accumulatedReasoningSignatureSource, accumulatedReasoningItemID, accumulatedReasoningStatus, accumulatedReasoningSummary, !hadToolInvocation); err != nil {
 		return service.failStreamIfNonTerminal(stream, "unknown", err)
 	}
+	if providerIncomplete && !hadToolInvocation {
+		if isOutputLimitIncomplete(finishReason) {
+			stream.mu.Lock()
+			canContinue := stream.ProviderContinuationCount < providerContinuationLimit
+			if canContinue {
+				stream.ProviderContinuationCount++
+			}
+			continuationCount := stream.ProviderContinuationCount
+			stream.mu.Unlock()
+			if canContinue {
+				if err := service.recordTurnUsageSnapshot(stream, conversationID, turnSeq, requestID, modelCallID, "incomplete", usage, finishReason, false); err != nil {
+					return service.failStreamIfNonTerminal(stream, "usage_persistence_error", err)
+				}
+				if err := service.updateConversationTokenState(stream, conversationID, usage, modelCallID, true); err != nil {
+					return service.failStreamIfNonTerminal(stream, "unknown", err)
+				}
+				entries := []HistoryEntry{newMetadataEntry(turnSeq, requestID, "provider_continuation_scheduled", map[string]any{
+					"model_call_id": modelCallID,
+					"attempt":       continuationCount,
+					"limit":         providerContinuationLimit,
+					"finish_reason": finishReason,
+				})}
+				if continuationCount == 1 {
+					entries = append(entries, newPromptContextEntry(turnSeq, requestID, newPromptContextReminder(
+						promptContextSourceProviderContinuation,
+						"The previous provider pass reached its output limit. Continue exactly from the prior assistant output, avoid repeating content already emitted, and finish the current task.",
+					)))
+				}
+				if _, err := service.appendConversationEntries(stream, conversationID, entries); err != nil {
+					return service.failStreamIfNonTerminal(stream, "unknown", err)
+				}
+				if err := service.syncSummaryCarryForward(conversationID, requestID, modelCallID); err != nil {
+					return service.failStreamIfNonTerminal(stream, "unknown", err)
+				}
+				if err := service.publishCheckpoint(requestID, conversationID); err != nil {
+					return service.failStreamIfNonTerminal(stream, "unknown", err)
+				}
+				if err := service.requestProviderAction(stream, providerActionResume); err != nil {
+					return service.failStreamIfNonTerminal(stream, "unknown", err)
+				}
+				return nil
+			}
+		}
+		service.setTurnPhase(stream, TurnPhaseFailed)
+		incompleteErr := providerTerminalError{cause: fmt.Errorf("provider response incomplete after %d continuation attempts: %s", providerContinuationLimit, firstNonEmpty(strings.TrimSpace(finishReason), "unknown reason"))}
+		return service.closeStreamWithProviderError(stream, conversationID, turnSeq, requestID, "", "", "", "", "", "", nil, usage, incompleteErr, false)
+	}
+	stream.mu.Lock()
+	stream.ProviderContinuationCount = 0
+	stream.mu.Unlock()
 	if err := service.recordTurnUsageSnapshot(stream, conversationID, turnSeq, requestID, modelCallID, "completed", usage, "", false); err != nil {
 		return service.failStreamIfNonTerminal(stream, "usage_persistence_error", err)
 	}
