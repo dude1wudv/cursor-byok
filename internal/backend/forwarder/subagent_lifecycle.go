@@ -49,6 +49,10 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		return decision, fmt.Errorf("decode Task args: %w", err)
 	}
 	decision.SubagentType = readStringMapValue(args, "subagent_type", "subagentType")
+	requestedModelID := readStringMapValue(args, "model", "model_id", "modelId")
+	if strings.EqualFold(requestedModelID, "fast") {
+		return decision, fmt.Errorf("Task model %q is disabled; use grok4.5 instead", requestedModelID)
+	}
 	requestedThinkingEffort := normalizeTaskThinkingEffort(readStringMapValue(args, "thinking_effort", "thinkingEffort"))
 	callID := strings.TrimSpace(invocation.CallID)
 	if callID == "" {
@@ -380,6 +384,9 @@ func observeBackgroundSubagentCompletions(stream *ActiveStream, message *agentv1
 		if !found {
 			continue
 		}
+		if resumeID := strings.TrimSpace(completion.GetThreadId()); resumeID != "" {
+			pending.SubagentResumeID = resumeID
+		}
 		if completion.GetReason() == agentv1.BackgroundTaskCompletionReason_BACKGROUND_TASK_COMPLETION_REASON_TASK_PROGRESS {
 			if subagentAwaitingResult(pending.StreamState) {
 				continue
@@ -499,6 +506,45 @@ func (service *Service) cancelActiveSubagentRuns(parent *ActiveStream, pending r
 			},
 		})
 	}
+}
+
+func (service *Service) recoverSubagentStillRunning(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
+	if stream == nil {
+		return nil
+	}
+	markExecCompleted(stream, pending)
+	reason = firstNonEmpty(strings.TrimSpace(reason), "subagent progress timeout")
+	resumeID := strings.TrimSpace(pending.SubagentResumeID)
+	resultPayload := fmt.Sprintf("Task is still running after %s. Do not assume it stopped or cancel it. Wait for its result, or send a short status/progress check by resuming the child.", reason)
+	if resumeID != "" {
+		resultPayload += fmt.Sprintf(" Resume agent ID: %s.", resumeID)
+	} else {
+		resultPayload += " A resumable agent ID has not been reported yet."
+	}
+	if err := service.appendToolResult(stream, pending.ToolCallID, "Task", pending.ArgsJSON, resultPayload, pending.ReasoningContent, nil); err != nil {
+		return err
+	}
+	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "subagent_still_running", map[string]any{
+			"tool_call_id": pending.ToolCallID,
+			"message_id":   pending.MessageID,
+			"exec_id":      pending.ExecID,
+			"resume_id":    resumeID,
+			"reason":       reason,
+		}),
+	}); err != nil {
+		return err
+	}
+	if err := service.syncSummaryCarryForward(stream.ConversationID, stream.RequestID, pending.ModelCallID); err != nil {
+		return err
+	}
+	if err := service.publishToolCallCompleted(stream.RequestID, pending.ToolCallID, pending.ModelCallID, nil); err != nil {
+		return err
+	}
+	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
+		return err
+	}
+	return service.reconcileStream(stream)
 }
 
 func (service *Service) recoverSubagentWithoutResult(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {

@@ -763,8 +763,7 @@ func (bridge *Bridge) openForceBackgroundShell(toolCall runtimecore.ToolInvocati
 }
 
 func isConcreteTaskModelSelection(modelID string) bool {
-	normalized := strings.TrimSpace(modelID)
-	return normalized != "" && !strings.EqualFold(normalized, "fast")
+	return strings.TrimSpace(modelID) != ""
 }
 
 // openTask 构造 Task 对应的执行桥请求。
@@ -790,6 +789,9 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 	execID := fmt.Sprintf("exec-subagent-%d", now.UnixNano())
 	parentConversationID := strings.TrimSpace(openContext.ConversationID)
 	taskRequestedModelID := strings.TrimSpace(readStringArg(args, "model", "model_id", "modelId"))
+	if strings.EqualFold(taskRequestedModelID, "fast") {
+		return nil, runtimecore.PendingExec{}, fmt.Errorf("Task model %q is disabled; use grok4.5 instead", taskRequestedModelID)
+	}
 	modelID := taskRequestedModelID
 	if override, _, ok := runtimecore.LookupSubagentModelOverride(openContext.SubagentModelOverrides, subagentType); ok {
 		selection := strings.TrimSpace(override.Selection)

@@ -180,7 +180,7 @@ func subagentContractText(readonly bool, subagentType string) string {
 		responsibility = "You are a read-only investigation child. Do not modify files, start processes, or save downloaded resources; report only concise findings to the parent agent."
 	}
 	if strings.TrimSpace(subagentType) == runtimecore.SubagentTypeLongContextRead {
-		responsibility = "You are the read-only fast long-context investigation child. Use this run only to scan a large codebase, long logs, or many documents quickly. Do not modify files or perform ordinary implementation work. Return compressed conclusions with precise file paths and line evidence."
+		responsibility = "You are the read-only long-context investigation child. Use this run only to scan a large codebase, long logs, or many documents quickly. Do not modify files or perform ordinary implementation work. Return compressed conclusions with precise file paths and line evidence."
 	}
 	return strings.Join([]string{
 		"The turn that contains this reminder runs inside a subagent child conversation. Work for the parent agent, not as the final user-facing assistant.",

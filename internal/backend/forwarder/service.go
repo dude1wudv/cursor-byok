@@ -31,11 +31,13 @@ import (
 
 const (
 	providerResumeDebounce         = 200 * time.Millisecond
+	providerRetryInterval          = time.Minute
+	providerRetryLimit             = 5
 	completedExecRetention         = 15 * time.Second
 	nonStreamingExecCloseGrace     = 1500 * time.Millisecond
 	subagentResultGrace            = 2 * time.Second
-	subagentInactivityTimeout      = 10 * time.Minute
-	subagentMaximumRuntime         = 90 * time.Minute
+	subagentInactivityTimeout      = 60 * time.Minute
+	subagentMaximumRuntime         = 120 * time.Minute
 	defaultSummaryCompletedThought = "Chat context summarized"
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
@@ -202,8 +204,7 @@ func rewriteTaskInvocationModelForExecutionWithLongContext(invocation runtimecor
 }
 
 func isConcreteTaskModelSelection(modelID string) bool {
-	normalized := strings.TrimSpace(modelID)
-	return normalized != "" && !strings.EqualFold(normalized, "fast")
+	return strings.TrimSpace(modelID) != ""
 }
 
 func readStringMapValue(args map[string]any, keys ...string) string {
@@ -855,6 +856,8 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.TimerTokens = make(map[string]uint64)
 	stream.CurrentProviderToken = 0
 	stream.CurrentCompactionToken = 0
+	stream.ProviderRetryCount = 0
+	stream.ProviderLastRetryError = ""
 	stream.ProviderAccumulatedText = ""
 	stream.ProviderAccumulatedReasoning = ""
 	stream.ProviderAccumulatedReasoningSignature = ""
