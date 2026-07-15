@@ -1,6 +1,7 @@
+- 修复 Task 子代理的 Grok 4.5 模型标识缺少连字符导致渠道无法匹配的问题，并兼容已生成的旧 `grok4.5` 调用。
 - 修复 provider 返回 HTTP 502 或流中途 `unexpected EOF` 时立即停止的问题，改为每分钟重试、最多 5 次，并从 checkpoint 继续。
 - 子代理无进度与最大运行时限调整为 60 / 120 分钟；到期仅交回父代理探活，不再自动取消仍运行的 child。
-- 子代理模型移除 `fast`，新增并推荐 `grok4.5`，同时保留 Terra / Sol 的显式选择。
+- 子代理模型移除 `fast`，新增并推荐 `grok-4.5`，同时保留 Terra / Sol 的显式选择。
 - 修复 Windows 环境在 `PATH` 缺少系统目录时无法找到 `certutil.exe` 的问题，改为从 `SystemRoot` / `windir` 解析绝对路径。
 - 新增可选的 `longContextRead` 只读子代理渠道，用于高速扫描大规模上下文；默认禁用，不影响日常 `explore` 或编码任务。
 - 模型配置页支持选择快速长上下文阅读渠道，并提供 Grok 4.5 的 OpenAI Chat Completions 预设。

@@ -790,7 +790,7 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 	parentConversationID := strings.TrimSpace(openContext.ConversationID)
 	taskRequestedModelID := strings.TrimSpace(readStringArg(args, "model", "model_id", "modelId"))
 	if strings.EqualFold(taskRequestedModelID, "fast") {
-		return nil, runtimecore.PendingExec{}, fmt.Errorf("Task model %q is disabled; use grok4.5 instead", taskRequestedModelID)
+		return nil, runtimecore.PendingExec{}, fmt.Errorf("Task model %q is disabled; use grok-4.5 instead", taskRequestedModelID)
 	}
 	modelID := taskRequestedModelID
 	if override, _, ok := runtimecore.LookupSubagentModelOverride(openContext.SubagentModelOverrides, subagentType); ok {

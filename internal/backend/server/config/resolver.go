@@ -37,6 +37,17 @@ func resolveModelAdapterChannel(adapters []ModelAdapterConfig, requestedModel st
 			return modelchannel.BuildLegacyChannelID(adapter.BaseURL, adapter.ModelID, adapter.APIKey, adapter.DisplayName)
 		},
 	)
+	if !ok && strings.EqualFold(strings.TrimSpace(requestedModel), "grok4.5") {
+		matchIndex, ok = modelchannel.ResolveAdapterIndex(
+			adapters,
+			"grok-4.5",
+			func(adapter ModelAdapterConfig) string { return adapter.ID },
+			func(adapter ModelAdapterConfig) string { return adapter.ModelID },
+			func(adapter ModelAdapterConfig) string {
+				return modelchannel.BuildLegacyChannelID(adapter.BaseURL, adapter.ModelID, adapter.APIKey, adapter.DisplayName)
+			},
+		)
+	}
 	if !ok {
 		return nil, legacyruntime.ErrChannelNotAvailable
 	}
