@@ -776,10 +776,7 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 	if err != nil {
 		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode Task readonly failed: %w", err)
 	}
-	if readonly == nil {
-		return nil, runtimecore.PendingExec{}, fmt.Errorf("task readonly is required")
-	}
-	capability, err := runtimecore.ResolveSubagentCapability(readStringArg(args, "subagent_type", "subagentType"), *readonly)
+	capability, err := runtimecore.ResolveTaskSubagentCapability(readStringArg(args, "subagent_type", "subagentType"), readonly)
 	if err != nil {
 		return nil, runtimecore.PendingExec{}, err
 	}

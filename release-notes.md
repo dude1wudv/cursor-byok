@@ -1,4 +1,7 @@
-- 修复 Task 子代理的 Grok 4.5 模型标识缺少连字符导致渠道无法匹配的问题，并兼容已生成的旧 `grok4.5` 调用。
+- 支持 `AgentService/Run` 与保留的 `RunSSE` 重连流，按 `request_id` 去重重复 Run，避免重复 provider pass。
+- Task 子代理省略 `readonly` 时，generalPurpose 默认可写；explore / longContextRead 始终只读。
+- Task 模型新增 `gpt-5.6-luna`；未配置 Grok 时才回退到已配置的 Luna，二者都不可用则明确失败。
+- 子代理写入终态 `tool_result` 或缺结果恢复时记录 `subagent_dispatch_closed`，已关闭派发不再占用四槽配额。
 - 修复 provider 返回 HTTP 502 或流中途 `unexpected EOF` 时立即停止的问题，改为每分钟重试、最多 5 次，并从 checkpoint 继续。
 - 子代理无进度与最大运行时限调整为 60 / 120 分钟；到期仅交回父代理探活，不再自动取消仍运行的 child。
 - 子代理模型移除 `fast`，新增并推荐 `grok-4.5`，同时保留 Terra / Sol 的显式选择。

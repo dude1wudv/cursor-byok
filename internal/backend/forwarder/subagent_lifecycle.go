@@ -14,6 +14,7 @@ const (
 	subagentDispatchLimit                = 4
 	subagentMaximumDepth                 = 3
 	subagentDispatchReservation          = "subagent_dispatch_reserved"
+	subagentDispatchClosed               = "subagent_dispatch_closed"
 	subagentTimeoutReasonInactivityLease = "inactivity lease expired"
 	subagentTimeoutReasonMaximumRuntime  = "maximum runtime exceeded"
 )
@@ -273,7 +274,8 @@ func (service *Service) resolveSubagentDispatchThinkingEffort(conversation *Conv
 }
 
 func countSubagentDispatchReservations(entries []HistoryEntry, callID string, currentTurnOnly bool, turnSeq int64) (int, bool) {
-	seen := make(map[string]struct{})
+	reserved := make(map[string]struct{})
+	closed := make(map[string]struct{})
 	duplicate := false
 	callID = strings.TrimSpace(callID)
 	for _, entry := range entries {
@@ -281,19 +283,33 @@ func countSubagentDispatchReservations(entries []HistoryEntry, callID string, cu
 			continue
 		}
 		var payload metadataPayload
-		if err := json.Unmarshal(entry.Payload, &payload); err != nil || strings.TrimSpace(payload.Type) != subagentDispatchReservation {
+		if err := json.Unmarshal(entry.Payload, &payload); err != nil {
 			continue
 		}
-		reservedCallID := strings.TrimSpace(readStringValue(payload.Value["tool_call_id"]))
-		if reservedCallID == "" {
+		kind := strings.TrimSpace(payload.Type)
+		if kind != subagentDispatchReservation && kind != subagentDispatchClosed {
 			continue
 		}
-		seen[reservedCallID] = struct{}{}
-		if callID != "" && reservedCallID == callID {
+		toolCallID := strings.TrimSpace(readStringValue(payload.Value["tool_call_id"]))
+		if toolCallID == "" {
+			continue
+		}
+		if kind == subagentDispatchClosed {
+			closed[toolCallID] = struct{}{}
+			continue
+		}
+		reserved[toolCallID] = struct{}{}
+		if callID != "" && toolCallID == callID {
 			duplicate = true
 		}
 	}
-	return len(seen), duplicate
+	used := 0
+	for toolCallID := range reserved {
+		if _, isClosed := closed[toolCallID]; !isClosed {
+			used++
+		}
+	}
+	return used, duplicate
 }
 
 func initializePendingSubagentLease(pending runtimecore.PendingExec, now time.Time) runtimecore.PendingExec {
@@ -524,15 +540,7 @@ func (service *Service) recoverSubagentStillRunning(stream *ActiveStream, pendin
 	if err := service.appendToolResult(stream, pending.ToolCallID, "Task", pending.ArgsJSON, resultPayload, pending.ReasoningContent, nil); err != nil {
 		return err
 	}
-	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
-		newMetadataEntry(stream.TurnSeq, stream.RequestID, "subagent_still_running", map[string]any{
-			"tool_call_id": pending.ToolCallID,
-			"message_id":   pending.MessageID,
-			"exec_id":      pending.ExecID,
-			"resume_id":    resumeID,
-			"reason":       reason,
-		}),
-	}); err != nil {
+	if err := service.closeSubagentDispatch(stream, pending, "still_running"); err != nil {
 		return err
 	}
 	if err := service.syncSummaryCarryForward(stream.ConversationID, stream.RequestID, pending.ModelCallID); err != nil {
@@ -547,6 +555,38 @@ func (service *Service) recoverSubagentStillRunning(stream *ActiveStream, pendin
 	return service.reconcileStream(stream)
 }
 
+func (service *Service) closeSubagentDispatch(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
+	if service == nil || stream == nil || strings.TrimSpace(pending.ToolCallID) == "" {
+		return nil
+	}
+	stream.mu.Lock()
+	conversation := cloneConversationFile(stream.CheckpointConversation)
+	turnSeq := stream.TurnSeq
+	requestID := stream.RequestID
+	conversationID := stream.ConversationID
+	stream.mu.Unlock()
+	if conversation == nil {
+		return nil
+	}
+	for _, entry := range conversation.Entries {
+		if strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if json.Unmarshal(entry.Payload, &payload) == nil && strings.TrimSpace(payload.Type) == subagentDispatchClosed && strings.TrimSpace(readStringValue(payload.Value["tool_call_id"])) == strings.TrimSpace(pending.ToolCallID) {
+			return nil
+		}
+	}
+	_, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
+		newMetadataEntry(turnSeq, requestID, subagentDispatchClosed, map[string]any{
+			"tool_call_id": pending.ToolCallID,
+			"exec_id":      pending.ExecID,
+			"reason":       strings.TrimSpace(reason),
+		}),
+	})
+	return err
+}
+
 func (service *Service) recoverSubagentWithoutResult(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
 	if stream == nil {
 		return nil
@@ -557,15 +597,7 @@ func (service *Service) recoverSubagentWithoutResult(stream *ActiveStream, pendi
 	if err := service.appendToolResult(stream, pending.ToolCallID, "Task", pending.ArgsJSON, resultPayload, pending.ReasoningContent, nil); err != nil {
 		return err
 	}
-	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
-		newMetadataEntry(stream.TurnSeq, stream.RequestID, "subagent_result_missing", map[string]any{
-			"tool_call_id": pending.ToolCallID,
-			"message_id":   pending.MessageID,
-			"exec_id":      pending.ExecID,
-			"stream_state": pending.StreamState,
-			"reason":       reason,
-		}),
-	}); err != nil {
+	if err := service.closeSubagentDispatch(stream, pending, "result_missing"); err != nil {
 		return err
 	}
 	if err := service.syncSummaryCarryForward(stream.ConversationID, stream.RequestID, pending.ModelCallID); err != nil {

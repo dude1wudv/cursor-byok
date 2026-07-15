@@ -269,6 +269,7 @@ func (host *Host) rebuildLocked(cfg serverconfig.Config) error {
 	host.listenAddr = cfg.BackendListenAddr
 	agentModule := forwarder.NewModule(appdata.HistoryRootPath(), host.configs)
 	legacyBidiAppendProcedure := "/aiserver.v1.BidiService/BidiAppend"
+	agentRunProcedure := "/agent.v1.AgentService/Run"
 	legacyRunSSEProcedure := "/agent.v1.AgentService/RunSSE"
 	routeDeps := upstream.Dependencies{
 		SystemSettingService: &serverSystemSettings{configs: host.configs},
@@ -294,6 +295,14 @@ func (host *Host) rebuildLocked(cfg serverconfig.Config) error {
 			server.Local(server.HTTPHandlerAction(agentModule.LocalBidiHandler)),
 			server.Upstream(upstream.DirectAction(routeDeps, upstream.CompatRouteConfig{
 				Name: "bidi_append",
+			})),
+		),
+		server.POST(agentRunProcedure,
+			server.Name("agent_run"),
+			server.ConnectStream(),
+			server.Local(server.HTTPHandlerAction(agentModule.LocalRun)),
+			server.Upstream(upstream.DirectAction(routeDeps, upstream.CompatRouteConfig{
+				Name: "agent_run",
 			})),
 		),
 		server.POST(legacyRunSSEProcedure,

@@ -13,6 +13,18 @@ type SubagentCapability struct {
 	Readonly bool
 }
 
+// ResolveTaskSubagentCapability applies the Task access default before validation.
+func ResolveTaskSubagentCapability(subagentType string, readonly *bool) (SubagentCapability, error) {
+	requestedReadonly := false
+	if readonly != nil {
+		requestedReadonly = *readonly
+	}
+	if strings.TrimSpace(subagentType) == "explore" || strings.TrimSpace(subagentType) == SubagentTypeLongContextRead {
+		requestedReadonly = true
+	}
+	return ResolveSubagentCapability(subagentType, requestedReadonly)
+}
+
 // ResolveSubagentCapability validates the supported Task type and access pair.
 func ResolveSubagentCapability(subagentType string, readonly bool) (SubagentCapability, error) {
 	capability := SubagentCapability{

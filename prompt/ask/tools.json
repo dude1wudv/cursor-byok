@@ -482,9 +482,10 @@
             "type": "string"
           },
           "model": {
-            "description": "Optional model for this subagent. Omit it to use the configured subagent default. Use grok-4.5 for quick or cost-sensitive work, gpt-5.6-terra for normal implementation work, and gpt-5.6-sol only for unusually difficult reasoning, architecture, or high-quality review. A concrete model selected by the assigning agent takes precedence over the configured default.",
+            "description": "Optional model for this subagent. Use grok-4.5 for quick tasks; when Grok is not configured, the server falls back to configured gpt-5.6-luna. Use gpt-5.6-terra for normal implementation and gpt-5.6-sol only for unusually difficult reasoning or review.",
             "enum": [
               "grok-4.5",
+              "gpt-5.6-luna",
               "gpt-5.6-terra",
               "gpt-5.6-sol"
             ],
@@ -507,7 +508,7 @@
             "type": "string"
           },
           "readonly": {
-            "description": "Required child access: explore requires readonly=true; generalPurpose may be readonly or writable. Unsupported types and explore with readonly=false are rejected before dispatch.",
+            "description": "Optional child access. generalPurpose defaults to writable when omitted; explore and longContextRead are always readonly.",
             "type": "boolean"
           },
           "resume": {
@@ -526,7 +527,6 @@
         "required": [
           "description",
           "prompt",
-          "readonly",
           "subagent_type"
         ],
         "type": "object"

@@ -46,11 +46,8 @@ func TestOpenTaskNormalizesCapability(t *testing.T) {
 
 func TestOpenTaskRejectsInvalidCapability(t *testing.T) {
 	for _, args := range []map[string]any{
-		{"subagent_type": "explore", "readonly": false},
-		{"subagent_type": runtimecore.SubagentTypeLongContextRead, "readonly": false, "model": "grok-channel"},
 		{"subagent_type": runtimecore.SubagentTypeLongContextRead, "readonly": true},
 		{"subagent_type": "unknown", "readonly": true},
-		{"subagent_type": "generalPurpose"},
 	} {
 		payload, err := json.Marshal(args)
 		if err != nil {

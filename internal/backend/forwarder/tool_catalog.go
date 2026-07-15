@@ -243,11 +243,15 @@ func validateTaskSubagentCapability(argsJSON []byte) error {
 	if !found {
 		value, found = args["readOnly"]
 	}
-	readonly, ok := value.(bool)
-	if !found || !ok {
-		return fmt.Errorf("task readonly is required")
+	var readonly *bool
+	if found {
+		parsed, ok := value.(bool)
+		if !ok {
+			return fmt.Errorf("task readonly must be boolean")
+		}
+		readonly = &parsed
 	}
-	_, err = runtimecore.ResolveSubagentCapability(runtimecore.ReadStringArg(args, "subagent_type", "subagentType"), readonly)
+	_, err = runtimecore.ResolveTaskSubagentCapability(runtimecore.ReadStringArg(args, "subagent_type", "subagentType"), readonly)
 	return err
 }
 

@@ -750,6 +750,18 @@ func planContentHash(planText string) string {
 // handleRunIntent 处理 run/prewarm 类 intent，负责建会话、写 turn 和拉起 provider。
 func (service *Service) handleRunIntent(intent InboundIntent) error {
 	intent.UserMessage = normalizeUserMessageForStorage(intent.UserMessage)
+	if stream, ok := service.broker.Get(intent.RequestID); ok && stream != nil {
+		stream.mu.Lock()
+		duplicate := strings.TrimSpace(stream.ConversationID) == strings.TrimSpace(intent.ConversationID) && !isTerminalStreamStatus(stream.Status)
+		providerActive := stream.ProviderActive
+		stream.mu.Unlock()
+		if duplicate {
+			service.debug.LogRuntime(context.Background(), intent.RequestID, intent.ConversationID, "run_request_deduplicated", map[string]any{
+				"provider_active": providerActive,
+			})
+			return nil
+		}
+	}
 	if !intent.Prewarm {
 		service.cancelOtherConversationActors(
 			intent.ConversationID,
@@ -1034,6 +1046,11 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 			}); err != nil {
 				return err
 			}
+		}
+	}
+	if strings.TrimSpace(pending.ExecKind) == "subagent" {
+		if err := service.closeSubagentDispatch(stream, pending, "tool_result"); err != nil {
+			return err
 		}
 	}
 	if err := service.publishToolCallCompleted(intent.RequestID, result.ToolCallID, pending.ModelCallID, result.ToolCall); err != nil {

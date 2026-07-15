@@ -51,8 +51,8 @@ func TestWritableSubagentToolsMatchPreDispatchPolicy(t *testing.T) {
 			t.Fatalf("writable child cannot use %q", name)
 		}
 	}
-	if err := validateTaskSubagentCapability([]byte(`{"subagent_type":"explore","readonly":false}`)); err == nil {
-		t.Fatal("writable explore was accepted")
+	if err := validateTaskSubagentCapability([]byte(`{"subagent_type":"explore","readonly":false}`)); err != nil {
+		t.Fatalf("explore readonly normalization failed: %v", err)
 	}
 	if err := validateTaskSubagentCapability([]byte(`{"subagent_type":"unknown","readonly":true}`)); err == nil {
 		t.Fatal("unknown subagent type was accepted")

@@ -34,7 +34,6 @@ func TestTaskModelDisplayUsesChannelNameWithoutChangingExecutionModel(t *testing
 	const channelID = "b169b656217cef18"
 	argsJSON, err := json.Marshal(map[string]any{
 		"subagent_type": "explore",
-		"model":         "fast",
 	})
 	if err != nil {
 		t.Fatal(err)
