@@ -171,10 +171,14 @@ type Service struct {
 }
 
 type Method struct {
-	Name       string
-	InputType  string // variable name
-	OutputType string // variable name
-	Kind       string // Unary, ServerStreaming, ClientStreaming, BiDiStreaming
+	Name              string
+	InputType         string // variable name
+	InputPos          int
+	InputModuleStart  int
+	OutputType        string // variable name
+	OutputPos         int
+	OutputModuleStart int
+	Kind              string // Unary, ServerStreaming, ClientStreaming, BiDiStreaming
 }
 
 type symbolDef struct {
@@ -185,14 +189,18 @@ type symbolDef struct {
 }
 
 type TypeResolver struct {
-	bySymbol map[string][]symbolDef
-	byShort  map[string][]symbolDef
+	bySymbol       map[string][]symbolDef
+	byShort        map[string][]symbolDef
+	modulesByStart map[int]*webpackModule
+	modulesByID    map[string]*webpackModule
 }
 
-func newTypeResolver(messages []Message, enums []Enum, aliases map[string][]string) *TypeResolver {
+func newTypeResolver(messages []Message, enums []Enum, aliases map[string][]string, modulesByStart map[int]*webpackModule, modulesByID map[string]*webpackModule) *TypeResolver {
 	resolver := &TypeResolver{
-		bySymbol: make(map[string][]symbolDef),
-		byShort:  make(map[string][]symbolDef),
+		bySymbol:       make(map[string][]symbolDef),
+		byShort:        make(map[string][]symbolDef),
+		modulesByStart: modulesByStart,
+		modulesByID:    modulesByID,
 	}
 
 	add := func(symbol, typeName string, pos int, moduleStart int, kind string) {
@@ -318,19 +326,6 @@ func pickBestDefinition(candidates []symbolDef, contextPos int, contextModuleSta
 	}
 
 	filtered := candidates
-	if strings.TrimSpace(preferredPkg) != "" {
-		tmp := make([]symbolDef, 0, len(candidates))
-		for _, item := range candidates {
-			pkg, _ := parseTypeName(item.TypeName)
-			if pkg == preferredPkg {
-				tmp = append(tmp, item)
-			}
-		}
-		if len(tmp) > 0 {
-			filtered = tmp
-		}
-	}
-
 	if strings.TrimSpace(expectedKind) != "" {
 		tmp := make([]symbolDef, 0, len(filtered))
 		for _, item := range filtered {
@@ -338,15 +333,31 @@ func pickBestDefinition(candidates []symbolDef, contextPos int, contextModuleSta
 				tmp = append(tmp, item)
 			}
 		}
-		if len(tmp) > 0 {
-			filtered = tmp
+		// An expected kind is a hard constraint. Do not fall back to an enum
+		// (or message) when resolving a service method or field reference.
+		if len(tmp) == 0 {
+			return symbolDef{}, false
 		}
+		filtered = tmp
 	}
 
 	if contextModuleStart > 0 {
 		tmp := make([]symbolDef, 0, len(filtered))
 		for _, item := range filtered {
 			if item.ModuleStart == contextModuleStart {
+				tmp = append(tmp, item)
+			}
+		}
+		if len(tmp) > 0 {
+			filtered = tmp
+		}
+	}
+
+	if strings.TrimSpace(preferredPkg) != "" {
+		tmp := make([]symbolDef, 0, len(filtered))
+		for _, item := range filtered {
+			pkg, _ := parseTypeName(item.TypeName)
+			if pkg == preferredPkg {
 				tmp = append(tmp, item)
 			}
 		}
@@ -393,11 +404,20 @@ func (resolver *TypeResolver) ResolveTypeName(ref string, contextPos int, contex
 		return "", false
 	}
 
+	ref, contextModuleStart = resolveWebpackExportRef(ref, contextModuleStart, resolver.modulesByStart, resolver.modulesByID)
 	trimmed := strings.TrimSpace(ref)
 	if trimmed == "" {
 		return "", false
 	}
 	if looksLikeFullTypeName(trimmed) {
+		if strings.TrimSpace(expectedKind) != "" {
+			_, shortName := parseTypeName(trimmed)
+			for _, candidate := range resolver.byShort[shortName] {
+				if candidate.TypeName == trimmed {
+					return trimmed, candidate.Kind == expectedKind
+				}
+			}
+		}
 		return trimmed, true
 	}
 
@@ -474,6 +494,72 @@ func absInt(value int) int {
 }
 
 var moduleStartRe = regexp.MustCompile(`(?:^|,)(\d+):(?:function\([\w$,]*\)|\([\w$,]*\)=>)\{`)
+var webpackModuleRe = regexp.MustCompile(`(?:^|,)(\d+):(?:function\(([\w$]+),([\w$]+),([\w$]+)\)|\(([\w$]+),([\w$]+),([\w$]+)\)=>)\{`)
+
+type webpackModule struct {
+	ID           string
+	Start        int
+	End          int
+	ExportsParam string
+	RequireParam string
+	Imports      map[string]string
+	Exports      map[string]string
+}
+
+func buildWebpackModules(text string) (map[int]*webpackModule, map[string]*webpackModule) {
+	matches := webpackModuleRe.FindAllStringSubmatchIndex(text, -1)
+	byStart := make(map[int]*webpackModule, len(matches))
+	byID := make(map[string]*webpackModule, len(matches))
+	for index, match := range matches {
+		value := func(group int) string {
+			start, end := match[group*2], match[group*2+1]
+			if start < 0 {
+				return ""
+			}
+			return text[start:end]
+		}
+		end := len(text)
+		if index+1 < len(matches) {
+			end = matches[index+1][0]
+		}
+		module := &webpackModule{ID: value(1), Start: match[0], End: end, Imports: make(map[string]string), Exports: make(map[string]string)}
+		module.ExportsParam, module.RequireParam = value(3), value(4)
+		if module.RequireParam == "" {
+			module.ExportsParam, module.RequireParam = value(6), value(7)
+		}
+		body := text[module.Start:module.End]
+		importRe := regexp.MustCompile(`\b([\w$]+)\s*=\s*` + regexp.QuoteMeta(module.RequireParam) + `\(\s*(\d+)\s*\)`)
+		for _, item := range importRe.FindAllStringSubmatch(body, -1) {
+			module.Imports[item[1]] = item[2]
+		}
+		exportBlockRe := regexp.MustCompile(regexp.QuoteMeta(module.RequireParam) + `\.d\(\s*` + regexp.QuoteMeta(module.ExportsParam) + `\s*,\s*\{([^}]*)\}\s*\)`)
+		exportEntryRe := regexp.MustCompile(`(?:^|,)\s*([\w$]+)\s*:\s*\(\s*\)\s*=>\s*([\w$]+)`)
+		for _, block := range exportBlockRe.FindAllStringSubmatch(body, -1) {
+			for _, item := range exportEntryRe.FindAllStringSubmatch(block[1], -1) {
+				module.Exports[item[1]] = item[2]
+			}
+		}
+		byStart[module.Start] = module
+		byID[module.ID] = module
+	}
+	return byStart, byID
+}
+
+func resolveWebpackExportRef(ref string, moduleStart int, byStart map[int]*webpackModule, byID map[string]*webpackModule) (string, int) {
+	parts := strings.Split(ref, ".")
+	if len(parts) != 2 {
+		return ref, moduleStart
+	}
+	current := byStart[moduleStart]
+	if current == nil {
+		return ref, moduleStart
+	}
+	target := byID[current.Imports[parts[0]]]
+	if target == nil || target.Exports[parts[1]] == "" {
+		return ref, moduleStart
+	}
+	return target.Exports[parts[1]], target.Start
+}
 
 func buildModuleStarts(text string) []int {
 	matches := moduleStartRe.FindAllStringSubmatchIndex(text, -1)
@@ -512,19 +598,20 @@ func ExtractProtos(inputFile, outputDir string) {
 
 	text := string(content)
 	moduleStarts := buildModuleStarts(text)
+	modulesByStart, modulesByID := buildWebpackModules(text)
 	aliases := buildAliasIndex(text)
 
 	// Extract messages, enums, and services
 	messages := extractMessages(text, moduleStarts)
 	enums := extractEnums(text, moduleStarts)
-	services := extractServices(text, moduleStarts)
+	services := extractServices(text, moduleStarts, modulesByStart, modulesByID)
 	for _, msg := range messages {
 		if len(msg.Fields) == 0 {
 			activeDiagnostics.emptyMessages = append(activeDiagnostics.emptyMessages, msg.TypeName)
 		}
 	}
 
-	resolver := newTypeResolver(messages, enums, aliases)
+	resolver := newTypeResolver(messages, enums, aliases, modulesByStart, modulesByID)
 
 	// Generate proto files
 	generateProtos(messages, enums, services, resolver, outputDir)
@@ -980,7 +1067,7 @@ func extractEnums(text string, moduleStarts []int) []Enum {
 	return enums
 }
 
-func extractServices(text string, moduleStarts []int) []Service {
+func extractServices(text string, moduleStarts []int, modulesByStart map[int]*webpackModule, modulesByID map[string]*webpackModule) []Service {
 	var services []Service
 
 	// Pattern: VarName = { typeName: "xxx.v1.ServiceName", methods: { ... } }
@@ -991,6 +1078,7 @@ func extractServices(text string, moduleStarts []int) []Service {
 	for _, match := range matches {
 		varName := text[match[2]:match[3]]
 		typeName := text[match[4]:match[5]]
+		moduleStart := moduleStartForPos(moduleStarts, match[0])
 
 		// Find the end of the methods object
 		methodsStart := match[1] - 1 // position of '{'
@@ -1000,7 +1088,7 @@ func extractServices(text string, moduleStarts []int) []Service {
 		}
 
 		methodsText := text[methodsStart:methodsEnd]
-		methods := extractMethods(methodsText)
+		methods := extractMethods(methodsText, methodsStart, moduleStart, modulesByStart, modulesByID)
 
 		pkg, shortName := parseTypeName(typeName)
 		service := Service{
@@ -1010,7 +1098,7 @@ func extractServices(text string, moduleStarts []int) []Service {
 			Package:     pkg,
 			ShortName:   shortName,
 			Pos:         match[0],
-			ModuleStart: moduleStartForPos(moduleStarts, match[0]),
+			ModuleStart: moduleStart,
 		}
 		services = append(services, service)
 	}
@@ -1018,19 +1106,27 @@ func extractServices(text string, moduleStarts []int) []Service {
 	return services
 }
 
-func extractMethods(methodsText string) []Method {
+func extractMethods(methodsText string, methodsStart int, moduleStart int, modulesByStart map[int]*webpackModule, modulesByID map[string]*webpackModule) []Method {
 	var methods []Method
 
 	// Pattern: methodName: { name: "MethodName", I: n.Input, O: n.Output, kind: s.MethodKind.Unary }
 	methodRe := regexp.MustCompile(`\w+:\s*\{\s*name:\s*"([^"]+)"\s*,\s*I:\s*([\w$.]+)\s*,\s*O:\s*([\w$.]+)\s*,\s*kind:\s*[\w$.]+\.(Unary|ServerStreaming|ClientStreaming|BiDiStreaming)`)
 
-	matches := methodRe.FindAllStringSubmatch(methodsText, -1)
-	for _, m := range matches {
+	matches := methodRe.FindAllStringSubmatchIndex(methodsText, -1)
+	for _, match := range matches {
+		inputType := methodsText[match[4]:match[5]]
+		outputType := methodsText[match[6]:match[7]]
+		inputType, inputModuleStart := resolveWebpackExportRef(inputType, moduleStart, modulesByStart, modulesByID)
+		outputType, outputModuleStart := resolveWebpackExportRef(outputType, moduleStart, modulesByStart, modulesByID)
 		method := Method{
-			Name:       m[1],
-			InputType:  m[2],
-			OutputType: m[3],
-			Kind:       m[4],
+			Name:              methodsText[match[2]:match[3]],
+			InputType:         inputType,
+			InputPos:          methodsStart + match[4],
+			InputModuleStart:  inputModuleStart,
+			OutputType:        outputType,
+			OutputPos:         methodsStart + match[6],
+			OutputModuleStart: outputModuleStart,
+			Kind:              methodsText[match[8]:match[9]],
 		}
 		methods = append(methods, method)
 	}
@@ -1201,8 +1297,8 @@ func copyAllExternalTypes(pkgName string, pkg struct {
 		}
 		for _, svc := range result.services {
 			for _, m := range svc.Methods {
-				collectMethodRefsSimple(m.InputType, pkgName, svc.Pos, svc.ModuleStart, resolver, neededTypes, localTypes)
-				collectMethodRefsSimple(m.OutputType, pkgName, svc.Pos, svc.ModuleStart, resolver, neededTypes, localTypes)
+				collectMethodRefsSimple(m.InputType, pkgName, m.InputPos, m.InputModuleStart, resolver, neededTypes, localTypes)
+				collectMethodRefsSimple(m.OutputType, pkgName, m.OutputPos, m.OutputModuleStart, resolver, neededTypes, localTypes)
 			}
 		}
 
@@ -1406,8 +1502,8 @@ func collectImports(currentPkg string, messages []Message, services []Service, r
 
 	for _, svc := range services {
 		for _, m := range svc.Methods {
-			addImport(m.InputType, svc.Pos, svc.ModuleStart, "message")
-			addImport(m.OutputType, svc.Pos, svc.ModuleStart, "message")
+			addImport(m.InputType, m.InputPos, m.InputModuleStart, "message")
+			addImport(m.OutputType, m.OutputPos, m.OutputModuleStart, "message")
 		}
 	}
 
@@ -1468,8 +1564,8 @@ func generateProtoFile(pkgName string, messages []Message, enums []Enum, service
 		sb.WriteString(fmt.Sprintf("// Source: %s (var: %s)\n", svc.TypeName, svc.VarName))
 		sb.WriteString(fmt.Sprintf("service %s {\n", svc.ShortName))
 		for _, m := range svc.Methods {
-			inputType := resolveMethodType(m.InputType, resolver, pkgName, svc.Pos, svc.ModuleStart)
-			outputType := resolveMethodType(m.OutputType, resolver, pkgName, svc.Pos, svc.ModuleStart)
+			inputType := resolveMethodType(m.InputType, resolver, pkgName, m.InputPos, m.InputModuleStart)
+			outputType := resolveMethodType(m.OutputType, resolver, pkgName, m.OutputPos, m.OutputModuleStart)
 
 			switch m.Kind {
 			case "ServerStreaming":
