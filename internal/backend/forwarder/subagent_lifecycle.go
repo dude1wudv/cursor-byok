@@ -53,10 +53,6 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		return decision, fmt.Errorf("decode Task args: %w", err)
 	}
 	decision.SubagentType = readStringMapValue(args, "subagent_type", "subagentType")
-	requestedModelID := readStringMapValue(args, "model", "model_id", "modelId")
-	if strings.EqualFold(requestedModelID, "fast") {
-		return decision, fmt.Errorf("Task model %q is disabled; use grok-4.5 instead", requestedModelID)
-	}
 	requestedThinkingEffort := normalizeTaskThinkingEffort(readStringMapValue(args, "thinking_effort", "thinkingEffort"))
 	callID := strings.TrimSpace(invocation.CallID)
 	if callID == "" {

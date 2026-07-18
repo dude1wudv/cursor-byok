@@ -181,6 +181,7 @@ export function buildModelAdapterTestRequestHash(source) {
     asString(adapter.modelID),
     adapter.type === "openai" ? asString(adapter.reasoningEffort || "medium") : "",
     adapter.type === "openai" ? normalizeOpenAIEndpoint(adapter.openAIEndpoint) : "",
+    adapter.type === "openai" ? String(Boolean(adapter.fastMode)) : "false",
     adapter.type === "openai" ? String(Boolean(adapter.openAIExtraParamsEnabled)) : "false",
     adapter.type === "openai" && adapter.openAIExtraParamsEnabled ? asString(adapter.openAIExtraParamsJSON) : "",
     String(Boolean(adapter.customHeadersEnabled)),
@@ -355,6 +356,9 @@ export function normalizeModelAdapter(source) {
   const openAIExtraParamsEnabled = normalizedType === "openai"
     ? asBoolean(raw.openAIExtraParamsEnabled ?? raw.openaiExtraParamsEnabled ?? raw.open_ai_extra_params_enabled)
     : false;
+  const fastMode = normalizedType === "openai"
+    ? asBoolean(raw.fastMode ?? raw.fast_mode)
+    : false;
   const openAIExtraParamsJSON = normalizedType === "openai"
     ? asString(raw.openAIExtraParamsJSON ?? raw.openaiExtraParamsJSON ?? raw.open_ai_extra_params_json) || OPENAI_EXTRA_PARAMS_DEFAULT_JSON
     : "";
@@ -378,6 +382,7 @@ export function normalizeModelAdapter(source) {
       ? normalizedReasoningEffort
       : "medium",
     openAIEndpoint: normalizedType === "openai" ? normalizedOpenAIEndpoint : "",
+    fastMode,
     openAIExtraParamsEnabled,
     openAIExtraParamsJSON,
     customHeadersEnabled,

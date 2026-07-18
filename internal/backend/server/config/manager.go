@@ -172,6 +172,7 @@ func (manager *Manager) LegacyRuntimeSnapshot(_ context.Context) (legacyruntime.
 			ModelID:                  item.ModelID,
 			ReasoningEffort:          item.ReasoningEffort,
 			OpenAIEndpoint:           item.OpenAIEndpoint,
+			FastMode:                 item.FastMode,
 			OpenAIExtraParamsEnabled: item.OpenAIExtraParamsEnabled,
 			OpenAIExtraParamsJSON:    item.OpenAIExtraParamsJSON,
 			ContextWindowTokens:      item.ContextWindowTokens,

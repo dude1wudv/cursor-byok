@@ -211,6 +211,12 @@ func applyOpenAIPromptCacheKeyOverride(body map[string]any, req StreamRequest, m
 	}
 }
 
+func applyOpenAIFastMode(body map[string]any, enabled bool) {
+	if enabled {
+		body["service_tier"] = "priority"
+	}
+}
+
 func shouldExposeOpenAIResponsesImageGeneration(req StreamRequest, tools []map[string]any) bool {
 	if !openAIResponsesToolNamePresent(tools, "GenerateImage") {
 		return false
@@ -486,6 +492,7 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 		return err
 	}
+	applyOpenAIFastMode(bodyMap, req.FastMode)
 	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 {
 		bodyMap["max_output_tokens"] = req.MaxTokens
 	}
@@ -965,6 +972,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 		return err
 	}
+	applyOpenAIFastMode(bodyMap, req.FastMode)
 	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 {
 		bodyMap["max_output_tokens"] = req.MaxTokens
 	}

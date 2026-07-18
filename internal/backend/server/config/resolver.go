@@ -74,6 +74,7 @@ func resolveModelAdapterChannel(adapters []ModelAdapterConfig, requestedModel st
 		APIKey:                      strings.TrimSpace(matched.APIKey),
 		Model:                       strings.TrimSpace(matched.ModelID),
 		OpenAIEndpoint:              strings.TrimSpace(matched.OpenAIEndpoint),
+		FastMode:                    matched.FastMode,
 		OpenAIExtraParamsEnabled:    matched.OpenAIExtraParamsEnabled,
 		OpenAIExtraParamsJSON:       strings.TrimSpace(matched.OpenAIExtraParamsJSON),
 		CustomHeadersEnabled:        matched.CustomHeadersEnabled,

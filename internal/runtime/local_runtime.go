@@ -52,6 +52,8 @@ type ModelAdapterConfig struct {
 	ReasoningEffort string `json:"reasoningEffort"`
 	// OpenAIEndpoint 表示 OpenAI 兼容适配器使用的 API 端点。
 	OpenAIEndpoint string `json:"openAIEndpoint"`
+	// FastMode 表示 OpenAI 兼容适配器是否请求 priority 服务层级。
+	FastMode bool `json:"fastMode"`
 	// OpenAIExtraParamsEnabled 表示是否启用 OpenAI 额外请求参数。
 	OpenAIExtraParamsEnabled bool `json:"openAIExtraParamsEnabled"`
 	// OpenAIExtraParamsJSON 表示 OpenAI 额外请求参数 JSON 对象。
@@ -117,6 +119,7 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 			ThinkingBudgetTokens: normalizeMaxCompletionTokens(item.ThinkingBudgetTokens),
 		}
 		if next.Type == "openai" {
+			next.FastMode = item.FastMode
 			next.OpenAIExtraParamsEnabled = item.OpenAIExtraParamsEnabled
 			next.OpenAIExtraParamsJSON = strings.TrimSpace(item.OpenAIExtraParamsJSON)
 		} else if next.Type == "anthropic" {
@@ -267,6 +270,8 @@ type ResolvedChannel struct {
 	ReasoningEffort string
 	// OpenAIEndpoint 表示 OpenAI 兼容适配器使用的 API 端点。
 	OpenAIEndpoint string
+	// FastMode 表示 OpenAI 兼容适配器是否请求 priority 服务层级。
+	FastMode bool
 	// OpenAIExtraParamsEnabled 表示是否启用 OpenAI 额外请求参数。
 	OpenAIExtraParamsEnabled bool
 	// OpenAIExtraParamsJSON 表示 OpenAI 额外请求参数 JSON 对象。

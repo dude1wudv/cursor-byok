@@ -248,6 +248,7 @@ func (s *ProxyService) executeOpenAIStreamingTest(ctx context.Context, adapter s
 		ResolvedContextWindowTokens: adapter.ContextWindowTokens,
 		ReasoningEffort:             strings.TrimSpace(adapter.ReasoningEffort),
 		OpenAIEndpoint:              strings.TrimSpace(adapter.OpenAIEndpoint),
+		FastMode:                    adapter.FastMode,
 		OpenAIExtraParamsEnabled:    adapter.OpenAIExtraParamsEnabled,
 		OpenAIExtraParamsJSON:       strings.TrimSpace(adapter.OpenAIExtraParamsJSON),
 		CustomHeadersEnabled:        adapter.CustomHeadersEnabled,

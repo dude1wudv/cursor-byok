@@ -94,6 +94,8 @@ type StreamRequest struct {
 	ReasoningEffort string
 	// OpenAIEndpoint 表示 OpenAI 兼容 provider 使用的 API 端点。
 	OpenAIEndpoint string
+	// FastMode 表示 OpenAI 兼容 provider 是否请求 priority 服务层级。
+	FastMode bool
 	// OpenAIExtraParamsEnabled 表示是否启用 OpenAI 额外请求参数。
 	OpenAIExtraParamsEnabled bool
 	// OpenAIExtraParamsJSON 表示 OpenAI 额外请求参数 JSON 对象。

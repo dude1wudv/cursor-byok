@@ -57,6 +57,7 @@ func (router *Router) Stream(ctx context.Context, req StreamRequest, sink func(M
 	resolved.ResolvedContextWindowTokens = channel.ContextWindowTokens
 	resolved.ReasoningEffort = openAIReasoningEffortFromRuntime(channel.ReasoningEffort)
 	resolved.OpenAIEndpoint = strings.TrimSpace(channel.OpenAIEndpoint)
+	resolved.FastMode = channel.FastMode
 	resolved.OpenAIExtraParamsEnabled = channel.OpenAIExtraParamsEnabled
 	resolved.OpenAIExtraParamsJSON = strings.TrimSpace(channel.OpenAIExtraParamsJSON)
 	resolved.CustomHeadersEnabled = channel.CustomHeadersEnabled
@@ -107,6 +108,7 @@ func (router *Router) Stream(ctx context.Context, req StreamRequest, sink func(M
 				delete(resolved.RequestKnobs, "reasoning_effort")
 			}
 			resolved.RequestKnobs["openai_endpoint"] = resolved.OpenAIEndpoint
+			resolved.RequestKnobs["fast_mode"] = resolved.FastMode
 			resolved.RequestKnobs["openai_extra_params_enabled"] = resolved.OpenAIExtraParamsEnabled
 			resolved.RequestKnobs["custom_headers_enabled"] = resolved.CustomHeadersEnabled
 		} else if resolved.Provider == "anthropic" {
