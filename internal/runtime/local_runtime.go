@@ -48,6 +48,8 @@ type ModelAdapterConfig struct {
 	TooltipData string `json:"tooltipData"`
 	// SubagentEnabled 表示此模型是否可供父代理选择为子代理。
 	SubagentEnabled bool `json:"subagentEnabled"`
+	// SubagentRoles 表示此模型允许承担的子代理角色，并保留配置顺序。
+	SubagentRoles []string `json:"subagentRoles,omitempty"`
 	// ModelID 表示当前声明中的 ModelID。
 	ModelID string `json:"modelID"`
 	// ReasoningEffort 表示当前声明中的 ReasoningEffort。
@@ -113,6 +115,7 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 			APIKey:               strings.TrimSpace(item.APIKey),
 			TooltipData:          strings.TrimSpace(item.TooltipData),
 			SubagentEnabled:      item.SubagentEnabled,
+			SubagentRoles:        append([]string(nil), item.SubagentRoles...),
 			ModelID:              strings.TrimSpace(item.ModelID),
 			ReasoningEffort:      normalizeReasoningEffort(item.ReasoningEffort),
 			OpenAIEndpoint:       modelchannel.NormalizeOpenAIEndpoint(item.Type, item.OpenAIEndpoint),

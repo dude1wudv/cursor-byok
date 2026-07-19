@@ -186,6 +186,8 @@ func subagentContractText(readonly bool, subagentType string) string {
 	return strings.Join([]string{
 		"The turn that contains this reminder runs inside a subagent child conversation. Work for the parent agent, not as the final user-facing assistant.",
 		responsibility,
+		"The inherited <current_plan> and <todo_list> are an immutable snapshot from dispatch time. Use them for scope and dependencies, but do not treat child TodoWrite or CreatePlan calls as updates to the parent conversation.",
+		"Report the outcome and evidence to the parent. The parent coordinator owns acceptance, workspace verification, and advancing the matching parent Todo.",
 		"Return a short textual result: lead with the conclusion, keep only the key evidence, and do not produce a long response.",
 		"Use the available agent tools when they materially improve correctness or efficiency. Do not ask the user questions. If required information is missing, report the gap to the parent agent instead of asking the user directly.",
 	}, "\n\n")
@@ -206,9 +208,9 @@ func currentModeContractText(mode agentv1.AgentMode, childSubagent bool, childRe
 	case agentv1.AgentMode_AGENT_MODE_DEBUG:
 		return "For the turn that contains this reminder, the active mode is debug. Follow the Debug Mode workflow from the static debug prompt: inspect or reproduce before editing, keep 3-5 concrete hypotheses, use the injected debug session log path when temporary instrumentation is useful, and verify with runtime evidence. Do not call CreatePlan or SwitchMode."
 	case agentv1.AgentMode_AGENT_MODE_MULTITASK:
-		return "For the turn that contains this reminder, the active mode is multitask. For broad investigation, first do minimal reconnaissance and then delegate 2-4 independent read-only explore tasks with Task; otherwise act as the foreground coordinator for one coherent worker. Avoid duplicating delegated work and do not wait just for a worker to finish."
+		return "For the turn that contains this reminder, the active mode is multitask. For broad investigation, first do minimal reconnaissance and then delegate 2-4 independent read-only explore tasks with Task; otherwise act as the foreground coordinator for one coherent worker. Avoid duplicating delegated work and do not wait just for a worker to finish. When a Task result returns, verify it against the workspace and acceptance criteria; the child only reports evidence, while you own final acceptance and the matching parent Todo state."
 	default:
-		return "For the turn that contains this reminder, the active mode is agent. CreatePlan is not available in this mode; do not call CreatePlan. If the user explicitly asks to create or revise a plan, call SwitchMode to return to plan mode first. If there is an accepted or current plan, execute or continue the implementation using the available agent-mode tools."
+		return "For the turn that contains this reminder, the active mode is agent. CreatePlan is not available in this mode; do not call CreatePlan. If the user explicitly asks to create or revise a plan, call SwitchMode to return to plan mode first. If there is an accepted or current plan, execute or continue the implementation using the available agent-mode tools. When a Task result returns, verify it against the workspace and acceptance criteria; the child only reports evidence, while you own final acceptance and the matching parent Todo state."
 	}
 }
 

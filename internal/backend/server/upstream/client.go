@@ -22,6 +22,7 @@ import (
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 var hopByHopHeaders = map[string]struct{}{
@@ -425,8 +426,12 @@ func newProtoMessage(typeName string) (proto.Message, error) {
 		return &aiserverv1.GetPlanInfoResponse{}, nil
 	case "aiserver.v1.GetUsageLimitStatusAndActiveGrantsResponse":
 		return &aiserverv1.GetUsageLimitStatusAndActiveGrantsResponse{}, nil
+	case "aiserver.v1.GetEffectiveUserPluginsResponse":
+		return &aiserverv1.GetEffectiveUserPluginsResponse{}, nil
 	case "aiserver.v1.IsOnNewPricingResponse":
 		return &aiserverv1.IsOnNewPricingResponse{}, nil
+	case "google.protobuf.Empty":
+		return &emptypb.Empty{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported proto message type %q", typeName)
 	}

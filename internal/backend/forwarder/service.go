@@ -346,6 +346,31 @@ func (service *Service) enabledSubagentModel(modelID string) bool {
 	return false
 }
 
+func (service *Service) resolveTaskModelID(role string, requested string) (string, error) {
+	requested = strings.TrimSpace(requested)
+	directory := subagentModelDirectoryFromResolver(service.resolver)
+	if directory == nil {
+		return "", fmt.Errorf("subagent model directory is unavailable")
+	}
+	models := directory.EnabledSubagentModels()
+	if requested != "" {
+		for _, model := range models {
+			if strings.TrimSpace(model.ID) == requested {
+				return requested, nil
+			}
+		}
+		return "", fmt.Errorf("Task model %q is not an enabled adapter id", requested)
+	}
+	role = normalizeSubagentRole(role)
+	for _, model := range models {
+		for _, candidateRole := range model.Roles {
+			if normalizeSubagentRole(candidateRole) == role {
+				return strings.TrimSpace(model.ID), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no enabled subagent model is configured for task_role %q", role)
+}
 func (service *Service) validateNewSubagentModel(modelID string) error {
 	if service.enabledSubagentModel(modelID) {
 		return nil
@@ -864,9 +889,15 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	if hasMatchedLaunch {
 		conversation.ParentConversationID = matchedLaunch.ParentConversationID
 		conversation.ParentToolCallID = matchedLaunch.ParentToolCallID
+		conversation.SubagentRole = normalizeSubagentRole(matchedLaunch.SubagentRole)
 		if strings.TrimSpace(matchedLaunch.RootConversationID) != "" {
 			conversation.RootConversationID = matchedLaunch.RootConversationID
 		}
+		snapshotEntries, err := subagentLaunchBootstrapEntries(matchedLaunch, turnSeq, intent.RequestID)
+		if err != nil {
+			return err
+		}
+		initialEntries = append(snapshotEntries, initialEntries...)
 	}
 	if strings.TrimSpace(intent.ThinkingEffort) == "" && isChildConversationSubagentTypeName(conversation.SubagentTypeName) {
 		intent.ThinkingEffort = service.resolveSubagentDispatchThinkingEffort(conversation)
@@ -939,6 +970,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
 	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
 	stream.RecentCompletedExecs = make(map[uint32]time.Time)
+	stream.TaskBatches = make(map[int]*TaskBatch)
 	stream.BackgroundShells = make(map[string]*BackgroundShellState)
 	stream.BackgroundShellsByMessageID = make(map[uint32]string)
 	stream.BackgroundShellsByExecID = make(map[string]string)
@@ -1155,6 +1187,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		}
 	}
 	if strings.TrimSpace(pending.ExecKind) == "subagent" {
+		if err := service.reconcileParentTodoFromSubagentResult(stream, pending, intent.ExecClientMessage); err != nil {
+			return err
+		}
 		if err := service.closeSubagentDispatch(stream, pending, "tool_result"); err != nil {
 			return err
 		}
@@ -1906,10 +1941,8 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		if quotaErr != nil {
 			return service.completePreDispatchToolError(stream, invocation, nil, false, false, quotaErr)
 		}
-		stream.mu.Lock()
-		parentThinkingEffort := stream.ThinkingEffort
-		stream.mu.Unlock()
-		invocation = rewriteTaskInvocationThinkingEffort(invocation, parentThinkingEffort)
+		invocation = rewriteTaskInvocationModel(invocation, decision.EffectiveModelID)
+		invocation = rewriteTaskInvocationThinkingEffort(invocation, decision.EffectiveThinkingEffort)
 	}
 	var err error
 	invocation, err = service.sanitizeCreatePlanInvocationForCurrentPlan(stream, invocation)
@@ -2042,6 +2075,9 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		pendingExec.ProviderPass = stream.ProviderPassCount
 		stream.PendingExecs[pendingExec.ExecID] = pendingExec
 		stream.mu.Unlock()
+		if strings.TrimSpace(pendingExec.ExecKind) == "subagent" {
+			registerTaskBatchMember(stream, pendingExec)
+		}
 		scheduleExecRecovery := func() {
 			service.scheduleShellForegroundRecovery(stream.RequestID, pendingExec)
 			service.scheduleSubagentLeaseTimeout(stream.RequestID, pendingExec)
@@ -3577,6 +3613,7 @@ func markExecCompleted(stream *ActiveStream, pending runtimecore.PendingExec) {
 
 	stream.mu.Lock()
 	delete(stream.PendingExecs, pending.ExecID)
+	markTaskBatchTerminalLocked(stream, pending)
 	if pending.MessageID != 0 {
 		if stream.RecentCompletedExecs == nil {
 			stream.RecentCompletedExecs = make(map[uint32]time.Time)

@@ -16,33 +16,62 @@ const (
 	DefaultProxyListenAddr                  = "127.0.0.1:18080"
 	DefaultFrontendBaseURL                  = "http://127.0.0.1"
 	DefaultRoutingMode                      = "local"
-	DefaultProviderStreamIdleTimeoutSeconds = 240
 	MinProviderStreamIdleTimeoutSeconds     = 30
+	DefaultProviderStreamIdleTimeoutSeconds = 240
 )
 
+const (
+	SubagentRoleSimpleExplore = "simple_explore"
+	SubagentRoleMediumExplore = "medium_explore"
+	SubagentRoleComplexDebug  = "complex_debug"
+)
+
+var allSubagentRoles = []string{SubagentRoleSimpleExplore, SubagentRoleMediumExplore, SubagentRoleComplexDebug}
+
+func normalizeSubagentRoles(roles []string, legacyEnabled bool) []string {
+	if roles == nil && legacyEnabled {
+		return append([]string(nil), allSubagentRoles...)
+	}
+	seen := make(map[string]struct{}, len(roles))
+	normalized := make([]string, 0, len(roles))
+	for _, role := range roles {
+		role = strings.TrimSpace(role)
+		if role != SubagentRoleSimpleExplore && role != SubagentRoleMediumExplore && role != SubagentRoleComplexDebug {
+			continue
+		}
+		if _, exists := seen[role]; exists {
+			continue
+		}
+		seen[role] = struct{}{}
+		normalized = append(normalized, role)
+	}
+	return normalized
+}
+
 type ModelAdapterConfig struct {
-	ID                          string `json:"id,omitempty" yaml:"-"`
-	DisplayName                 string `json:"displayName" yaml:"displayName"`
-	Type                        string `json:"type" yaml:"type"`
-	BaseURL                     string `json:"baseURL" yaml:"baseURL"`
-	APIKey                      string `json:"apiKey" yaml:"apiKey"`
-	TooltipData                 string `json:"tooltipData" yaml:"tooltipData"`
-	SubagentEnabled             bool   `json:"subagentEnabled" yaml:"subagentEnabled"`
-	ModelID                     string `json:"modelID" yaml:"modelID"`
-	ReasoningEffort             string `json:"reasoningEffort" yaml:"reasoningEffort"`
-	OpenAIEndpoint              string `json:"openAIEndpoint" yaml:"openAIEndpoint"`
-	FastMode                    bool   `json:"fastMode" yaml:"fastMode"`
-	OpenAIExtraParamsEnabled    bool   `json:"openAIExtraParamsEnabled" yaml:"openAIExtraParamsEnabled"`
-	OpenAIExtraParamsJSON       string `json:"openAIExtraParamsJSON" yaml:"openAIExtraParamsJSON"`
-	CustomHeadersEnabled        bool   `json:"customHeadersEnabled" yaml:"customHeadersEnabled"`
-	CustomHeadersJSON           string `json:"customHeadersJSON" yaml:"customHeadersJSON"`
-	AnthropicExtraParamsEnabled bool   `json:"anthropicExtraParamsEnabled" yaml:"anthropicExtraParamsEnabled"`
-	AnthropicExtraParamsJSON    string `json:"anthropicExtraParamsJSON" yaml:"anthropicExtraParamsJSON"`
-	ContextWindowTokens         int    `json:"contextWindowTokens" yaml:"contextWindowTokens"`
-	MaxCompletionTokens         int    `json:"maxCompletionTokens" yaml:"maxCompletionTokens"`
-	AnthropicMaxTokens          int    `json:"anthropicMaxTokens" yaml:"anthropicMaxTokens"`
-	AnthropicThinkingEffort     string `json:"anthropicThinkingEffort,omitempty" yaml:"anthropicThinkingEffort,omitempty"`
-	ThinkingBudgetTokens        int    `json:"thinkingBudgetTokens" yaml:"thinkingBudgetTokens"`
+	ID                          string   `json:"id,omitempty" yaml:"-"`
+	DisplayName                 string   `json:"displayName" yaml:"displayName"`
+	Type                        string   `json:"type" yaml:"type"`
+	BaseURL                     string   `json:"baseURL" yaml:"baseURL"`
+	APIKey                      string   `json:"apiKey" yaml:"apiKey"`
+	TooltipData                 string   `json:"tooltipData" yaml:"tooltipData"`
+	SubagentEnabled             bool     `json:"subagentEnabled" yaml:"subagentEnabled"`
+	SubagentRoles               []string `json:"subagentRoles,omitempty" yaml:"subagentRoles,omitempty"`
+	ModelID                     string   `json:"modelID" yaml:"modelID"`
+	ReasoningEffort             string   `json:"reasoningEffort" yaml:"reasoningEffort"`
+	OpenAIEndpoint              string   `json:"openAIEndpoint" yaml:"openAIEndpoint"`
+	FastMode                    bool     `json:"fastMode" yaml:"fastMode"`
+	OpenAIExtraParamsEnabled    bool     `json:"openAIExtraParamsEnabled" yaml:"openAIExtraParamsEnabled"`
+	OpenAIExtraParamsJSON       string   `json:"openAIExtraParamsJSON" yaml:"openAIExtraParamsJSON"`
+	CustomHeadersEnabled        bool     `json:"customHeadersEnabled" yaml:"customHeadersEnabled"`
+	CustomHeadersJSON           string   `json:"customHeadersJSON" yaml:"customHeadersJSON"`
+	AnthropicExtraParamsEnabled bool     `json:"anthropicExtraParamsEnabled" yaml:"anthropicExtraParamsEnabled"`
+	AnthropicExtraParamsJSON    string   `json:"anthropicExtraParamsJSON" yaml:"anthropicExtraParamsJSON"`
+	ContextWindowTokens         int      `json:"contextWindowTokens" yaml:"contextWindowTokens"`
+	MaxCompletionTokens         int      `json:"maxCompletionTokens" yaml:"maxCompletionTokens"`
+	AnthropicMaxTokens          int      `json:"anthropicMaxTokens" yaml:"anthropicMaxTokens"`
+	AnthropicThinkingEffort     string   `json:"anthropicThinkingEffort,omitempty" yaml:"anthropicThinkingEffort,omitempty"`
+	ThinkingBudgetTokens        int      `json:"thinkingBudgetTokens" yaml:"thinkingBudgetTokens"`
 }
 
 type RoutingConfig struct {
@@ -138,7 +167,7 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 			BaseURL:              baseURL,
 			APIKey:               strings.TrimSpace(item.APIKey),
 			TooltipData:          strings.TrimSpace(item.TooltipData),
-			SubagentEnabled:      item.SubagentEnabled,
+			SubagentRoles:        normalizeSubagentRoles(item.SubagentRoles, item.SubagentEnabled),
 			ModelID:              strings.TrimSpace(item.ModelID),
 			ReasoningEffort:      normalizeReasoningEffort(item.ReasoningEffort),
 			OpenAIEndpoint:       modelchannel.NormalizeOpenAIEndpoint(item.Type, item.OpenAIEndpoint),
@@ -158,6 +187,7 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 		}
 		next.CustomHeadersEnabled = item.CustomHeadersEnabled
 		next.CustomHeadersJSON = strings.TrimSpace(item.CustomHeadersJSON)
+		next.SubagentEnabled = len(next.SubagentRoles) > 0
 		switch {
 		case next.DisplayName == "":
 			return nil, errors.New("模型适配器 displayName 不能为空")

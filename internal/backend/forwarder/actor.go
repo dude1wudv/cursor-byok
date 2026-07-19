@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -402,6 +403,18 @@ func (service *Service) reconcileStream(stream *ActiveStream) error {
 		}
 		return nil
 	}
+	generation, batchReady := taskBatchAllowsParentNotification(stream)
+	if !batchReady {
+		service.setTurnPhase(stream, TurnPhaseWaitingExternal)
+		return nil
+	}
+	if generation > 0 && service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "task_batch_parent_notified", map[string]any{
+			"generation": generation,
+			"members":    taskBatchDebugSnapshot(stream, generation),
+			"notified":   true,
+		})
+	}
 	if hasPendingCompaction {
 		service.setTurnPhase(stream, TurnPhaseCompacting)
 		return nil
@@ -494,15 +507,7 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 		stream.mu.Unlock()
 		return service.broker.Publish(requestID, StreamEvent{Message: buildThinkingDeltaMessage(event.Text, event.ThinkingStyle)})
 	case modeladapter.ModelEventKindThinkingCompleted:
-		shouldEmitSyntheticThinking := false
-		suppressThinkingCompleted := false
-		completedDuration := event.ThinkingDurationMS
-		if strings.TrimSpace(event.ThinkingSignature) == "" {
-			stream.mu.Lock()
-			suppressThinkingCompleted = stream.ProviderSyntheticThinkingPublished &&
-				strings.TrimSpace(stream.ProviderAccumulatedReasoning) == ""
-			stream.mu.Unlock()
-		}
+		hasPublicReasoning := strings.TrimSpace(accumulatedReasoning) != ""
 		if strings.TrimSpace(event.ThinkingSignature) != "" {
 			stream.mu.Lock()
 			stream.ProviderAccumulatedReasoningSignature = strings.TrimSpace(event.ThinkingSignature)
@@ -510,31 +515,13 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 			stream.ProviderAccumulatedReasoningItemID = strings.TrimSpace(event.ProviderItemID)
 			stream.ProviderAccumulatedReasoningStatus = strings.TrimSpace(event.ProviderStatus)
 			stream.ProviderAccumulatedReasoningSummary = append([]byte(nil), event.ProviderSummary...)
-			shouldEmitSyntheticThinking = strings.TrimSpace(stream.ProviderAccumulatedReasoning) == "" &&
-				strings.TrimSpace(event.ThinkingSignatureSource) == modeladapter.ReasoningSignatureSourceOpenAIResponses
-			if shouldEmitSyntheticThinking {
-				if completedDuration <= 0 {
-					completedDuration = 1
-				}
-				if !stream.ProviderSyntheticThinkingPublished {
-					stream.ProviderSyntheticThinkingPublished = true
-				} else {
-					shouldEmitSyntheticThinking = false
-					suppressThinkingCompleted = true
-				}
-			}
 			stream.UpdatedAt = time.Now().UTC()
 			stream.mu.Unlock()
 		}
-		if shouldEmitSyntheticThinking {
-			if err := service.broker.Publish(requestID, StreamEvent{Message: buildThinkingDeltaMessage("Thinking is encrypted. Please wait a moment.", event.ThinkingStyle)}); err != nil {
-				return err
-			}
-		}
-		if suppressThinkingCompleted {
+		if !hasPublicReasoning {
 			return nil
 		}
-		return service.broker.Publish(requestID, StreamEvent{Message: buildThinkingCompletedMessage(completedDuration)})
+		return service.broker.Publish(requestID, StreamEvent{Message: buildThinkingCompletedMessage(event.ThinkingDurationMS)})
 	case modeladapter.ModelEventKindPartialToolCall:
 		toolCallID := strings.TrimSpace(event.ToolCallID)
 		if toolCallID == "" || event.ToolCall == nil {

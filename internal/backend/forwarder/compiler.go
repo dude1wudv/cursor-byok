@@ -62,6 +62,10 @@ func (compiler *DefaultPromptCompiler) Compile(conversation *ConversationFile, m
 	if err != nil {
 		return CompiledConversation{}, err
 	}
+	tools, _, err = filterTaskToolForSubagentRole(conversation, tools)
+	if err != nil {
+		return CompiledConversation{}, err
+	}
 	replayMessages, err := compiler.projector.ProjectPromptReplay(conversation)
 	if err != nil {
 		return CompiledConversation{}, err
@@ -121,6 +125,7 @@ func (compiler *DefaultPromptCompiler) DerivePromptContexts(conversation *Conver
 	if err != nil {
 		return nil, err
 	}
+	toolNames = filterTaskToolNamesForSubagentRole(conversation, toolNames)
 	replayMessages, err := compiler.projector.ProjectPromptReplay(conversation)
 	if err != nil {
 		return nil, err

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -111,7 +110,7 @@ func (manager *Manager) EnabledSubagentModels() []modeladapter.SubagentModel {
 	cfg := manager.Current()
 	models := make([]modeladapter.SubagentModel, 0, len(cfg.ModelAdapters))
 	for _, adapter := range cfg.ModelAdapters {
-		if !adapter.SubagentEnabled {
+		if len(adapter.SubagentRoles) == 0 {
 			continue
 		}
 		models = append(models, modeladapter.SubagentModel{
@@ -119,11 +118,9 @@ func (manager *Manager) EnabledSubagentModels() []modeladapter.SubagentModel {
 			DisplayName: strings.TrimSpace(adapter.DisplayName),
 			ModelID:     strings.TrimSpace(adapter.ModelID),
 			TooltipData: strings.TrimSpace(adapter.TooltipData),
+			Roles:       append([]string(nil), adapter.SubagentRoles...),
 		})
 	}
-	sort.Slice(models, func(left int, right int) bool {
-		return models[left].ID < models[right].ID
-	})
 	return models
 }
 
@@ -195,6 +192,7 @@ func (manager *Manager) LegacyRuntimeSnapshot(_ context.Context) (legacyruntime.
 			APIKey:                   item.APIKey,
 			TooltipData:              item.TooltipData,
 			SubagentEnabled:          item.SubagentEnabled,
+			SubagentRoles:            append([]string(nil), item.SubagentRoles...),
 			ModelID:                  item.ModelID,
 			ReasoningEffort:          item.ReasoningEffort,
 			OpenAIEndpoint:           item.OpenAIEndpoint,

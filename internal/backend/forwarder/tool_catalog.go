@@ -4,7 +4,6 @@ package forwarder
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 
 	"cursor/gen/agentv1"
@@ -73,9 +72,6 @@ func (catalog *DefaultToolCatalog) rewriteRootTaskTool(item json.RawMessage) (js
 	if len(models) == 0 {
 		return nil, nil
 	}
-	sort.Slice(models, func(left int, right int) bool {
-		return models[left].ID < models[right].ID
-	})
 	enum := make([]string, 0, len(models))
 	details := make([]string, 0, len(models))
 	for _, model := range models {
@@ -101,7 +97,22 @@ func (catalog *DefaultToolCatalog) rewriteRootTaskTool(item json.RawMessage) (js
 		return nil, fmt.Errorf("Task tool descriptor model schema is missing")
 	}
 	model["enum"] = enum
-	model["description"] = "Required for a new subagent: select one enabled adapter ID from the enum. Omit only when resuming an already-started subagent. Enabled adapters (display name | model ID | note):\n" + strings.Join(details, "\n")
+	roleEnum := []string{"simple_explore", "medium_explore", "complex_debug"}
+	roleProperty := map[string]any{
+		"type": "string", "enum": roleEnum,
+		"description": "任务角色：simple_explore 简单探索、medium_explore 中等探索、complex_debug 复杂调试。",
+	}
+	properties["task_role"] = roleProperty
+	required, _ := parameters["required"].([]any)
+	filteredRequired := make([]any, 0, len(required)+1)
+	for _, field := range required {
+		if fieldText, ok := field.(string); ok && fieldText == "model" {
+			continue
+		}
+		filteredRequired = append(filteredRequired, field)
+	}
+	parameters["required"] = append(filteredRequired, "task_role")
+	model["description"] = "Optional for a new subagent: when omitted, the first enabled adapter matching task_role is selected in configuration order. Explicit model IDs take priority and must be enabled. Enabled adapters (display name | model ID | note):\n" + strings.Join(details, "\n")
 	return json.Marshal(tool)
 }
 
@@ -332,6 +343,45 @@ func isChildConversationSubagentTypeName(subagentTypeName string) bool {
 	return strings.TrimSpace(subagentTypeName) != ""
 }
 
+func filterTaskToolNamesForSubagentRole(conversation *ConversationFile, names []string) []string {
+	if conversation == nil || !isChildConversationSubagentTypeName(conversation.SubagentTypeName) || normalizeSubagentRole(conversation.SubagentRole) == "complex_debug" {
+		return names
+	}
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if name != "Task" {
+			filtered = append(filtered, name)
+		}
+	}
+	return filtered
+}
+func filterTaskToolForSubagentRole(conversation *ConversationFile, items []json.RawMessage) ([]json.RawMessage, []string, error) {
+	if conversation == nil || !isChildConversationSubagentTypeName(conversation.SubagentTypeName) || normalizeSubagentRole(conversation.SubagentRole) == "complex_debug" {
+		names := make([]string, 0, len(items))
+		for _, item := range items {
+			name, err := extractToolName(item)
+			if err != nil {
+				return nil, nil, err
+			}
+			names = append(names, name)
+		}
+		return items, names, nil
+	}
+	filtered := make([]json.RawMessage, 0, len(items))
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		name, err := extractToolName(item)
+		if err != nil {
+			return nil, nil, err
+		}
+		if name == "Task" {
+			continue
+		}
+		filtered = append(filtered, item)
+		names = append(names, name)
+	}
+	return filtered, names, nil
+}
 func selectToolsByOrderedNames(items []json.RawMessage, orderedNames []string) ([]json.RawMessage, []string, error) {
 	byName := make(map[string]json.RawMessage, len(items))
 	for _, item := range items {

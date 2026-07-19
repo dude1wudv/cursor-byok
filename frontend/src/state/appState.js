@@ -22,6 +22,7 @@ import {
 const APP_STATE_STORAGE_KEY = "cursor-client:runtime-state:v2";
 const GENERIC_SERVICE_ERROR = "服务错误";
 const SUPPORTED_MODEL_ADAPTER_TYPES = new Set(["openai", "anthropic"]);
+const SUPPORTED_SUBAGENT_ROLES = new Set(["simple_explore", "medium_explore", "complex_debug"]);
 const SUPPORTED_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const SUPPORTED_ANTHROPIC_THINKING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 export const ANTHROPIC_THINKING_EFFORT_DEFAULT = "xhigh";
@@ -268,6 +269,7 @@ export function createEmptyModelAdapter() {
     apiKey: "",
     tooltipData: "备注",
     subagentEnabled: false,
+    subagentRoles: [],
     modelID: "",
     reasoningEffort: "medium",
     openAIEndpoint: OPENAI_ENDPOINT_RESPONSES,
@@ -371,6 +373,14 @@ export function normalizeModelAdapter(source) {
   const anthropicExtraParamsJSON = normalizedType === "anthropic"
     ? asString(raw.anthropicExtraParamsJSON ?? raw.anthropic_extra_params_json) || EXTRA_PARAMS_DEFAULT_JSON
     : "";
+  const configuredRoles = asArray(raw.subagentRoles ?? raw.subagent_roles)
+    .map((role) => asString(role).toLowerCase())
+    .filter((role, index, roles) => SUPPORTED_SUBAGENT_ROLES.has(role) && roles.indexOf(role) === index);
+  const subagentRoles = configuredRoles.length > 0
+    ? configuredRoles
+    : (raw.subagentRoles === undefined && raw.subagent_roles === undefined && asBoolean(raw.subagentEnabled ?? raw.subagent_enabled)
+      ? ["simple_explore", "medium_explore", "complex_debug"]
+      : []);
   return {
     id: asString(raw.id),
     displayName: asString(raw.displayName || raw.name),
@@ -378,7 +388,8 @@ export function normalizeModelAdapter(source) {
     baseURL: normalizeBaseURL(raw.baseURL || raw.url),
     apiKey: asString(raw.apiKey || raw.key),
     tooltipData: asString(raw.tooltipData),
-    subagentEnabled: asBoolean(raw.subagentEnabled ?? raw.subagent_enabled),
+    subagentRoles,
+    subagentEnabled: subagentRoles.length > 0,
     modelID: asString(raw.modelID),
     reasoningEffort: SUPPORTED_REASONING_EFFORTS.has(normalizedReasoningEffort)
       ? normalizedReasoningEffort

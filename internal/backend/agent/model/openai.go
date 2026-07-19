@@ -50,7 +50,8 @@ type openAIResponsesRequestBody struct {
 }
 
 type openAIResponsesReasoning struct {
-	Effort string `json:"effort,omitempty"`
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
 }
 
 type openAIToolAccumulator struct {
@@ -210,6 +211,14 @@ func applyOpenAIPromptCacheKeyOverride(body map[string]any, req StreamRequest, m
 	if key := openAIPromptCacheKey(req, modelID); key != "" {
 		body["prompt_cache_key"] = key
 	}
+}
+
+func applyOpenAIResponsesReasoningSummary(body map[string]any) {
+	reasoning, ok := body["reasoning"].(map[string]any)
+	if !ok || strings.TrimSpace(fmt.Sprint(reasoning["effort"])) == "none" {
+		return
+	}
+	reasoning["summary"] = "auto"
 }
 
 func applyOpenAIFastMode(body map[string]any, enabled bool) {
@@ -592,7 +601,6 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 	turnFinishedPending := false
 	thinkingStarted := time.Time{}
 	thinkingActive := false
-	thinkParser := &openAIThinkTagParser{}
 	flushThinkingCompleted := func() error {
 		if !thinkingActive {
 			return nil
@@ -667,28 +675,6 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 			Text:          reasoning,
 			ThinkingStyle: agentv1.ThinkingStyle_THINKING_STYLE_DEFAULT,
 		})
-	}
-	emitTaggedContentParts := func(parts []openAIContentPart) error {
-		for _, part := range parts {
-			switch part.Kind {
-			case openAIContentPartText:
-				if err := emitTextDelta(part.Text); err != nil {
-					return err
-				}
-			case openAIContentPartReasoning:
-				if err := emitThinkingDelta(part.Text); err != nil {
-					return err
-				}
-			case openAIContentPartThinkingCompleted:
-				if err := flushThinkingCompleted(); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-	flushTaggedContentTail := func() error {
-		return emitTaggedContentParts(thinkParser.Flush())
 	}
 	fail := func(streamErr error) error {
 		finishedAt = time.Now().UTC()
@@ -766,9 +752,6 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		}
 		payloadLine := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payloadLine == "[DONE]" {
-			if err := flushTaggedContentTail(); err != nil {
-				return fail(err)
-			}
 			if err := flushThinkingCompleted(); err != nil {
 				return fail(err)
 			}
@@ -790,9 +773,6 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 				currentModel = strings.TrimSpace(chunk.Model)
 			}
 			applyUsage(chunk.Usage)
-			if err := flushTaggedContentTail(); err != nil {
-				return fail(err)
-			}
 			if err := flushThinkingCompleted(); err != nil {
 				return fail(err)
 			}
@@ -808,7 +788,7 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		applyUsage(chunk.Usage)
 
 		if text := choice.Delta.Content; text != "" {
-			if err := emitTaggedContentParts(thinkParser.Consume(text)); err != nil {
+			if err := emitTextDelta(text); err != nil {
 				return fail(err)
 			}
 		}
@@ -819,9 +799,6 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		}
 
 		if len(choice.Delta.ToolCalls) > 0 && choice.Delta.Content == "" && choice.Delta.ReasoningContent == "" {
-			if err := flushTaggedContentTail(); err != nil {
-				return fail(err)
-			}
 			if err := flushThinkingCompleted(); err != nil {
 				return fail(err)
 			}
@@ -852,9 +829,6 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		}
 
 		if choice.FinishReason != nil {
-			if err := flushTaggedContentTail(); err != nil {
-				return fail(err)
-			}
 			if err := flushThinkingCompleted(); err != nil {
 				return fail(err)
 			}
@@ -899,9 +873,6 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		if idleErr := streamIdle.Err(); idleErr != nil {
 			return fail(idleErr)
 		}
-		return fail(err)
-	}
-	if err := flushTaggedContentTail(); err != nil {
 		return fail(err)
 	}
 	if err := flushThinkingCompleted(); err != nil {
@@ -954,7 +925,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			requestBody.Tools = tools
 		}
 		if effort := strings.TrimSpace(req.ReasoningEffort); effort != "" {
-			requestBody.Reasoning = &openAIResponsesReasoning{Effort: effort}
+			requestBody.Reasoning = &openAIResponsesReasoning{Effort: effort, Summary: "auto"}
 			requestBody.Include = []string{"reasoning.encrypted_content"}
 		}
 		body = requestBody
@@ -973,6 +944,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 		return err
 	}
+	applyOpenAIResponsesReasoningSummary(bodyMap)
 	applyOpenAIFastMode(bodyMap, req.FastMode)
 	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 {
 		bodyMap["max_output_tokens"] = req.MaxTokens
@@ -1110,9 +1082,23 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	pendingReasoningItemID := ""
 	pendingReasoningStatus := ""
 	var pendingReasoningSummary json.RawMessage
-	reasoningSummaryParts := make(map[int]string)
+	reasoningSummaryParts := make(map[string]string)
+	reasoningSummaryItemIDs := make(map[int]string)
 	reasoningSummaryText := ""
-	thinkParser := &openAIThinkTagParser{}
+	reasoningSummaryItemID := func(itemID string, outputIndex int) string {
+		if knownItemID, ok := reasoningSummaryItemIDs[outputIndex]; ok {
+			return knownItemID
+		}
+		itemID = strings.TrimSpace(itemID)
+		if itemID == "" {
+			itemID = fmt.Sprintf("output:%d", outputIndex)
+		}
+		reasoningSummaryItemIDs[outputIndex] = itemID
+		return itemID
+	}
+	reasoningSummaryKey := func(itemID string, summaryIndex int) string {
+		return strings.TrimSpace(itemID) + ":" + strconv.Itoa(summaryIndex)
+	}
 	toolKey := func(itemID string, outputIndex int) string {
 		if strings.TrimSpace(itemID) != "" {
 			return strings.TrimSpace(itemID)
@@ -1129,23 +1115,6 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	flushThinkingCompleted := func() error {
 		if !thinkingActive && pendingReasoningSignature == "" {
 			return nil
-		}
-		if !thinkingActive {
-			if summaryText := openAIResponsesReasoningSummaryText(pendingReasoningSummary); summaryText != "" {
-				streamIdle.MarkEffectiveContent()
-				thinkingStarted = time.Now()
-				thinkingActive = true
-				if err := sink(ModelEvent{
-					Kind:          ModelEventKindThinkingDelta,
-					OccurredAt:    time.Now().UTC(),
-					Provider:      "openai",
-					Model:         currentModel,
-					Text:          summaryText,
-					ThinkingStyle: agentv1.ThinkingStyle_THINKING_STYLE_DEFAULT,
-				}); err != nil {
-					return err
-				}
-			}
 		}
 		duration := int32(0)
 		if thinkingActive {
@@ -1233,17 +1202,17 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			ThinkingStyle: agentv1.ThinkingStyle_THINKING_STYLE_DEFAULT,
 		})
 	}
-	emitReasoningSummaryPart := func(summaryIndex int, text string, complete bool) error {
+	emitReasoningSummaryPart := func(itemID string, summaryIndex int, text string, snapshot bool) error {
 		if text == "" {
 			return nil
 		}
-		seen := reasoningSummaryParts[summaryIndex]
-		if complete {
-			if strings.HasPrefix(text, seen) {
-				text = strings.TrimPrefix(text, seen)
-			} else if seen != "" {
+		key := reasoningSummaryKey(itemID, summaryIndex)
+		seen := reasoningSummaryParts[key]
+		if snapshot {
+			if !strings.HasPrefix(text, seen) {
 				return nil
 			}
+			text = strings.TrimPrefix(text, seen)
 		}
 		if text == "" {
 			return nil
@@ -1257,31 +1226,17 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		if err := emitThinkingDelta(text); err != nil {
 			return err
 		}
-		reasoningSummaryParts[summaryIndex] += text
+		reasoningSummaryParts[key] += text
 		reasoningSummaryText += text
 		return nil
 	}
-	emitTaggedContentParts := func(parts []openAIContentPart) error {
-		for _, part := range parts {
-			switch part.Kind {
-			case openAIContentPartText:
-				if err := emitTextDelta(part.Text); err != nil {
-					return err
-				}
-			case openAIContentPartReasoning:
-				if err := emitThinkingDelta(part.Text); err != nil {
-					return err
-				}
-			case openAIContentPartThinkingCompleted:
-				if err := flushThinkingCompleted(); err != nil {
-					return err
-				}
+	emitReasoningSummarySnapshot := func(itemID string, raw json.RawMessage) error {
+		for index, text := range openAIResponsesReasoningSummaryParts(raw) {
+			if err := emitReasoningSummaryPart(itemID, index, text, true); err != nil {
+				return err
 			}
 		}
 		return nil
-	}
-	flushTaggedContentTail := func() error {
-		return emitTaggedContentParts(thinkParser.Flush())
 	}
 	fail := func(streamErr error) error {
 		finishedAt = time.Now().UTC()
@@ -1496,6 +1451,10 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	applyOutputItem := func(item openAIResponsesOutputItem, outputIndex int, complete bool) error {
 		switch strings.TrimSpace(item.Type) {
 		case "reasoning":
+			summaryItemID := reasoningSummaryItemID(item.ID, outputIndex)
+			if err := emitReasoningSummarySnapshot(summaryItemID, item.Summary); err != nil {
+				return err
+			}
 			return rememberReasoningSignature(item.EncryptedContent, item.ID, item.Status, item.Summary)
 		case "function_call":
 			if err := flushThinkingCompleted(); err != nil {
@@ -1544,9 +1503,6 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			if !terminalSeen {
 				return fail(fmt.Errorf("openai responses stream ended before terminal response event"))
 			}
-			if err := flushTaggedContentTail(); err != nil {
-				return fail(err)
-			}
 			if err := flushThinkingCompleted(); err != nil {
 				return fail(err)
 			}
@@ -1569,7 +1525,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 
 		switch strings.TrimSpace(event.Type) {
 		case "response.output_text.delta":
-			if err := emitTaggedContentParts(thinkParser.Consume(event.Delta)); err != nil {
+			if err := emitTextDelta(event.Delta); err != nil {
 				return fail(err)
 			}
 		case "response.output_item.added":
@@ -1638,16 +1594,19 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			}
 		case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
 			if event.Part != nil && strings.TrimSpace(event.Part.Type) == "summary_text" {
-				if err := emitReasoningSummaryPart(event.SummaryIndex, event.Part.Text, strings.HasSuffix(event.Type, ".done")); err != nil {
+				itemID := reasoningSummaryItemID(event.ItemID, event.OutputIndex)
+				if err := emitReasoningSummaryPart(itemID, event.SummaryIndex, event.Part.Text, strings.HasSuffix(event.Type, ".done")); err != nil {
 					return fail(err)
 				}
 			}
 		case "response.reasoning_summary_text.delta":
-			if err := emitReasoningSummaryPart(event.SummaryIndex, event.Delta, false); err != nil {
+			itemID := reasoningSummaryItemID(event.ItemID, event.OutputIndex)
+			if err := emitReasoningSummaryPart(itemID, event.SummaryIndex, event.Delta, false); err != nil {
 				return fail(err)
 			}
 		case "response.reasoning_summary_text.done":
-			if err := emitReasoningSummaryPart(event.SummaryIndex, event.Text, true); err != nil {
+			itemID := reasoningSummaryItemID(event.ItemID, event.OutputIndex)
+			if err := emitReasoningSummaryPart(itemID, event.SummaryIndex, event.Text, true); err != nil {
 				return fail(err)
 			}
 		case "response.reasoning_text.delta":
@@ -1659,7 +1618,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			responseIncomplete = strings.TrimSpace(event.Type) == "response.incomplete"
 			if event.Response != nil && !emittedText {
 				if strings.TrimSpace(event.Response.OutputText) != "" {
-					if err := emitTaggedContentParts(thinkParser.Consume(event.Response.OutputText)); err != nil {
+					if err := emitTextDelta(event.Response.OutputText); err != nil {
 						return fail(err)
 					}
 				} else {
@@ -1668,15 +1627,12 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 							if strings.TrimSpace(content.Type) != "output_text" && strings.TrimSpace(content.Type) != "text" {
 								continue
 							}
-							if err := emitTaggedContentParts(thinkParser.Consume(content.Text)); err != nil {
+							if err := emitTextDelta(content.Text); err != nil {
 								return fail(err)
 							}
 						}
 					}
 				}
-			}
-			if err := flushTaggedContentTail(); err != nil {
-				return fail(err)
 			}
 			if event.Response != nil {
 				for index, item := range event.Response.Output {
@@ -1709,9 +1665,6 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	}
 	if !terminalSeen {
 		return fail(fmt.Errorf("openai responses stream ended before terminal response event"))
-	}
-	if err := flushTaggedContentTail(); err != nil {
-		return fail(err)
 	}
 	if err := flushThinkingCompleted(); err != nil {
 		return fail(err)
@@ -1750,28 +1703,24 @@ func needsReasoningPartSeparator(previous string, next string) bool {
 		strings.TrimLeftFunc(next, unicode.IsSpace) == next
 }
 
-func openAIResponsesReasoningSummaryText(raw json.RawMessage) string {
+func openAIResponsesReasoningSummaryParts(raw json.RawMessage) []string {
 	if len(raw) == 0 {
-		return ""
+		return nil
 	}
 	var parts []struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	}
 	if err := json.Unmarshal(raw, &parts); err != nil {
-		return ""
+		return nil
 	}
-	var text strings.Builder
-	for _, part := range parts {
-		if strings.TrimSpace(part.Type) != "summary_text" || part.Text == "" {
-			continue
+	texts := make([]string, len(parts))
+	for index, part := range parts {
+		if strings.TrimSpace(part.Type) == "summary_text" {
+			texts[index] = part.Text
 		}
-		if needsReasoningPartSeparator(text.String(), part.Text) {
-			text.WriteString("\n\n")
-		}
-		text.WriteString(part.Text)
 	}
-	return text.String()
+	return texts
 }
 
 func cloneRawJSON(raw json.RawMessage) json.RawMessage {

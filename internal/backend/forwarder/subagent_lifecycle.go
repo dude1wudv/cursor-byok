@@ -18,6 +18,7 @@ const (
 	subagentDispatchReservation          = "subagent_dispatch_reserved"
 	subagentDispatchEffective            = "subagent_dispatch_effective"
 	subagentDispatchClosed               = "subagent_dispatch_closed"
+	subagentParentTodoReconciled         = "subagent_parent_todo_reconciled"
 	subagentTimeoutReasonInactivityLease = "inactivity lease expired"
 	subagentTimeoutReasonMaximumRuntime  = "maximum runtime exceeded"
 )
@@ -27,20 +28,74 @@ type pendingSubagentLaunch struct {
 	ParentToolCallID     string
 	RootConversationID   string
 	SubagentType         string
+	SubagentRole         string
 	ModelID              string
 	PromptHash           string
 	ThinkingEffort       string
+	PlanText             string
+	Plans                map[string]*agentv1.PlanRegistryEntry
+	Todos                []*agentv1.TodoItem
+	PlanHash             string
+	PlanVersion          int64
+	ParentTodoID         string
+	DispatchID           string
 	CreatedAt            time.Time
 }
 
 type subagentDispatchDecision struct {
-	Depth        int
-	Used         int
-	Limit        int
-	QuotaScope   string
-	SubagentType string
-	Resume       bool
-	Duplicate    bool
+	Depth                   int
+	Used                    int
+	Limit                   int
+	QuotaScope              string
+	SubagentType            string
+	SubagentRole            string
+	EffectiveThinkingEffort string
+	EffectiveModelID        string
+	Resume                  bool
+	Duplicate               bool
+}
+
+func normalizeSubagentRole(value string) string {
+	switch strings.TrimSpace(value) {
+	case "simple_explore", "medium_explore", "complex_debug":
+		return strings.TrimSpace(value)
+	default:
+		return ""
+	}
+}
+
+func defaultTaskThinkingEffort(role string) string {
+	switch normalizeSubagentRole(role) {
+	case "simple_explore":
+		return "low"
+	case "medium_explore", "complex_debug":
+		return "medium"
+	default:
+		return ""
+	}
+}
+
+func latestSubagentRole(conversation *ConversationFile) string {
+	if conversation == nil {
+		return ""
+	}
+	if role := normalizeSubagentRole(conversation.SubagentRole); role != "" {
+		return role
+	}
+	for index := len(conversation.Entries) - 1; index >= 0; index-- {
+		entry := conversation.Entries[index]
+		if entry.Kind != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if json.Unmarshal(entry.Payload, &payload) != nil {
+			continue
+		}
+		if role := normalizeSubagentRole(readStringValue(payload.Value["task_role"])); role != "" {
+			return role
+		}
+	}
+	return ""
 }
 
 func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream, invocation runtimecore.ToolInvocation) (subagentDispatchDecision, error) {
@@ -53,6 +108,19 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		return decision, fmt.Errorf("decode Task args: %w", err)
 	}
 	decision.SubagentType = readStringMapValue(args, "subagent_type", "subagentType")
+	rawTaskRole := readStringMapValue(args, "task_role", "taskRole")
+	decision.SubagentRole = normalizeSubagentRole(rawTaskRole)
+	if strings.TrimSpace(rawTaskRole) != "" && decision.SubagentRole == "" {
+		return decision, fmt.Errorf("unsupported task_role %q", rawTaskRole)
+	}
+	requestedModelID := readStringMapValue(args, "model", "model_id", "modelId")
+	if decision.SubagentRole != "" {
+		resolvedModelID, modelErr := service.resolveTaskModelID(decision.SubagentRole, requestedModelID)
+		if modelErr != nil {
+			return decision, modelErr
+		}
+		decision.EffectiveModelID = resolvedModelID
+	}
 	requestedThinkingEffort := normalizeTaskThinkingEffort(readStringMapValue(args, "thinking_effort", "thinkingEffort"))
 	callID := strings.TrimSpace(invocation.CallID)
 	if callID == "" {
@@ -79,6 +147,18 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		return decision, err
 	}
 	decision.Depth = depth
+	if depth > 1 {
+		parentRole := latestSubagentRole(conversation)
+		if parentRole != "complex_debug" {
+			return decision, fmt.Errorf("only complex_debug subagents may dispatch nested Task calls")
+		}
+		if decision.SubagentRole == "complex_debug" {
+			return decision, fmt.Errorf("complex_debug subagents may only dispatch simple_explore or medium_explore")
+		}
+		if decision.SubagentRole != "" && decision.SubagentRole != "simple_explore" && decision.SubagentRole != "medium_explore" {
+			return decision, fmt.Errorf("nested Task task_role must be simple_explore or medium_explore")
+		}
+	}
 	if depth >= subagentMaximumDepth {
 		return decision, fmt.Errorf("subagent depth limit reached: maximum depth is %d", subagentMaximumDepth)
 	}
@@ -100,15 +180,28 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 	}
 	effectiveThinkingEffort := requestedThinkingEffort
 	if effectiveThinkingEffort == "" {
-		effectiveThinkingEffort = parentThinkingEffort
+		effectiveThinkingEffort = defaultTaskThinkingEffort(decision.SubagentRole)
+		if effectiveThinkingEffort == "" {
+			effectiveThinkingEffort = parentThinkingEffort
+		}
 	}
+	decision.EffectiveThinkingEffort = effectiveThinkingEffort
+	planHash := subagentParentPlanHash(conversation)
+	parentTodoID := matchSubagentParentTodo(conversation.CurrentTodos, args)
+	planVersion := conversation.ContextVersion
+	dispatchID := strings.TrimSpace(invocation.CallID)
 	if _, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
 		newMetadataEntry(turnSeq, requestID, subagentDispatchReservation, map[string]any{
 			"tool_call_id":              strings.TrimSpace(invocation.CallID),
+			"dispatch_id":               dispatchID,
 			"turn_seq":                  turnSeq,
 			"parent_conversation_id":    strings.TrimSpace(conversationID),
+			"parent_todo_id":            parentTodoID,
+			"plan_hash":                 planHash,
+			"plan_version":              planVersion,
 			"depth":                     depth,
 			"subagent_type":             strings.TrimSpace(decision.SubagentType),
+			"task_role":                 strings.TrimSpace(decision.SubagentRole),
 			"requested_model_id":        readStringMapValue(args, "model", "model_id", "modelId"),
 			"requested_thinking_effort": requestedThinkingEffort,
 			"effective_thinking_effort": effectiveThinkingEffort,
@@ -122,9 +215,17 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		ParentToolCallID:     strings.TrimSpace(invocation.CallID),
 		RootConversationID:   strings.TrimSpace(conversation.RootConversationID),
 		SubagentType:         strings.TrimSpace(decision.SubagentType),
-		ModelID:              readStringMapValue(args, "model", "model_id", "modelId"),
+		SubagentRole:         strings.TrimSpace(decision.SubagentRole),
+		ModelID:              firstNonEmpty(decision.EffectiveModelID, readStringMapValue(args, "model", "model_id", "modelId")),
 		PromptHash:           planContentHash(readStringMapValue(args, "prompt")),
 		ThinkingEffort:       effectiveThinkingEffort,
+		PlanText:             strings.TrimSpace(conversation.CurrentPlanText),
+		Plans:                clonePlanRegistryEntries(conversation.CurrentPlans),
+		Todos:                cloneTodoItems(conversation.CurrentTodos),
+		PlanHash:             planHash,
+		PlanVersion:          planVersion,
+		ParentTodoID:         parentTodoID,
+		DispatchID:           dispatchID,
 		CreatedAt:            time.Now().UTC(),
 	})
 	decision.Used++
@@ -209,9 +310,115 @@ func (service *Service) consumePendingSubagentLaunch(subagentType string, modelI
 			continue
 		}
 		service.pendingSubagents = append(service.pendingSubagents[:index], service.pendingSubagents[index+1:]...)
+		item.Plans = clonePlanRegistryEntries(item.Plans)
+		item.Todos = cloneTodoItems(item.Todos)
 		return item, true
 	}
 	return pendingSubagentLaunch{}, false
+}
+
+func subagentLaunchBootstrapEntries(launch pendingSubagentLaunch, turnSeq int64, requestID string) ([]HistoryEntry, error) {
+	entries := make([]HistoryEntry, 0, 2)
+	if strings.TrimSpace(launch.PlanText) != "" || len(launch.Plans) > 0 || len(launch.Todos) > 0 {
+		payload, err := json.Marshal(runtimeStateEntryPayload{
+			PlanText: strings.TrimSpace(launch.PlanText),
+			Plans:    clonePlanRegistryEntries(launch.Plans),
+			Todos:    cloneTodoItems(launch.Todos),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("encode subagent parent plan snapshot: %w", err)
+		}
+		entries = append(entries, HistoryEntry{
+			TurnSeq:   turnSeq,
+			RequestID: strings.TrimSpace(requestID),
+			Role:      "system",
+			Kind:      "runtime_state",
+			Payload:   payload,
+		})
+	}
+	entries = append(entries, newMetadataEntry(turnSeq, requestID, "subagent_parent_plan_snapshot", map[string]any{
+		"parent_conversation_id": strings.TrimSpace(launch.ParentConversationID),
+		"parent_tool_call_id":    strings.TrimSpace(launch.ParentToolCallID),
+		"parent_todo_id":         strings.TrimSpace(launch.ParentTodoID),
+		"dispatch_id":            strings.TrimSpace(launch.DispatchID),
+		"plan_hash":              strings.TrimSpace(launch.PlanHash),
+		"plan_version":           launch.PlanVersion,
+	}))
+	return entries, nil
+}
+
+func subagentParentPlanHash(conversation *ConversationFile) string {
+	if conversation == nil {
+		return ""
+	}
+	payload, err := json.Marshal(struct {
+		PlanText string                                `json:"plan_text,omitempty"`
+		Plans    map[string]*agentv1.PlanRegistryEntry `json:"plans,omitempty"`
+	}{
+		PlanText: strings.TrimSpace(conversation.CurrentPlanText),
+		Plans:    clonePlanRegistryEntries(conversation.CurrentPlans),
+	})
+	if err != nil || (strings.TrimSpace(conversation.CurrentPlanText) == "" && len(conversation.CurrentPlans) == 0) {
+		return ""
+	}
+	return planContentHash(string(payload))
+}
+
+func matchSubagentParentTodo(todos []*agentv1.TodoItem, args map[string]any) string {
+	if len(todos) == 0 {
+		return ""
+	}
+	description := strings.ToLower(readStringMapValue(args, "description"))
+	prompt := strings.ToLower(readStringMapValue(args, "prompt"))
+	for _, todo := range todos {
+		if todo == nil || isTerminalTodoStatus(todo.GetStatus()) {
+			continue
+		}
+		id := strings.TrimSpace(todo.GetId())
+		if id != "" && (containsTaskIdentifier(description, id) || containsTaskIdentifier(prompt, id)) {
+			return id
+		}
+	}
+	inProgressID := ""
+	for _, todo := range todos {
+		if todo == nil || todo.GetStatus() != agentv1.TodoStatus_TODO_STATUS_IN_PROGRESS {
+			continue
+		}
+		if inProgressID != "" {
+			return ""
+		}
+		inProgressID = strings.TrimSpace(todo.GetId())
+	}
+	return inProgressID
+}
+
+func containsTaskIdentifier(text string, id string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	id = strings.ToLower(strings.TrimSpace(id))
+	if text == "" || id == "" {
+		return false
+	}
+	for offset := 0; ; {
+		index := strings.Index(text[offset:], id)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		leftOK := index == 0 || !isTaskIdentifierRune(rune(text[index-1]))
+		right := index + len(id)
+		rightOK := right == len(text) || !isTaskIdentifierRune(rune(text[right]))
+		if leftOK && rightOK {
+			return true
+		}
+		offset = index + len(id)
+		if offset >= len(text) {
+			return false
+		}
+	}
+}
+
+func isTaskIdentifierRune(value rune) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9' || value == '_' || value == '-'
 }
 
 func normalizeTaskThinkingEffort(raw string) string {
@@ -242,6 +449,20 @@ func taskThinkingEffortDisplayName(effort string) string {
 	}
 }
 
+func rewriteTaskInvocationModel(invocation runtimecore.ToolInvocation, modelID string) runtimecore.ToolInvocation {
+	if strings.TrimSpace(invocation.ToolName) != "Task" || strings.TrimSpace(modelID) == "" {
+		return invocation
+	}
+	var args map[string]any
+	if json.Unmarshal(invocation.ArgsJSON, &args) != nil {
+		return invocation
+	}
+	args["model"] = strings.TrimSpace(modelID)
+	if encoded, err := json.Marshal(args); err == nil {
+		invocation.ArgsJSON = encoded
+	}
+	return invocation
+}
 func rewriteTaskInvocationThinkingEffort(invocation runtimecore.ToolInvocation, parentThinkingEffort string) runtimecore.ToolInvocation {
 	if strings.TrimSpace(invocation.ToolName) != "Task" {
 		return invocation
@@ -302,6 +523,7 @@ func (service *Service) rollbackSubagentDispatch(stream *ActiveStream, pending r
 		return
 	}
 	stream.mu.Lock()
+	markTaskBatchTerminalLocked(stream, pending)
 	delete(stream.PendingExecs, pending.ExecID)
 	stream.mu.Unlock()
 	clearStreamTimer(stream, providerTimerKey(streamTimerSubagentResult, pending.ExecID))
@@ -687,6 +909,246 @@ func (service *Service) recoverSubagentStillRunning(stream *ActiveStream, pendin
 	return service.reconcileStream(stream)
 }
 
+func (service *Service) reconcileParentTodoFromSubagentResult(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
+	if service == nil || stream == nil || strings.TrimSpace(pending.ToolCallID) == "" || message == nil {
+		return nil
+	}
+	outcome := subagentResultOutcome(message.GetSubagentResult())
+	conversation, _, _, err := service.snapshotCheckpointConversation(stream)
+	if err != nil || conversation == nil {
+		return err
+	}
+	reservation, found := latestSubagentReservation(conversation, pending.ToolCallID)
+	if !found || reservation.ParentTodoID == "" || reservation.PlanHash == "" {
+		return nil
+	}
+	for _, entry := range conversation.Entries {
+		if strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if json.Unmarshal(entry.Payload, &payload) == nil && strings.TrimSpace(payload.Type) == subagentParentTodoReconciled && strings.TrimSpace(readStringValue(payload.Value["dispatch_id"])) == reservation.DispatchID {
+			return nil
+		}
+	}
+	currentPlanHash := subagentParentPlanHash(conversation)
+	currentAttempt := latestSubagentTodoAttempt(conversation, reservation.PlanHash, reservation.ParentTodoID)
+	applied := outcome == "succeeded" && currentPlanHash == reservation.PlanHash && currentAttempt == reservation.DispatchID
+	reason := "outcome_not_successful"
+	if currentPlanHash != reservation.PlanHash {
+		reason = "stale_plan"
+	} else if currentAttempt != reservation.DispatchID {
+		reason = "stale_attempt"
+	} else if applied {
+		reason = "completed"
+	}
+	entries := make([]HistoryEntry, 0, 4)
+	if applied {
+		state, stateErr := projectConversationStructuredState(conversation)
+		if stateErr != nil {
+			return stateErr
+		}
+		nextTodos := cloneTodoItems(state.Todos)
+		updated := false
+		for _, todo := range nextTodos {
+			if todo == nil || strings.TrimSpace(todo.GetId()) != reservation.ParentTodoID || isTerminalTodoStatus(todo.GetStatus()) {
+				continue
+			}
+			todo.Status = agentv1.TodoStatus_TODO_STATUS_COMPLETED
+			todo.UpdatedAt = time.Now().UTC().UnixMilli()
+			updated = true
+			break
+		}
+		if updated {
+			payload, encodeErr := json.Marshal(runtimeStateEntryPayload{
+				PlanText: state.PlanText,
+				Plans:    clonePlanRegistryEntries(state.Plans),
+				Todos:    nextTodos,
+			})
+			if encodeErr != nil {
+				return fmt.Errorf("encode parent todo reconciliation state: %w", encodeErr)
+			}
+			entries = append(entries, HistoryEntry{
+				TurnSeq:   stream.TurnSeq,
+				RequestID: strings.TrimSpace(stream.RequestID),
+				Role:      "system",
+				Kind:      "runtime_state",
+				Payload:   payload,
+			})
+			entries = append(entries, buildPlanWaveTransitionEntries(conversation, state.Todos, nextTodos, stream.TurnSeq, stream.RequestID)...)
+		} else {
+			applied = false
+			reason = "todo_missing_or_terminal"
+		}
+	}
+	entries = append(entries, newMetadataEntry(stream.TurnSeq, stream.RequestID, subagentParentTodoReconciled, map[string]any{
+		"tool_call_id":   strings.TrimSpace(pending.ToolCallID),
+		"dispatch_id":    reservation.DispatchID,
+		"parent_todo_id": reservation.ParentTodoID,
+		"plan_hash":      reservation.PlanHash,
+		"plan_version":   reservation.PlanVersion,
+		"outcome":        outcome,
+		"applied":        applied,
+		"reason":         reason,
+	}))
+	_, err = service.appendConversationEntries(stream, stream.ConversationID, entries)
+	return err
+}
+
+type subagentReservationCorrelation struct {
+	DispatchID   string
+	ParentTodoID string
+	PlanHash     string
+	PlanVersion  int64
+}
+
+func latestSubagentReservation(conversation *ConversationFile, toolCallID string) (subagentReservationCorrelation, bool) {
+	toolCallID = strings.TrimSpace(toolCallID)
+	if conversation == nil || toolCallID == "" {
+		return subagentReservationCorrelation{}, false
+	}
+	for index := len(conversation.Entries) - 1; index >= 0; index-- {
+		entry := conversation.Entries[index]
+		if strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if json.Unmarshal(entry.Payload, &payload) != nil || strings.TrimSpace(payload.Type) != subagentDispatchReservation || strings.TrimSpace(readStringValue(payload.Value["tool_call_id"])) != toolCallID {
+			continue
+		}
+		return subagentReservationCorrelation{
+			DispatchID:   firstNonEmpty(strings.TrimSpace(readStringValue(payload.Value["dispatch_id"])), toolCallID),
+			ParentTodoID: strings.TrimSpace(readStringValue(payload.Value["parent_todo_id"])),
+			PlanHash:     strings.TrimSpace(readStringValue(payload.Value["plan_hash"])),
+			PlanVersion:  int64Value(payload.Value["plan_version"]),
+		}, true
+	}
+	return subagentReservationCorrelation{}, false
+}
+
+func latestSubagentTodoAttempt(conversation *ConversationFile, planHash string, parentTodoID string) string {
+	if conversation == nil {
+		return ""
+	}
+	for index := len(conversation.Entries) - 1; index >= 0; index-- {
+		entry := conversation.Entries[index]
+		if strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if json.Unmarshal(entry.Payload, &payload) != nil || strings.TrimSpace(payload.Type) != subagentDispatchReservation {
+			continue
+		}
+		if strings.TrimSpace(readStringValue(payload.Value["plan_hash"])) == strings.TrimSpace(planHash) && strings.TrimSpace(readStringValue(payload.Value["parent_todo_id"])) == strings.TrimSpace(parentTodoID) {
+			return firstNonEmpty(strings.TrimSpace(readStringValue(payload.Value["dispatch_id"])), strings.TrimSpace(readStringValue(payload.Value["tool_call_id"])))
+		}
+	}
+	return ""
+}
+
+func subagentResultOutcome(result *agentv1.SubagentResult) string {
+	if result == nil {
+		return "missing"
+	}
+	switch item := result.GetResult().(type) {
+	case *agentv1.SubagentResult_Success:
+		if strings.TrimSpace(item.Success.GetFinalMessage()) == "" {
+			return "background_or_empty"
+		}
+		return "succeeded"
+	case *agentv1.SubagentResult_Error:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+func registerTaskBatchMember(stream *ActiveStream, pending runtimecore.PendingExec) {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "subagent" || strings.TrimSpace(pending.ToolCallID) == "" {
+		return
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if stream.TaskBatches == nil {
+		stream.TaskBatches = make(map[int]*TaskBatch)
+	}
+	batch := stream.TaskBatches[pending.ProviderPass]
+	if batch == nil {
+		batch = &TaskBatch{Generation: pending.ProviderPass, ProviderPass: pending.ProviderPass, Members: make(map[string]*TaskBatchMember)}
+		stream.TaskBatches[pending.ProviderPass] = batch
+	}
+	if _, exists := batch.Members[pending.ToolCallID]; !exists {
+		batch.Members[pending.ToolCallID] = &TaskBatchMember{ToolCallID: strings.TrimSpace(pending.ToolCallID)}
+	}
+}
+
+func markTaskBatchTerminalLocked(stream *ActiveStream, pending runtimecore.PendingExec) {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "subagent" || strings.TrimSpace(pending.ToolCallID) == "" {
+		return
+	}
+	batch := stream.TaskBatches[pending.ProviderPass]
+	if batch == nil {
+		return
+	}
+	member := batch.Members[strings.TrimSpace(pending.ToolCallID)]
+	if member == nil || member.Terminal {
+		return
+	}
+	member.Terminal = true
+	member.TerminalSource = firstNonEmpty(strings.TrimSpace(pending.StreamState), "real_result")
+	member.TerminalAt = time.Now().UTC()
+}
+
+func taskBatchAllowsParentNotification(stream *ActiveStream) (int, bool) {
+	if stream == nil {
+		return 0, true
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	var selected *TaskBatch
+	for _, batch := range stream.TaskBatches {
+		if batch == nil || len(batch.Members) == 0 || batch.ParentNotified {
+			continue
+		}
+		if selected == nil || batch.Generation > selected.Generation {
+			selected = batch
+		}
+	}
+	if selected == nil {
+		return 0, true
+	}
+	for _, member := range selected.Members {
+		if member == nil || !member.Terminal {
+			return selected.Generation, false
+		}
+	}
+	selected.ParentNotified = true
+	return selected.Generation, true
+}
+func taskBatchDebugSnapshot(stream *ActiveStream, generation int) []map[string]any {
+	if stream == nil {
+		return nil
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	batch := stream.TaskBatches[generation]
+	if batch == nil {
+		return nil
+	}
+	members := make([]map[string]any, 0, len(batch.Members))
+	for _, member := range batch.Members {
+		if member == nil {
+			continue
+		}
+		members = append(members, map[string]any{
+			"tool_call_id":    member.ToolCallID,
+			"terminal":        member.Terminal,
+			"terminal_source": member.TerminalSource,
+		})
+	}
+	return members
+}
+
 func (service *Service) closeSubagentDispatch(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
 	if service == nil || stream == nil || strings.TrimSpace(pending.ToolCallID) == "" {
 		return nil
@@ -710,11 +1172,17 @@ func (service *Service) closeSubagentDispatch(stream *ActiveStream, pending runt
 			return nil
 		}
 	}
+	reservation, _ := latestSubagentReservation(conversation, pending.ToolCallID)
 	_, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
 		newMetadataEntry(turnSeq, requestID, subagentDispatchClosed, map[string]any{
-			"tool_call_id": pending.ToolCallID,
-			"exec_id":      pending.ExecID,
-			"reason":       strings.TrimSpace(reason),
+			"tool_call_id":   pending.ToolCallID,
+			"exec_id":        pending.ExecID,
+			"dispatch_id":    reservation.DispatchID,
+			"parent_todo_id": reservation.ParentTodoID,
+			"plan_hash":      reservation.PlanHash,
+			"plan_version":   reservation.PlanVersion,
+			"outcome":        strings.TrimSpace(reason),
+			"reason":         strings.TrimSpace(reason),
 		}),
 	})
 	return err

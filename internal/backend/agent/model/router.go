@@ -31,6 +31,7 @@ type SubagentModel struct {
 	DisplayName string
 	ModelID     string
 	TooltipData string
+	Roles       []string
 }
 
 // SubagentModelDirectory 提供当前启用的子代理模型目录。

@@ -49,6 +49,12 @@ const anthropicThinkingEffortOptions = [
   { label: "Max", value: "max", icon: "icon-[mdi--brain]" },
 ];
 
+const subagentRoleOptions = [
+  { value: "simple_explore", label: "简单探索", description: "快速定位文件与线索，建议 Luna / Low" },
+  { value: "medium_explore", label: "中等探索", description: "跨文件调查与归纳，建议 Terra / Medium" },
+  { value: "complex_debug", label: "复杂调试", description: "需要运行证据的复杂排障，建议 Sol / Medium" },
+];
+
 const openAIEndpointOptions = [
   { label: "/v1/responses", value: OPENAI_ENDPOINT_RESPONSES, icon: "icon-[mdi--api]" },
   { label: "/v1/chat/completions", value: OPENAI_ENDPOINT_CHAT_COMPLETIONS, icon: "icon-[mdi--message-text-outline]" },
@@ -331,10 +337,23 @@ onMounted(async () => {
               v-model="draft.subagentEnabled"
               type="checkbox"
               class="size-4 accent-[#10AD5D]"
+              @change="draft.subagentRoles = draft.subagentEnabled ? subagentRoleOptions.map((role) => role.value) : []"
             />
             <span>允许作为子代理模型</span>
           </label>
-          <p class="mt-2 text-xs leading-5 text-[#8f8f8f]">开启后，显示名称、模型标识和备注会供父模型发现和选择。</p>
+          <div class="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
+            <label
+              v-for="role in subagentRoleOptions"
+              :key="role.value"
+              class="flex cursor-pointer flex-col gap-1 rounded-[6px] border border-[#3f3f3f] bg-[#232323] p-2 text-xs text-[#d4d4d4]"
+            >
+              <span class="center-row gap-2">
+                <input v-model="draft.subagentRoles" :value="role.value" type="checkbox" class="size-4 accent-[#10AD5D]" @change="draft.subagentEnabled = draft.subagentRoles.length > 0" />
+                <span>{{ role.label }}</span>
+              </span>
+              <span class="text-[#8f8f8f]">{{ role.description }}</span>
+            </label>
+          </div>
         </div>
 
         <div class="grid grid-cols-1 gap-3 md:grid-cols-2">

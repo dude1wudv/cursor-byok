@@ -22,6 +22,7 @@ type ConversationFile struct {
 	ParentConversationID            string                                `json:"parent_conversation_id"`
 	ParentToolCallID                string                                `json:"parent_tool_call_id"`
 	SubagentTypeName                string                                `json:"subagent_type_name,omitempty"`
+	SubagentRole                    string                                `json:"subagent_role,omitempty"`
 	SubagentDepth                   int                                   `json:"subagent_depth,omitempty"`
 	Mode                            string                                `json:"mode"`
 	ContextVersion                  int64                                 `json:"context_version,omitempty"`
@@ -118,6 +119,19 @@ type StreamSubscriber struct {
 	Done   chan struct{}
 }
 
+type TaskBatchMember struct {
+	ToolCallID     string    `json:"tool_call_id"`
+	Terminal       bool      `json:"terminal"`
+	TerminalSource string    `json:"terminal_source,omitempty"`
+	TerminalAt     time.Time `json:"terminal_at,omitempty"`
+}
+
+type TaskBatch struct {
+	Generation     int                         `json:"generation"`
+	ProviderPass   int                         `json:"provider_pass"`
+	Members        map[string]*TaskBatchMember `json:"members"`
+	ParentNotified bool                        `json:"parent_notified"`
+}
 type ActiveStream struct {
 	mu sync.Mutex
 
@@ -176,6 +190,7 @@ type ActiveStream struct {
 	TerminalsFolder             string
 	RequestFileContents         map[string]string
 	RecentCompletedExecs        map[uint32]time.Time
+	TaskBatches                 map[int]*TaskBatch
 	BackgroundShells            map[string]*BackgroundShellState
 	BackgroundShellsByMessageID map[uint32]string
 	BackgroundShellsByExecID    map[string]string
