@@ -1,1 +1,3 @@
-- 修复 Grok OpenAI 兼容模型未获得稳定会话 `prompt_cache_key` 的问题；`grok-*` 现使用 `cursor:<ConversationID>`，使同一会话可复用提示缓存。
+- 模型配置现可显式允许作为 Subagent 使用。
+- 父模型可动态发现并通过自然语言选择 Kimi、DeepSeek 等兼容 OpenAI / Anthropic 的自定义模型。
+- 严格 opt-in：未启用的模型不会暴露给子代理选择。
