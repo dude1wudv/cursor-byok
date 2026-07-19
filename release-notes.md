@@ -1,4 +1,1 @@
-- 新增每模型 OpenAI Fast / priority 开关，开启后 Chat Completions 与 Responses 请求发送 `service_tier: "priority"`。
-- 旧模型配置默认关闭 Fast，Anthropic 请求保持原有行为。
-- 保留 `explore` 与 `generalPurpose` 的双向模型兜底，任一角色配置不可用时任务仍可继续。
-- 优先减少 `sol` 在常规探索与修改任务中的使用，但不强制禁止、过滤或拒绝显式模型选择。
+- 修复 Grok OpenAI 兼容模型未获得稳定会话 `prompt_cache_key` 的问题；`grok-*` 现使用 `cursor:<ConversationID>`，使同一会话可复用提示缓存。
