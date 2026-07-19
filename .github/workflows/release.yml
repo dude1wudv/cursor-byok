@@ -77,7 +77,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force frontend/dist | Out-Null
-          Set-Content -NoNewline frontend/dist/.wails-placeholder 'placeholder'
+          Set-Content -Path frontend/dist/wails-placeholder.txt -Value 'placeholder' -NoNewline
           task common:generate:proto
           task common:generate:bindings
           yarn --cwd frontend install --frozen-lockfile
@@ -98,7 +98,7 @@ jobs:
   macos-amd64:
     name: macOS amd64
     needs: validate-tag
-    runs-on: macos-13
+    runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -135,7 +135,7 @@ jobs:
       - name: Generate bindings and build frontend
         run: |
           mkdir -p frontend/dist
-          : > frontend/dist/.wails-placeholder
+          : > frontend/dist/wails-placeholder.txt
           task common:generate:proto
           task common:generate:bindings
           yarn --cwd frontend install --frozen-lockfile
@@ -211,7 +211,7 @@ jobs:
       - name: Generate bindings and build frontend
         run: |
           mkdir -p frontend/dist
-          : > frontend/dist/.wails-placeholder
+          : > frontend/dist/wails-placeholder.txt
           task common:generate:proto
           task common:generate:bindings
           yarn --cwd frontend install --frozen-lockfile
