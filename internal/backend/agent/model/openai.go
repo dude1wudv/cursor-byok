@@ -1217,17 +1217,15 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		if text == "" {
 			return nil
 		}
+		emittedText := text
 		if seen == "" && reasoningSummaryText != "" && needsReasoningPartSeparator(reasoningSummaryText, text) {
-			if err := emitThinkingDelta("\n\n"); err != nil {
-				return err
-			}
-			reasoningSummaryText += "\n\n"
+			emittedText = "\n\n" + text
 		}
-		if err := emitThinkingDelta(text); err != nil {
+		if err := emitThinkingDelta(emittedText); err != nil {
 			return err
 		}
 		reasoningSummaryParts[key] += text
-		reasoningSummaryText += text
+		reasoningSummaryText += emittedText
 		return nil
 	}
 	emitReasoningSummarySnapshot := func(itemID string, raw json.RawMessage) error {

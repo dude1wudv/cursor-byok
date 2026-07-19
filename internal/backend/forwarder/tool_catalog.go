@@ -80,7 +80,13 @@ func (catalog *DefaultToolCatalog) rewriteRootTaskTool(item json.RawMessage) (js
 			continue
 		}
 		enum = append(enum, id)
-		details = append(details, fmt.Sprintf("- %s | %s | %s", strings.TrimSpace(model.DisplayName), strings.TrimSpace(model.ModelID), strings.TrimSpace(model.TooltipData)))
+		roles := make([]string, 0, len(model.Roles))
+		for _, role := range model.Roles {
+			if normalized := normalizeSubagentRole(role); normalized != "" {
+				roles = append(roles, normalized)
+			}
+		}
+		details = append(details, fmt.Sprintf("- roles=%s | %s | adapter=%s | model=%s | %s", strings.Join(roles, ","), strings.TrimSpace(model.DisplayName), id, strings.TrimSpace(model.ModelID), strings.TrimSpace(model.TooltipData)))
 	}
 	if len(enum) == 0 {
 		return nil, nil
@@ -112,7 +118,10 @@ func (catalog *DefaultToolCatalog) rewriteRootTaskTool(item json.RawMessage) (js
 		filteredRequired = append(filteredRequired, field)
 	}
 	parameters["required"] = append(filteredRequired, "task_role")
-	model["description"] = "Optional for a new subagent: when omitted, the first enabled adapter matching task_role is selected in configuration order. Explicit model IDs take priority and must be enabled. Enabled adapters (display name | model ID | note):\n" + strings.Join(details, "\n")
+	model["description"] = "Optional adapter override for a new subagent. Omit this field for automatic task_role routing; do not copy the parent model or choose a role candidate yourself. Set it only when intentionally overriding automatic routing with a specific enabled adapter ID. Explicit model IDs take priority and must be enabled. Enabled adapters (roles | display name | adapter ID | provider model | note):\n" + strings.Join(details, "\n")
+	if description, ok := function["description"].(string); ok {
+		function["description"] = description + "\n\nRole-based routing: always set task_role. For automatic routing, omit model entirely; the backend selects the first enabled adapter for that role in configuration order. Set model only for an intentional explicit override. If thinking_effort is omitted, role defaults apply (simple_explore=low, medium_explore=medium, complex_debug=medium)."
+	}
 	return json.Marshal(tool)
 }
 

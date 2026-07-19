@@ -527,6 +527,9 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 		if toolCallID == "" || event.ToolCall == nil {
 			return nil
 		}
+		if taskToolCall := event.ToolCall.GetTaskToolCall(); taskToolCall != nil && taskToolCall.GetArgs() != nil && strings.TrimSpace(taskToolCall.GetArgs().GetModel()) == "" {
+			return nil
+		}
 		displayToolCall := stripTaskPromptForDisplay(service.rewriteTaskToolCallModelForDisplay(stream, event.ToolCall))
 		stream.mu.Lock()
 		if stream.PartialToolCallIDs == nil {
