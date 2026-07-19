@@ -28,7 +28,6 @@ tasks:
     internal: true
     deps:
       - task: common:toolchain:check
-      - task: common:go:mod:check
       - task: common:build:frontend
         vars:
           BUILD_FLAGS:

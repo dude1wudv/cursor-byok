@@ -113,7 +113,6 @@ tasks:
     dir: '{{.ROOT_DIR}}'
     deps:
       - task: generate:proto
-      - task: go:mod:check
     sources:
       - "**/*.[jt]s"
       - exclude: frontend/**/*
@@ -124,6 +123,7 @@ tasks:
     generates:
       - frontend/bindings/**/*
     cmds:
+      - task: go:mod:check
       - wails3 generate bindings -f '{{.BUILD_FLAGS}}' -clean=true
 
   build:frontend:
