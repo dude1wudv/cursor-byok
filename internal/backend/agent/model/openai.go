@@ -181,7 +181,8 @@ func NewOpenAIAdapter() *OpenAIAdapter {
 }
 
 func openAIModelSupportsPromptCacheKey(modelID string) bool {
-	return strings.Contains(strings.ToLower(strings.TrimSpace(modelID)), "gpt")
+	normalizedModelID := strings.ToLower(strings.TrimSpace(modelID))
+	return strings.Contains(normalizedModelID, "gpt") || strings.HasPrefix(normalizedModelID, "grok-")
 }
 
 func openAIPromptCacheKey(req StreamRequest, modelID string) string {
