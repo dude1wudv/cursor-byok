@@ -4,19 +4,26 @@ package forwarder
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"cursor/gen/agentv1"
 	runtimecore "cursor/internal/backend/agent/core"
+	modeladapter "cursor/internal/backend/agent/model"
 	promptassets "cursor/prompt"
 )
 
 type DefaultToolCatalog struct {
+	models modeladapter.SubagentModelDirectory
 }
 
 // NewToolCatalog 创建默认工具目录实现。
-func NewToolCatalog() *DefaultToolCatalog {
-	return &DefaultToolCatalog{}
+func NewToolCatalog(models ...modeladapter.SubagentModelDirectory) *DefaultToolCatalog {
+	catalog := &DefaultToolCatalog{}
+	if len(models) > 0 {
+		catalog.models = models[0]
+	}
+	return catalog
 }
 
 // Load 按 mode 读取工具资产，并过滤出当前阶段真正允许暴露的工具。
@@ -43,10 +50,59 @@ func (catalog *DefaultToolCatalog) Load(mode agentv1.AgentMode, subagentTypeName
 		if !isToolAllowedInMode(mode, subagentTypeName, name) {
 			continue
 		}
+		if name == "Task" && !isChildConversationSubagentTypeName(subagentTypeName) {
+			item, err = catalog.rewriteRootTaskTool(item)
+			if err != nil {
+				return nil, nil, err
+			}
+			if item == nil {
+				continue
+			}
+		}
 		filtered = append(filtered, item)
 		names = append(names, name)
 	}
 	return filtered, names, nil
+}
+
+func (catalog *DefaultToolCatalog) rewriteRootTaskTool(item json.RawMessage) (json.RawMessage, error) {
+	if catalog == nil || catalog.models == nil {
+		return nil, nil
+	}
+	models := append([]modeladapter.SubagentModel(nil), catalog.models.EnabledSubagentModels()...)
+	if len(models) == 0 {
+		return nil, nil
+	}
+	sort.Slice(models, func(left int, right int) bool {
+		return models[left].ID < models[right].ID
+	})
+	enum := make([]string, 0, len(models))
+	details := make([]string, 0, len(models))
+	for _, model := range models {
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			continue
+		}
+		enum = append(enum, id)
+		details = append(details, fmt.Sprintf("- %s | %s | %s", strings.TrimSpace(model.DisplayName), strings.TrimSpace(model.ModelID), strings.TrimSpace(model.TooltipData)))
+	}
+	if len(enum) == 0 {
+		return nil, nil
+	}
+	var tool map[string]any
+	if err := json.Unmarshal(item, &tool); err != nil {
+		return nil, fmt.Errorf("decode Task tool descriptor: %w", err)
+	}
+	function, _ := tool["function"].(map[string]any)
+	parameters, _ := function["parameters"].(map[string]any)
+	properties, _ := parameters["properties"].(map[string]any)
+	model, _ := properties["model"].(map[string]any)
+	if function == nil || parameters == nil || properties == nil || model == nil {
+		return nil, fmt.Errorf("Task tool descriptor model schema is missing")
+	}
+	model["enum"] = enum
+	model["description"] = "Required for a new subagent: select one enabled adapter ID from the enum. Omit only when resuming an already-started subagent. Enabled adapters (display name | model ID | note):\n" + strings.Join(details, "\n")
+	return json.Marshal(tool)
 }
 
 var agentModeToolNames = map[string]struct{}{

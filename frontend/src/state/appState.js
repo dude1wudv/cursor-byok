@@ -267,6 +267,7 @@ export function createEmptyModelAdapter() {
     baseURL: "",
     apiKey: "",
     tooltipData: "备注",
+    subagentEnabled: false,
     modelID: "",
     reasoningEffort: "medium",
     openAIEndpoint: OPENAI_ENDPOINT_RESPONSES,
@@ -377,6 +378,7 @@ export function normalizeModelAdapter(source) {
     baseURL: normalizeBaseURL(raw.baseURL || raw.url),
     apiKey: asString(raw.apiKey || raw.key),
     tooltipData: asString(raw.tooltipData),
+    subagentEnabled: asBoolean(raw.subagentEnabled ?? raw.subagent_enabled),
     modelID: asString(raw.modelID),
     reasoningEffort: SUPPORTED_REASONING_EFFORTS.has(normalizedReasoningEffort)
       ? normalizedReasoningEffort

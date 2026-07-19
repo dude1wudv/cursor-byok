@@ -193,6 +193,9 @@ func rewriteTaskInvocationModelForExecutionWithLongContext(invocation runtimecor
 	if subagentType == runtimecore.SubagentTypeLongContextRead && effectiveModelID == "" && longContextReadChannelValid {
 		effectiveModelID = strings.TrimSpace(longContextReadChannelID)
 	}
+	if effectiveModelID == "" && subagentType != runtimecore.SubagentTypeLongContextRead {
+		effectiveModelID = strings.TrimSpace(parentModelID)
+	}
 	if effectiveModelID == "" {
 		return invocation
 	}
@@ -203,6 +206,14 @@ func rewriteTaskInvocationModelForExecutionWithLongContext(invocation runtimecor
 	}
 	invocation.ArgsJSON = rewrittenArgs
 	return invocation
+}
+
+func readTaskInvocationModelID(invocation runtimecore.ToolInvocation) string {
+	var args map[string]any
+	if json.Unmarshal(invocation.ArgsJSON, &args) != nil {
+		return ""
+	}
+	return readStringMapValue(args, "model", "model_id", "modelId")
 }
 
 func isConcreteTaskModelSelection(modelID string) bool {
@@ -313,6 +324,43 @@ func (service *Service) longContextReadChannel() (string, bool) {
 	return provider.LongContextReadChannel()
 }
 
+func subagentModelDirectoryFromResolver(resolver modeladapter.ChannelResolver) modeladapter.SubagentModelDirectory {
+	directory, _ := resolver.(modeladapter.SubagentModelDirectory)
+	return directory
+}
+
+func (service *Service) enabledSubagentModel(modelID string) bool {
+	if service == nil || service.resolver == nil {
+		return false
+	}
+	directory := subagentModelDirectoryFromResolver(service.resolver)
+	if directory == nil {
+		return false
+	}
+	requested := strings.TrimSpace(modelID)
+	for _, model := range directory.EnabledSubagentModels() {
+		if requested != "" && requested == strings.TrimSpace(model.ID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (service *Service) validateNewSubagentModel(modelID string) error {
+	if service.enabledSubagentModel(modelID) {
+		return nil
+	}
+	return fmt.Errorf("Task model must be an enabled adapter id")
+}
+
+func taskInvocationResumes(invocation runtimecore.ToolInvocation) bool {
+	if strings.TrimSpace(invocation.ToolName) != "Task" {
+		return false
+	}
+	var args map[string]any
+	return json.Unmarshal(invocation.ArgsJSON, &args) == nil && strings.TrimSpace(readStringMapValue(args, "resume")) != ""
+}
+
 // NewService 使用默认依赖创建 forwarder 服务。
 func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Service {
 	projector := NewHistoryProjector()
@@ -335,7 +383,7 @@ func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Serv
 		docsIndexStore:     NewDocsIndexStore(appdata.DocsIndexRootPath()),
 		rules:              rules,
 		projector:          projector,
-		compiler:           NewPromptCompiler(projector, NewToolCatalog(), NewReminderInjector(), rules),
+		compiler:           NewPromptCompiler(projector, NewToolCatalog(subagentModelDirectoryFromResolver(resolver)), NewReminderInjector(), rules),
 		provider:           NewProviderGateway(resolver),
 		resolver:           resolver,
 		modelMemory:        modelMemory,
@@ -1904,6 +1952,13 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "subagent_model_override_resolved", resolutionPayload)
 		}
 		invocation = rewriteTaskInvocationModelForExecutionWithLongContext(invocation, stream.ModelID, subagentOverrides, longContextReadChannelID, longContextReadChannelValid)
+		if trimmedToolName == "Task" && !taskInvocationResumes(invocation) {
+			if err := service.validateNewSubagentModel(readTaskInvocationModelID(invocation)); err != nil {
+				pending := runtimecore.PendingExec{ToolCallID: invocation.CallID, ExecKind: "subagent"}
+				service.rollbackSubagentDispatch(stream, pending, "model_not_enabled")
+				return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
+			}
+		}
 		if trimmedToolName == "Task" {
 			if err := service.recordEffectiveSubagentDispatch(stream, invocation); err != nil {
 				pending := runtimecore.PendingExec{ToolCallID: invocation.CallID, ExecKind: "subagent"}

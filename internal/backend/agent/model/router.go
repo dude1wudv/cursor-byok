@@ -25,6 +25,19 @@ type ChannelResolver interface {
 	ProviderStreamIdleTimeout(context.Context) time.Duration
 }
 
+// SubagentModel 描述可供父代理选择的子代理模型。
+type SubagentModel struct {
+	ID          string
+	DisplayName string
+	ModelID     string
+	TooltipData string
+}
+
+// SubagentModelDirectory 提供当前启用的子代理模型目录。
+type SubagentModelDirectory interface {
+	EnabledSubagentModels() []SubagentModel
+}
+
 // NewRouter 创建模型适配路由器。
 func NewRouter(resolver ChannelResolver) *Router {
 	return &Router{

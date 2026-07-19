@@ -124,8 +124,8 @@ function ensureAnthropicThinkingEffort() {
 }
 
 const fieldTips = {
-  displayName: "仅用于界面展示，便于你区分不同模型。",
-  modelID: "请求实际发送给服务端的模型名称，例如 gpt-4.1 或 claude-sonnet。",
+  displayName: "用于界面展示；启用子代理后也会供父模型识别和选择。",
+  modelID: "请求实际发送给服务端的模型名称，例如 gpt-4.1 或 claude-sonnet；启用子代理后也会供父模型识别和选择。",
   baseURL: "模型服务的 API 根地址，通常为兼容 OpenAI 或 Anthropic 的接口入口。",
   apiKey: "调用该模型服务需要使用的访问密钥。",
   contextWindowTokens: "模型单次可接受的最大上下文 Token 数。留空时使用默认值。",
@@ -138,7 +138,8 @@ const fieldTips = {
   anthropicExtraParams: "开启后会把 JSON 对象覆盖到 Anthropic 请求体。同名字段以这里为准。",
   anthropicMaxTokens: "Anthropic 模型单次回复允许生成的最大 Token 数。留空时使用默认值。",
   anthropicThinkingEffort: "Anthropic adaptive thinking 的思考强度。请求会固定使用新版 thinking.type=adaptive。",
-  tooltipData: "模型列表 hover 时显示的备注说明。",
+  tooltipData: "模型列表 hover 时显示的备注说明；启用子代理后也会供父模型识别和选择。",
+  subagentEnabled: "开启后，该适配器的显示名称、模型标识和备注会供父模型发现并选择为子代理。关闭时不会暴露给 Task。",
 };
 
 function applyGrok45Preset() {
@@ -321,6 +322,19 @@ onMounted(async () => {
             <span :class="[tab.icon, 'text-[16px]']"></span>
             <span>{{ tab.label }}</span>
           </button>
+        </div>
+
+        <div class="rounded-[8px] border border-[#343434] bg-[#252525] p-3">
+          <label class="center-row gap-2 text-sm text-[#d4d4d4]">
+            <Tooltip :content="fieldTips.subagentEnabled" />
+            <input
+              v-model="draft.subagentEnabled"
+              type="checkbox"
+              class="size-4 accent-[#10AD5D]"
+            />
+            <span>允许作为子代理模型</span>
+          </label>
+          <p class="mt-2 text-xs leading-5 text-[#8f8f8f]">开启后，显示名称、模型标识和备注会供父模型发现和选择。</p>
         </div>
 
         <div class="grid grid-cols-1 gap-3 md:grid-cols-2">

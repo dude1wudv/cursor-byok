@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	modeladapter "cursor/internal/backend/agent/model"
 	legacyruntime "cursor/internal/runtime"
 )
 
@@ -102,6 +104,29 @@ func (manager *Manager) LongContextReadChannel() (string, bool) {
 	return channelID, false
 }
 
+func (manager *Manager) EnabledSubagentModels() []modeladapter.SubagentModel {
+	if manager == nil {
+		return nil
+	}
+	cfg := manager.Current()
+	models := make([]modeladapter.SubagentModel, 0, len(cfg.ModelAdapters))
+	for _, adapter := range cfg.ModelAdapters {
+		if !adapter.SubagentEnabled {
+			continue
+		}
+		models = append(models, modeladapter.SubagentModel{
+			ID:          strings.TrimSpace(adapter.ID),
+			DisplayName: strings.TrimSpace(adapter.DisplayName),
+			ModelID:     strings.TrimSpace(adapter.ModelID),
+			TooltipData: strings.TrimSpace(adapter.TooltipData),
+		})
+	}
+	sort.Slice(models, func(left int, right int) bool {
+		return models[left].ID < models[right].ID
+	})
+	return models
+}
+
 func (manager *Manager) LastAgentModelHash() string {
 	if manager == nil {
 		return ""
@@ -169,6 +194,7 @@ func (manager *Manager) LegacyRuntimeSnapshot(_ context.Context) (legacyruntime.
 			BaseURL:                  item.BaseURL,
 			APIKey:                   item.APIKey,
 			TooltipData:              item.TooltipData,
+			SubagentEnabled:          item.SubagentEnabled,
 			ModelID:                  item.ModelID,
 			ReasoningEffort:          item.ReasoningEffort,
 			OpenAIEndpoint:           item.OpenAIEndpoint,

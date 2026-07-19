@@ -27,6 +27,7 @@ type ModelAdapterConfig struct {
 	BaseURL                     string `json:"baseURL" yaml:"baseURL"`
 	APIKey                      string `json:"apiKey" yaml:"apiKey"`
 	TooltipData                 string `json:"tooltipData" yaml:"tooltipData"`
+	SubagentEnabled             bool   `json:"subagentEnabled" yaml:"subagentEnabled"`
 	ModelID                     string `json:"modelID" yaml:"modelID"`
 	ReasoningEffort             string `json:"reasoningEffort" yaml:"reasoningEffort"`
 	OpenAIEndpoint              string `json:"openAIEndpoint" yaml:"openAIEndpoint"`
@@ -137,6 +138,7 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 			BaseURL:              baseURL,
 			APIKey:               strings.TrimSpace(item.APIKey),
 			TooltipData:          strings.TrimSpace(item.TooltipData),
+			SubagentEnabled:      item.SubagentEnabled,
 			ModelID:              strings.TrimSpace(item.ModelID),
 			ReasoningEffort:      normalizeReasoningEffort(item.ReasoningEffort),
 			OpenAIEndpoint:       modelchannel.NormalizeOpenAIEndpoint(item.Type, item.OpenAIEndpoint),
