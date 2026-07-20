@@ -1450,8 +1450,13 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		switch strings.TrimSpace(item.Type) {
 		case "reasoning":
 			summaryItemID := reasoningSummaryItemID(item.ID, outputIndex)
-			if err := emitReasoningSummarySnapshot(summaryItemID, item.Summary); err != nil {
-				return err
+			// response.completed/incomplete 可能同时携带已流出的最终文本和完整
+			// reasoning snapshot。文本已经发出后只保留 provider metadata，不能再
+			// 生成答案之后的 Thought 卡。
+			if !emittedText {
+				if err := emitReasoningSummarySnapshot(summaryItemID, item.Summary); err != nil {
+					return err
+				}
 			}
 			return rememberReasoningSignature(item.EncryptedContent, item.ID, item.Status, item.Summary)
 		case "function_call":

@@ -1137,6 +1137,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	service.observeBackgroundShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	service.observeShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	pending = service.applyExecProgress(stream, pending, intent.ExecClientMessage)
+	if strings.TrimSpace(pending.ExecKind) == "subagent" && intent.ExecClientMessage.GetSubagentResult() == nil {
+		return nil
+	}
 	if isHiddenPatchEditExecKind(pending.ExecKind) {
 		return service.handleHiddenPatchEditExecResult(stream, pending, intent.ExecClientMessage)
 	}
@@ -1228,6 +1231,15 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 		return fmt.Errorf("pending exec not found for control message")
 	}
 	pending = service.applyExecControlProgress(stream, pending, intent.ExecClientControlMessage)
+	if strings.TrimSpace(pending.ExecKind) == "subagent" {
+		// 子代理的 Throw/stream_close 只代表控制面或传输状态；Task 的权威终态
+		// 必须来自后续 SubagentResult，不能在这里移除 pending 或唤醒父流。
+		_, err := service.execBridge.ApplyExecClientControl(intent.ExecClientControlMessage, pending)
+		if err != nil {
+			return err
+		}
+		return service.publishCheckpoint(intent.RequestID, stream.ConversationID)
+	}
 	if isHiddenPatchEditExecKind(pending.ExecKind) {
 		return service.handleHiddenPatchEditExecControl(stream, pending, intent.ExecClientControlMessage)
 	}

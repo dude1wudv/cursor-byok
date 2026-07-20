@@ -190,6 +190,7 @@ func subagentContractText(readonly bool, subagentType string) string {
 		"Report the outcome and evidence to the parent. The parent coordinator owns acceptance, workspace verification, and advancing the matching parent Todo.",
 		"Return a short textual result: lead with the conclusion, keep only the key evidence, and do not produce a long response.",
 		"Use the available agent tools when they materially improve correctness or efficiency. Do not ask the user questions. If required information is missing, report the gap to the parent agent instead of asking the user directly.",
+		"The parent may provide a subagent_dispatch_context block containing immutable dispatch-time snapshots of the plan file path/URI, owned_paths, related_paths, and a short user-context summary. Treat paths as locating hints, use the inherited plan text snapshot as the source of truth, and do not treat later file changes as a parent-plan update.",
 	}, "\n\n")
 }
 

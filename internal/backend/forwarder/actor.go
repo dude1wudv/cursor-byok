@@ -519,8 +519,20 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 			stream.mu.Unlock()
 		}
 		if !hasPublicReasoning {
+			stream.mu.Lock()
+			if strings.TrimSpace(event.ThinkingSignature) != "" {
+				stream.ProviderSyntheticThinkingPublished = true
+			}
+			stream.mu.Unlock()
 			return nil
 		}
+		stream.mu.Lock()
+		if stream.ProviderSyntheticThinkingPublished {
+			stream.mu.Unlock()
+			return nil
+		}
+		stream.ProviderSyntheticThinkingPublished = true
+		stream.mu.Unlock()
 		return service.broker.Publish(requestID, StreamEvent{Message: buildThinkingCompletedMessage(event.ThinkingDurationMS)})
 	case modeladapter.ModelEventKindPartialToolCall:
 		toolCallID := strings.TrimSpace(event.ToolCallID)

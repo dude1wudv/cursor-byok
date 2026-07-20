@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -37,6 +38,11 @@ type pendingSubagentLaunch struct {
 	Todos                []*agentv1.TodoItem
 	PlanHash             string
 	PlanVersion          int64
+	PlanFilePath         string
+	PlanFileURI          string
+	OwnedPaths           []string
+	RelatedPaths         []string
+	UserContextSummary   string
 	ParentTodoID         string
 	DispatchID           string
 	CreatedAt            time.Time
@@ -138,6 +144,7 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 	requestID := stream.RequestID
 	conversationID := stream.ConversationID
 	parentThinkingEffort := normalizeTaskThinkingEffort(stream.ThinkingEffort)
+	latestUserText := strings.TrimSpace(stream.LatestUserText)
 	stream.mu.Unlock()
 	if conversation == nil {
 		return decision, fmt.Errorf("subagent dispatch conversation is unavailable")
@@ -189,6 +196,17 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 	planHash := subagentParentPlanHash(conversation)
 	parentTodoID := matchSubagentParentTodo(conversation.CurrentTodos, args)
 	planVersion := conversation.ContextVersion
+	planFilePath := strings.TrimSpace(readStringMapValue(args, "plan_file_path", "planPath"))
+	planFileURI := strings.TrimSpace(readStringMapValue(args, "plan_file_uri", "planUri"))
+	if planFilePath == "" && planFileURI == "" {
+		planFilePath, planFileURI = subagentPlanFileHints(conversation)
+	}
+	ownedPaths := normalizeSubagentPathList(readStringSliceMapValue(args, "owned_paths", "ownedPaths"))
+	relatedPaths := normalizeSubagentPathList(readStringSliceMapValue(args, "related_paths", "relatedPaths"))
+	userContextSummary := strings.TrimSpace(readStringMapValue(args, "user_context_summary", "userContextSummary"))
+	if userContextSummary == "" {
+		userContextSummary = truncateSubagentContextSummary(latestUserText)
+	}
 	dispatchID := strings.TrimSpace(invocation.CallID)
 	if _, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
 		newMetadataEntry(turnSeq, requestID, subagentDispatchReservation, map[string]any{
@@ -199,6 +217,11 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 			"parent_todo_id":            parentTodoID,
 			"plan_hash":                 planHash,
 			"plan_version":              planVersion,
+			"plan_file_path":            planFilePath,
+			"plan_file_uri":             planFileURI,
+			"owned_paths":               ownedPaths,
+			"related_paths":             relatedPaths,
+			"user_context_summary":      userContextSummary,
 			"depth":                     depth,
 			"subagent_type":             strings.TrimSpace(decision.SubagentType),
 			"task_role":                 strings.TrimSpace(decision.SubagentRole),
@@ -224,6 +247,11 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		Todos:                cloneTodoItems(conversation.CurrentTodos),
 		PlanHash:             planHash,
 		PlanVersion:          planVersion,
+		PlanFilePath:         planFilePath,
+		PlanFileURI:          planFileURI,
+		OwnedPaths:           append([]string(nil), ownedPaths...),
+		RelatedPaths:         append([]string(nil), relatedPaths...),
+		UserContextSummary:   userContextSummary,
 		ParentTodoID:         parentTodoID,
 		DispatchID:           dispatchID,
 		CreatedAt:            time.Now().UTC(),
@@ -312,13 +340,125 @@ func (service *Service) consumePendingSubagentLaunch(subagentType string, modelI
 		service.pendingSubagents = append(service.pendingSubagents[:index], service.pendingSubagents[index+1:]...)
 		item.Plans = clonePlanRegistryEntries(item.Plans)
 		item.Todos = cloneTodoItems(item.Todos)
+		item.OwnedPaths = append([]string(nil), item.OwnedPaths...)
+		item.RelatedPaths = append([]string(nil), item.RelatedPaths...)
 		return item, true
 	}
 	return pendingSubagentLaunch{}, false
 }
 
+func subagentPlanFileHints(conversation *ConversationFile) (string, string) {
+	if conversation == nil {
+		return "", ""
+	}
+	for index := len(conversation.Entries) - 1; index >= 0; index-- {
+		entry := conversation.Entries[index]
+		if strings.TrimSpace(entry.Kind) != "prompt_context" {
+			continue
+		}
+		var payload promptContextEntryPayload
+		if err := json.Unmarshal(entry.Payload, &payload); err != nil {
+			continue
+		}
+		content := strings.TrimSpace(payload.Content)
+		if content == "" {
+			continue
+		}
+		path := ""
+		uri := ""
+		for _, line := range strings.Split(content, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "plan_file_path:") {
+				path = strings.TrimSpace(strings.TrimPrefix(line, "plan_file_path:"))
+			}
+			if strings.HasPrefix(line, "plan_file_uri:") {
+				uri = strings.TrimSpace(strings.TrimPrefix(line, "plan_file_uri:"))
+			}
+		}
+		if path != "" || uri != "" {
+			return path, uri
+		}
+	}
+	return "", ""
+}
+
+func truncateSubagentContextSummary(value string) string {
+	value = strings.TrimSpace(value)
+	if len([]rune(value)) <= 600 {
+		return value
+	}
+	return string([]rune(value)[:600]) + "…"
+}
+
+func readStringSliceMapValue(values map[string]any, keys ...string) []string {
+	for _, key := range keys {
+		value, ok := values[key]
+		if !ok || value == nil {
+			continue
+		}
+		items := make([]string, 0)
+		switch typed := value.(type) {
+		case []string:
+			items = append(items, typed...)
+		case []any:
+			for _, item := range typed {
+				if text, ok := item.(string); ok {
+					items = append(items, text)
+				}
+			}
+		case string:
+			items = strings.FieldsFunc(typed, func(r rune) bool { return r == ',' || r == '\n' || r == ';' })
+		}
+		if len(items) > 0 {
+			return items
+		}
+	}
+	return nil
+}
+
+func normalizeSubagentPathList(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func subagentDispatchContextContent(launch pendingSubagentLaunch) string {
+	parts := make([]string, 0, 5)
+	if launch.PlanFilePath != "" || launch.PlanFileURI != "" {
+		parts = append(parts, "plan_file_snapshot:\n"+firstNonEmpty(launch.PlanFilePath, launch.PlanFileURI))
+		if launch.PlanFilePath != "" && launch.PlanFileURI != "" {
+			parts[len(parts)-1] += "\nplan_file_uri: " + launch.PlanFileURI
+		}
+	}
+	if len(launch.OwnedPaths) > 0 {
+		parts = append(parts, "owned_paths:\n- "+strings.Join(launch.OwnedPaths, "\n- "))
+	}
+	if len(launch.RelatedPaths) > 0 {
+		parts = append(parts, "related_paths:\n- "+strings.Join(launch.RelatedPaths, "\n- "))
+	}
+	if launch.UserContextSummary != "" {
+		parts = append(parts, "user_context_summary:\n"+launch.UserContextSummary)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "<subagent_dispatch_context>\n" + strings.Join(parts, "\n\n") + "\n\nThese values are immutable dispatch-time snapshots. Paths are locating hints; use the plan text snapshot as the plan source of truth and do not infer later plan updates from file changes.\n</subagent_dispatch_context>"
+}
+
 func subagentLaunchBootstrapEntries(launch pendingSubagentLaunch, turnSeq int64, requestID string) ([]HistoryEntry, error) {
-	entries := make([]HistoryEntry, 0, 2)
+	entries := make([]HistoryEntry, 0, 3)
 	if strings.TrimSpace(launch.PlanText) != "" || len(launch.Plans) > 0 || len(launch.Todos) > 0 {
 		payload, err := json.Marshal(runtimeStateEntryPayload{
 			PlanText: strings.TrimSpace(launch.PlanText),
@@ -335,6 +475,13 @@ func subagentLaunchBootstrapEntries(launch pendingSubagentLaunch, turnSeq int64,
 			Kind:      "runtime_state",
 			Payload:   payload,
 		})
+	}
+	if content := subagentDispatchContextContent(launch); content != "" {
+		entries = append(entries, newPromptContextEntry(turnSeq, requestID, newPromptContextMessage(
+			"subagent_dispatch_context",
+			modeladapter.Message{Role: "system", Content: content},
+			true,
+		)))
 	}
 	entries = append(entries, newMetadataEntry(turnSeq, requestID, "subagent_parent_plan_snapshot", map[string]any{
 		"parent_conversation_id": strings.TrimSpace(launch.ParentConversationID),

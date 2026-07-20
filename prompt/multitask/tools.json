@@ -500,12 +500,47 @@
             },
             "type": "array"
           },
+          "plan_file_path": {
+            "description": "Optional dispatch-time path to the parent's .plan.md file.",
+            "type": "string"
+          },
+          "plan_file_uri": {
+            "description": "Optional dispatch-time URI for the parent's .plan.md file.",
+            "type": "string"
+          },
+          "owned_paths": {
+            "description": "Optional sorted list of paths this child owns for the dispatch.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "related_paths": {
+            "description": "Optional sorted list of related paths for context.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "user_context_summary": {
+            "description": "Optional short summary of the current user's symptoms, goal, and constraints.",
+            "type": "string"
+          },
           "description": {
             "description": "A short (3-5 word) description of the task",
             "type": "string"
           },
           "model": {
             "description": "Optional adapter id for this subagent. Enabled adapters are supplied dynamically by the local configuration.",
+            "type": "string"
+          },
+          "task_role": {
+            "description": "Optional orchestration role controlling child capabilities and default model/thinking policy.",
+            "enum": [
+              "simple_explore",
+              "medium_explore",
+              "complex_debug"
+            ],
             "type": "string"
           },
           "thinking_effort": {
