@@ -31,8 +31,7 @@ import (
 
 const (
 	providerResumeDebounce         = 200 * time.Millisecond
-	providerRetryInterval          = time.Minute
-	providerRetryLimit             = 5
+	providerRetryLimit             = 3
 	providerContinuationLimit      = 3
 	completedExecRetention         = 15 * time.Second
 	nonStreamingExecCloseGrace     = 1500 * time.Millisecond
@@ -969,6 +968,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.PendingCompaction = nil
 	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
 	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
+	stream.PartialToolCallIDs = make(map[string]struct{})
 	stream.RecentCompletedExecs = make(map[uint32]time.Time)
 	stream.SubagentFinalizations = make(map[string]*SubagentFinalizationState)
 	stream.TaskBatches = make(map[int]*TaskBatch)
@@ -1840,6 +1840,9 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 	currentPass := stream.ProviderPassCount
 	stream.Status = StreamStatusStreaming
 	stream.PendingProviderAction = providerActionNone
+	previousModelCallID := stream.CurrentModelCallID
+	retryAttempt := stream.ProviderRetryCount
+	retryError := stream.ProviderLastRetryError
 	stream.CurrentModelCallID = uuid.NewString()
 	stream.CurrentProviderToken++
 	currentToken := stream.CurrentProviderToken
@@ -1855,9 +1858,11 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 	stream.ProviderIncomplete = false
 	stream.ProviderUsage = turnUsageSnapshot{}
 	stream.ToolInvocationCount = 0
+	stream.PartialToolCallIDs = make(map[string]struct{})
 	modelCallID := stream.CurrentModelCallID
 	conversationID := stream.ConversationID
 	requestID := stream.RequestID
+	turnSeq := stream.TurnSeq
 	modelID := stream.ModelID
 	modelName := stream.ModelName
 	thinkingEffort := stream.ThinkingEffort
@@ -1866,6 +1871,22 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 	log.Printf("forwarder provider pass started request_id=%s model_call_id=%s provider_pass=%d", strings.TrimSpace(requestID), strings.TrimSpace(modelCallID), currentPass)
+	if retryAttempt > 0 && strings.TrimSpace(previousModelCallID) != "" {
+		retryClass, _ := providerRetryClassification(errors.New(retryError))
+		if _, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
+			newMetadataEntry(turnSeq, requestID, "provider_retry_started", map[string]any{
+				"previous_model_call_id": strings.TrimSpace(previousModelCallID),
+				"model_call_id":          strings.TrimSpace(modelCallID),
+				"provider_pass":          currentPass,
+				"attempt":                retryAttempt,
+				"retry_class":            retryClass,
+				"error":                  strings.TrimSpace(retryError),
+			}),
+		}); err != nil {
+			service.setTurnPhase(stream, TurnPhaseFailed)
+			return service.failStream(stream, "provider_retry_error", err)
+		}
+	}
 
 	conversation, _, _, err := service.snapshotCheckpointConversation(stream)
 	if err != nil {

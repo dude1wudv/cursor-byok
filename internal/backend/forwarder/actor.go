@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"strings"
 	"time"
 
@@ -815,19 +817,61 @@ func isOutputLimitIncomplete(reason string) bool {
 	}
 }
 
-func isRetryableProviderError(err error) bool {
-	if err == nil {
-		return false
+func providerRetryClassification(err error) (string, bool) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return "", false
+	}
+	var incompleteErr *modeladapter.IncompleteStreamError
+	if errors.As(err, &incompleteErr) {
+		return "incomplete_stream", true
 	}
 	var statusErr *modeladapter.HTTPStatusError
-	if errors.As(err, &statusErr) && statusErr.StatusCode == 502 {
-		return true
+	if errors.As(err, &statusErr) {
+		switch {
+		case statusErr.StatusCode == 408:
+			return "http_408", true
+		case statusErr.StatusCode == 429:
+			return "http_429", true
+		case statusErr.StatusCode >= 500 && statusErr.StatusCode <= 599:
+			return fmt.Sprintf("http_%d", statusErr.StatusCode), true
+		default:
+			return "", false
+		}
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "unexpected eof")
+	if errors.Is(err, io.EOF) {
+		return "connection_eof", true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return "network_error", true
+	}
+	normalized := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(normalized, "ended before a non-empty finish_reason"):
+		return "incomplete_stream", true
+	case strings.Contains(normalized, "provider stream idle timeout"):
+		return "watchdog_timeout", true
+	case strings.Contains(normalized, "connection reset"), strings.Contains(normalized, "broken pipe"), strings.Contains(normalized, "unexpected eof"), strings.Contains(normalized, "server closed idle connection"):
+		return "connection_interrupted", true
+	default:
+		return "", false
+	}
 }
 
-func (service *Service) scheduleProviderRetry(stream *ActiveStream, providerErr providerTerminalError, accumulatedText string, accumulatedReasoning string, accumulatedReasoningSignature string, accumulatedReasoningSignatureSource string, accumulatedReasoningItemID string, accumulatedReasoningStatus string, accumulatedReasoningSummary []byte, hadToolInvocation bool) (bool, error) {
-	if stream == nil || !isRetryableProviderError(providerErr) {
+func providerRetryDelay(attempt int) time.Duration {
+	switch attempt {
+	case 1:
+		return 2 * time.Second
+	case 2:
+		return 5 * time.Second
+	default:
+		return 10 * time.Second
+	}
+}
+
+func (service *Service) scheduleProviderRetry(stream *ActiveStream, providerErr providerTerminalError, accumulatedText string, accumulatedReasoning string, accumulatedReasoningSignature string, accumulatedReasoningSignatureSource string, accumulatedReasoningItemID string, accumulatedReasoningStatus string, accumulatedReasoningSummary []byte, hasToolSideEffects bool, partialToolCount int) (bool, error) {
+	retryClass, retryable := providerRetryClassification(providerErr)
+	if stream == nil || !retryable || hasToolSideEffects {
 		return false, nil
 	}
 	stream.mu.Lock()
@@ -837,48 +881,53 @@ func (service *Service) scheduleProviderRetry(stream *ActiveStream, providerErr 
 	}
 	stream.ProviderRetryCount++
 	retryCount := stream.ProviderRetryCount
+	retryDelay := providerRetryDelay(retryCount)
 	stream.ProviderLastRetryError = providerErr.Error()
 	requestID := stream.RequestID
 	conversationID := stream.ConversationID
 	turnSeq := stream.TurnSeq
 	modelCallID := stream.CurrentModelCallID
+	continuationInjected := currentTurnHasPromptContextSource(stream.CheckpointConversation, turnSeq, promptContextSourceProviderStreamRecovery)
 	stream.mu.Unlock()
 
-	if err := service.flushAssistantText(stream, conversationID, turnSeq, requestID, accumulatedText, accumulatedReasoning, accumulatedReasoningSignature, accumulatedReasoningSignatureSource, accumulatedReasoningItemID, accumulatedReasoningStatus, accumulatedReasoningSummary, !hadToolInvocation); err != nil {
+	hasText := strings.TrimSpace(accumulatedText) != ""
+	hasReasoning := strings.TrimSpace(accumulatedReasoning) != ""
+	if err := service.flushAssistantText(stream, conversationID, turnSeq, requestID, accumulatedText, accumulatedReasoning, accumulatedReasoningSignature, accumulatedReasoningSignatureSource, accumulatedReasoningItemID, accumulatedReasoningStatus, accumulatedReasoningSummary, true); err != nil {
 		return true, err
 	}
-	if _, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
-		newMetadataEntry(turnSeq, requestID, "provider_retry_scheduled", map[string]any{
-			"model_call_id": modelCallID,
-			"attempt":       retryCount,
-			"limit":         providerRetryLimit,
-			"delay_seconds": int(providerRetryInterval.Seconds()),
-			"error":         providerErr.Error(),
-		}),
-	}); err != nil {
+	entries := []HistoryEntry{newMetadataEntry(turnSeq, requestID, "provider_retry_scheduled", map[string]any{
+		"model_call_id":         modelCallID,
+		"attempt":               retryCount,
+		"limit":                 providerRetryLimit,
+		"delay_seconds":         int(retryDelay.Seconds()),
+		"retry_class":           retryClass,
+		"error":                 providerErr.Error(),
+		"has_text":              hasText,
+		"has_reasoning":         hasReasoning,
+		"has_tool_side_effects": hasToolSideEffects,
+		"partial_tool_count":    partialToolCount,
+	})}
+	if (hasText || hasReasoning) && !continuationInjected {
+		entries = append(entries, newPromptContextEntry(turnSeq, requestID, newPromptContextReminder(
+			promptContextSourceProviderStreamRecovery,
+			providerStreamRecoveryReminderText(),
+		)))
+	}
+	if _, err := service.appendConversationEntries(stream, conversationID, entries); err != nil {
+		return true, err
+	}
+	if err := service.syncSummaryCarryForward(conversationID, requestID, modelCallID); err != nil {
 		return true, err
 	}
 	if err := service.publishCheckpoint(requestID, conversationID); err != nil {
 		return true, err
 	}
 
-	if pendingBridgeCount(stream) > 0 {
-		rememberPendingProviderCompletion(stream, pendingTurnCompletion{
-			ConversationID: conversationID,
-			RequestID:      requestID,
-			TurnSeq:        turnSeq,
-			ModelCallID:    modelCallID,
-			ProviderPass:   currentProviderPass(stream),
-			Disposition:    completionDispositionResumeAfterExternal,
-		})
-		service.setTurnPhase(stream, TurnPhaseWaitingExternal)
-		return true, nil
-	}
 	stream.mu.Lock()
 	stream.PendingProviderAction = providerActionResume
 	stream.mu.Unlock()
 	service.setTurnPhase(stream, TurnPhaseWaitingExternal)
-	service.scheduleStreamTimer(stream, providerTimerKey(streamTimerProviderRetry, ""), providerRetryInterval, streamTimerProviderRetry, "", 0, providerErr.Error())
+	service.scheduleStreamTimer(stream, providerTimerKey(streamTimerProviderRetry, ""), retryDelay, streamTimerProviderRetry, "", 0, retryClass)
 	return true, nil
 }
 
@@ -903,6 +952,9 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 	providerIncomplete := stream.ProviderIncomplete
 	usage := stream.ProviderUsage
 	hadToolInvocation := stream.ToolInvocationCount > 0
+	partialToolCount := len(stream.PartialToolCallIDs)
+	pendingToolSideEffectCount := len(stream.PendingExecs) + len(stream.PendingInteractions)
+	hasToolSideEffects := hadToolInvocation || partialToolCount > 0 || pendingToolSideEffectCount > 0
 	terminalToolInvocation := stream.ProviderTerminalToolInvocation
 	existingCompletion := stream.PendingProviderCompletion
 	stream.ProviderActive = false
@@ -930,12 +982,32 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 	if payload.Err != nil {
 		var providerErr providerTerminalError
 		if errors.As(payload.Err, &providerErr) {
-			retried, retryErr := service.scheduleProviderRetry(stream, providerErr, accumulatedText, accumulatedReasoning, accumulatedReasoningSignature, accumulatedReasoningSignatureSource, accumulatedReasoningItemID, accumulatedReasoningStatus, accumulatedReasoningSummary, hadToolInvocation)
+			effectivePartialToolCount := partialToolCount
+			var incompleteErr *modeladapter.IncompleteStreamError
+			if errors.As(providerErr, &incompleteErr) && incompleteErr.PartialToolCount > effectivePartialToolCount {
+				effectivePartialToolCount = incompleteErr.PartialToolCount
+			}
+			effectiveToolSideEffects := hasToolSideEffects || effectivePartialToolCount > 0
+			retried, retryErr := service.scheduleProviderRetry(stream, providerErr, accumulatedText, accumulatedReasoning, accumulatedReasoningSignature, accumulatedReasoningSignatureSource, accumulatedReasoningItemID, accumulatedReasoningStatus, accumulatedReasoningSummary, effectiveToolSideEffects, effectivePartialToolCount)
 			if retryErr != nil {
 				return service.failStreamIfNonTerminal(stream, "provider_retry_error", retryErr)
 			}
 			if retried {
 				return nil
+			}
+			if retryClass, retryable := providerRetryClassification(providerErr); retryable && effectiveToolSideEffects {
+				if _, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
+					newMetadataEntry(turnSeq, requestID, "provider_retry_suppressed", map[string]any{
+						"model_call_id":             modelCallID,
+						"retry_class":               retryClass,
+						"has_committed_tool":        hadToolInvocation,
+						"pending_tool_side_effects": pendingToolSideEffectCount,
+						"partial_tool_count":        effectivePartialToolCount,
+						"error":                     providerErr.Error(),
+					}),
+				}); err != nil {
+					return service.failStreamIfNonTerminal(stream, "provider_retry_error", err)
+				}
 			}
 			service.setTurnPhase(stream, TurnPhaseFailed)
 			return service.closeStreamWithProviderError(stream, conversationID, turnSeq, requestID, accumulatedText, accumulatedReasoning, accumulatedReasoningSignature, accumulatedReasoningSignatureSource, accumulatedReasoningItemID, accumulatedReasoningStatus, accumulatedReasoningSummary, usage, providerErr, !hadToolInvocation)

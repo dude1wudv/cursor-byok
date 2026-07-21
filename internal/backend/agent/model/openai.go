@@ -459,13 +459,20 @@ func (adapter *OpenAIAdapter) Stream(ctx context.Context, req StreamRequest, sin
 func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req StreamRequest, baseURL string, apiKey string, modelID string, sink func(ModelEvent) error) error {
 	startedAt := time.Now().UTC()
 	finishedAt := time.Time{}
+	recordEarlyFailure := func(streamErr error, watchdogFired bool) {
+		finishedAt = time.Now().UTC()
+		summary := buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, streamErr)
+		recordLLMSummaryArtifact(req, withLLMStreamSummary(summary, llmStreamSummary{
+			WatchdogFired: watchdogFired,
+			ErrorClass:    classifyModelArtifactError(streamErr),
+		}))
+	}
 	overrideBody := cloneRequestBodyOverride(req.RequestBodyOverride)
 	var body any = overrideBody
 	if len(overrideBody) == 0 {
 		normalizedMessages, err := normalizeOpenAIProviderMessages(req.Messages, strings.TrimSpace(req.ReasoningEffort) != "")
 		if err != nil {
-			finishedAt = time.Now().UTC()
-			recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
+			recordEarlyFailure(err, false)
 			return err
 		}
 		requestBody := openAIRequestBody{
@@ -492,14 +499,12 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 	}
 	bodyMap, err := requestBodyToMap(body)
 	if err != nil {
-		finishedAt = time.Now().UTC()
-		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
+		recordEarlyFailure(err, false)
 		return err
 	}
 	applyOpenAIThinkingDisable(bodyMap, req, baseURL, modelID, req.OpenAIEndpoint)
 	if err := ApplyOpenAIExtraParams(bodyMap, req.OpenAIExtraParamsEnabled, req.OpenAIExtraParamsJSON); err != nil {
-		finishedAt = time.Now().UTC()
-		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
+		recordEarlyFailure(err, false)
 		return err
 	}
 	applyOpenAIFastMode(bodyMap, req.FastMode)
@@ -598,9 +603,17 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 	cacheWritePresent := false
 	firstEventAt := time.Time{}
 	finishReason := ""
+	terminalSeen := false
+	doneSeen := false
+	streamEventCount := 0
+	lastEffectiveEventAt := time.Time{}
 	turnFinishedPending := false
 	thinkingStarted := time.Time{}
 	thinkingActive := false
+	markEffectiveEvent := func() {
+		lastEffectiveEventAt = time.Now().UTC()
+		streamIdle.MarkEffectiveContent()
+	}
 	flushThinkingCompleted := func() error {
 		if !thinkingActive {
 			return nil
@@ -646,7 +659,7 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		if text == "" {
 			return nil
 		}
-		streamIdle.MarkEffectiveContent()
+		markEffectiveEvent()
 		if err := flushThinkingCompleted(); err != nil {
 			return err
 		}
@@ -662,7 +675,7 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		if reasoning == "" {
 			return nil
 		}
-		streamIdle.MarkEffectiveContent()
+		markEffectiveEvent()
 		if !thinkingActive {
 			thinkingStarted = time.Now()
 			thinkingActive = true
@@ -678,7 +691,15 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 	}
 	fail := func(streamErr error) error {
 		finishedAt = time.Now().UTC()
-		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", currentModel, startedAt, firstEventAt, finishedAt, finishReason, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, streamErr))
+		summary := buildLLMSummaryPayload(req, "openai", currentModel, startedAt, firstEventAt, finishedAt, finishReason, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, streamErr)
+		recordLLMSummaryArtifact(req, withLLMStreamSummary(summary, llmStreamSummary{
+			TerminalSeen:         terminalSeen,
+			DoneSeen:             doneSeen,
+			EventCount:           streamEventCount,
+			LastEffectiveEventAt: lastEffectiveEventAt,
+			WatchdogFired:        streamIdle.Err() != nil,
+			ErrorClass:           classifyModelArtifactError(streamErr),
+		}))
 		return streamErr
 	}
 	errorFromChunk := func(chunk openAIChunk) error {
@@ -751,7 +772,9 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 			firstEventAt = time.Now().UTC()
 		}
 		payloadLine := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		streamEventCount++
 		if payloadLine == "[DONE]" {
+			doneSeen = true
 			if err := flushThinkingCompleted(); err != nil {
 				return fail(err)
 			}
@@ -804,7 +827,7 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 			}
 		}
 		for _, item := range choice.Delta.ToolCalls {
-			streamIdle.MarkEffectiveContent()
+			markEffectiveEvent()
 			accumulator, ok := tools[item.Index]
 			if !ok {
 				accumulator = &openAIToolAccumulator{}
@@ -828,7 +851,9 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 			}
 		}
 
-		if choice.FinishReason != nil {
+		if choice.FinishReason != nil && strings.TrimSpace(*choice.FinishReason) != "" {
+			terminalSeen = true
+			finishReason = strings.TrimSpace(*choice.FinishReason)
 			if err := flushThinkingCompleted(); err != nil {
 				return fail(err)
 			}
@@ -846,28 +871,11 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 				}); err != nil {
 					return fail(err)
 				}
-				streamIdle.MarkEffectiveContent()
+				markEffectiveEvent()
 			}
 			tools = make(map[int]*openAIToolAccumulator)
-			finishReason = strings.TrimSpace(*choice.FinishReason)
 			turnFinishedPending = true
 		}
-	}
-	for _, accumulator := range tools {
-		if err := sink(ModelEvent{
-			Kind:       ModelEventKindToolLikeCompleted,
-			OccurredAt: time.Now().UTC(),
-			Provider:   "openai",
-			Model:      currentModel,
-			ToolInvocation: &runtimecore.ToolInvocation{
-				CallID:   strings.TrimSpace(accumulator.CallID),
-				ToolName: strings.TrimSpace(accumulator.Name),
-				ArgsJSON: []byte(accumulator.Args.String()),
-			},
-		}); err != nil {
-			return fail(err)
-		}
-		streamIdle.MarkEffectiveContent()
 	}
 	if err := scanner.Err(); err != nil {
 		if idleErr := streamIdle.Err(); idleErr != nil {
@@ -878,11 +886,26 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 	if err := flushThinkingCompleted(); err != nil {
 		return fail(err)
 	}
+	if !terminalSeen {
+		return fail(&IncompleteStreamError{
+			Provider:         "openai",
+			Endpoint:         "chat/completions",
+			DoneSeen:         doneSeen,
+			EventCount:       streamEventCount,
+			PartialToolCount: len(tools),
+		})
+	}
 	if err := flushTurnFinished(); err != nil {
 		return fail(err)
 	}
 	finishedAt = time.Now().UTC()
-	recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", currentModel, startedAt, firstEventAt, finishedAt, finishReason, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, nil))
+	summary := buildLLMSummaryPayload(req, "openai", currentModel, startedAt, firstEventAt, finishedAt, finishReason, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, nil)
+	recordLLMSummaryArtifact(req, withLLMStreamSummary(summary, llmStreamSummary{
+		TerminalSeen:         terminalSeen,
+		DoneSeen:             doneSeen,
+		EventCount:           streamEventCount,
+		LastEffectiveEventAt: lastEffectiveEventAt,
+	}))
 	return nil
 }
 

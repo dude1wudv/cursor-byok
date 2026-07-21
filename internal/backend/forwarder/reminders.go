@@ -25,6 +25,7 @@ const (
 	promptContextSourceSubagentContract          = "subagent_contract"
 	promptContextSourceSubagentEmptyStopRecovery = "subagent_empty_stop_recovery"
 	promptContextSourceProviderContinuation      = "provider_incomplete_continuation"
+	promptContextSourceProviderStreamRecovery    = "provider_stream_recovery_continuation"
 	promptContextSourceDebugModeReminder         = "debug_mode_reminder"
 )
 
@@ -147,6 +148,10 @@ func latestUserIntentReminderText(latestUserText string) string {
 	default:
 		return ""
 	}
+}
+
+func providerStreamRecoveryReminderText() string {
+	return "The previous provider stream ended before its terminal event. Continue exactly from the existing assistant output without repeating emitted content, and do not repeat or re-execute any action."
 }
 
 func newCurrentUserRequestReminder(latestUserText string) PromptContextMessage {

@@ -2,9 +2,58 @@ package modeladapter
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
+
+// IncompleteStreamError 表示 provider 流在协议终态前结束。
+type IncompleteStreamError struct {
+	Provider         string
+	Endpoint         string
+	DoneSeen         bool
+	EventCount       int
+	PartialToolCount int
+}
+
+func (err *IncompleteStreamError) Error() string {
+	if err == nil {
+		return "provider stream ended before a terminal event"
+	}
+	return fmt.Sprintf(
+		"%s %s stream ended before a non-empty finish_reason (done_seen=%t events=%d partial_tools=%d)",
+		firstNonEmptyString(err.Provider, "provider"),
+		firstNonEmptyString(err.Endpoint, "stream"),
+		err.DoneSeen,
+		err.EventCount,
+		err.PartialToolCount,
+	)
+}
+
+type llmStreamSummary struct {
+	TerminalSeen         bool
+	DoneSeen             bool
+	EventCount           int
+	LastEffectiveEventAt time.Time
+	WatchdogFired        bool
+	ErrorClass           string
+}
+
+func withLLMStreamSummary(payload map[string]any, summary llmStreamSummary) map[string]any {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["terminal_seen"] = summary.TerminalSeen
+	payload["done_seen"] = summary.DoneSeen
+	payload["stream_event_count"] = summary.EventCount
+	payload["last_effective_event_at"] = normalizeModelArtifactTime(summary.LastEffectiveEventAt)
+	payload["watchdog_fired"] = summary.WatchdogFired
+	if strings.TrimSpace(summary.ErrorClass) != "" {
+		payload["error_class"] = strings.TrimSpace(summary.ErrorClass)
+	}
+	return payload
+}
 
 // recordLLMRequestArtifact 记录一次模型调用的原始请求工件。
 func recordLLMRequestArtifact(req StreamRequest, provider string, model string, method string, url string, body any) {
@@ -58,21 +107,27 @@ func buildLLMSummaryPayload(
 	promptTokensTotal := inputTokens + cacheReadTokens + cacheWriteTokens
 	requestTokensTotal := promptTokensTotal + outputTokens
 	return map[string]any{
-		"provider":             strings.TrimSpace(provider),
-		"model":                strings.TrimSpace(model),
-		"started_at":           normalizeModelArtifactTime(startedAt),
-		"first_event_at":       normalizeModelArtifactTime(firstEventAt),
-		"finished_at":          normalizeModelArtifactTime(finished),
-		"finish_reason":        strings.TrimSpace(finishReason),
-		"input_tokens":         inputTokens,
-		"output_tokens":        outputTokens,
-		"cache_read_tokens":    cacheReadTokens,
-		"cache_write_tokens":   cacheWriteTokens,
-		"prompt_tokens_total":  promptTokensTotal,
-		"request_tokens_total": requestTokensTotal,
-		"error":                summarizeModelArtifactError(err),
-		"ttft_ms":              computeTTFTMS(startedAt, firstEventAt),
-		"duration_ms":          computeDurationMS(startedAt, finished),
+		"provider":                strings.TrimSpace(provider),
+		"model":                   strings.TrimSpace(model),
+		"started_at":              normalizeModelArtifactTime(startedAt),
+		"first_event_at":          normalizeModelArtifactTime(firstEventAt),
+		"finished_at":             normalizeModelArtifactTime(finished),
+		"finish_reason":           strings.TrimSpace(finishReason),
+		"terminal_seen":           false,
+		"done_seen":               false,
+		"stream_event_count":      0,
+		"last_effective_event_at": "",
+		"watchdog_fired":          false,
+		"input_tokens":            inputTokens,
+		"output_tokens":           outputTokens,
+		"cache_read_tokens":       cacheReadTokens,
+		"cache_write_tokens":      cacheWriteTokens,
+		"prompt_tokens_total":     promptTokensTotal,
+		"request_tokens_total":    requestTokensTotal,
+		"error":                   summarizeModelArtifactError(err),
+		"error_class":             classifyModelArtifactError(err),
+		"ttft_ms":                 computeTTFTMS(startedAt, firstEventAt),
+		"duration_ms":             computeDurationMS(startedAt, finished),
 	}
 }
 
@@ -184,6 +239,38 @@ func computeDurationMS(startedAt time.Time, finishedAt time.Time) int64 {
 		return 0
 	}
 	return value
+}
+
+func classifyModelArtifactError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var incompleteErr *IncompleteStreamError
+	if errors.As(err, &incompleteErr) {
+		return "incomplete_stream"
+	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return "http_status"
+	}
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+		return "protocol_error"
+	}
+	normalized := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(normalized, "provider stream idle timeout"):
+		return "watchdog_timeout"
+	case strings.Contains(normalized, "connection reset"), strings.Contains(normalized, "broken pipe"), strings.Contains(normalized, "unexpected eof"):
+		return "connection_interrupted"
+	case strings.Contains(normalized, "timeout"), strings.Contains(normalized, "temporarily unavailable"):
+		return "transient_network"
+	case strings.Contains(normalized, "context canceled"):
+		return "canceled"
+	default:
+		return "provider_error"
+	}
 }
 
 // summarizeModelArtifactError 返回可安全落盘的错误文本。
