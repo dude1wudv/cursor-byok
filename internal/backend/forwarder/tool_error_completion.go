@@ -64,7 +64,10 @@ func (service *Service) completePreDispatchToolError(
 	if startedToolCall == nil {
 		startedToolCall = buildStartedToolCall(invocation)
 	}
-	if !startedHistoryAppended && startedToolCall != nil {
+	// 未知/隐藏工具没有可编码的 canonical ToolCall oneof。不要向客户端发一个
+	// tool_call_started(nil)：那会制造一个永远无法被客户端关联收口的灰色状态行。
+	hasCanonicalToolCall := startedToolCall != nil
+	if !startedHistoryAppended && hasCanonicalToolCall {
 		toolCallPayload, err := protojson.Marshal(startedToolCall)
 		if err != nil {
 			return err
@@ -75,7 +78,7 @@ func (service *Service) completePreDispatchToolError(
 			return err
 		}
 	}
-	if !startedEmitted {
+	if !startedEmitted && hasCanonicalToolCall {
 		if err := service.broker.Publish(stream.RequestID, StreamEvent{
 			Message: buildToolCallStartedMessage(invocation.CallID, invocation.ModelCallID, startedToolCall),
 		}); err != nil {
@@ -86,8 +89,21 @@ func (service *Service) completePreDispatchToolError(
 	if err := service.appendToolResult(stream, invocation.CallID, strings.TrimSpace(invocation.ToolName), invocation.ArgsJSON, resultText, invocation.ReasoningContent, nil); err != nil {
 		return err
 	}
-	if err := service.publishToolCallCompleted(stream.RequestID, invocation.CallID, invocation.ModelCallID, nil); err != nil {
-		return err
+	if hasCanonicalToolCall || startedEmitted {
+		if err := service.publishToolCallCompleted(stream.RequestID, invocation.CallID, invocation.ModelCallID, nil); err != nil {
+			return err
+		}
+	}
+	if !hasCanonicalToolCall {
+		if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+			newMetadataEntry(stream.TurnSeq, stream.RequestID, "unsupported_tool_invocation", map[string]any{
+				"tool_call_id": invocation.CallID,
+				"tool_name":    strings.TrimSpace(invocation.ToolName),
+				"error":        resultText,
+			}),
+		}); err != nil {
+			return err
+		}
 	}
 	if err := service.syncSummaryCarryForward(stream.ConversationID, stream.RequestID, invocation.ModelCallID); err != nil {
 		return err

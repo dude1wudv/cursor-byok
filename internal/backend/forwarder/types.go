@@ -132,6 +132,19 @@ type TaskBatch struct {
 	Members        map[string]*TaskBatchMember `json:"members"`
 	ParentNotified bool                        `json:"parent_notified"`
 }
+type SubagentFinalizationState struct {
+	Pending                  runtimecore.PendingExec
+	ResultReceived           bool
+	ToolResultPersisted      bool
+	TodoReconciled           bool
+	ClosureMetadataPersisted bool
+	TaskBatchTerminal        bool
+	DispatchClosed           bool
+	ToolCompletedPublished   bool
+	CheckpointPublished      bool
+	ReconcileRequested       bool
+}
+
 type ActiveStream struct {
 	mu sync.Mutex
 
@@ -190,6 +203,7 @@ type ActiveStream struct {
 	TerminalsFolder             string
 	RequestFileContents         map[string]string
 	RecentCompletedExecs        map[uint32]time.Time
+	SubagentFinalizations       map[string]*SubagentFinalizationState
 	TaskBatches                 map[int]*TaskBatch
 	BackgroundShells            map[string]*BackgroundShellState
 	BackgroundShellsByMessageID map[uint32]string

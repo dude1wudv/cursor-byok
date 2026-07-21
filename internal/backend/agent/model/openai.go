@@ -1666,6 +1666,21 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		}
 		return fail(err)
 	}
+	// response.incomplete 可能在 function_call_arguments.done 之前终止，
+	// 此时 accumulator 仍在 tools 中。把它显式收口为一次工具意图，交给
+	// forwarder 的 pre-dispatch 校验/错误恢复，而不是留下客户端永远 pending。
+	for key, accumulator := range tools {
+		if accumulator == nil {
+			continue
+		}
+		if strings.TrimSpace(accumulator.CallID) == "" {
+			accumulator.CallID = namespaceToolCallID(req.ModelCallID, key)
+		}
+		if err := completeTool(key, accumulator); err != nil {
+			return fail(err)
+		}
+	}
+	tools = make(map[string]*openAIToolAccumulator)
 	if !terminalSeen {
 		return fail(fmt.Errorf("openai responses stream ended before terminal response event"))
 	}

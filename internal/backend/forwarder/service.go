@@ -970,6 +970,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
 	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
 	stream.RecentCompletedExecs = make(map[uint32]time.Time)
+	stream.SubagentFinalizations = make(map[string]*SubagentFinalizationState)
 	stream.TaskBatches = make(map[int]*TaskBatch)
 	stream.BackgroundShells = make(map[string]*BackgroundShellState)
 	stream.BackgroundShellsByMessageID = make(map[uint32]string)
@@ -1123,6 +1124,15 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	}
 	pending, found := selectPendingExec(intent.ExecClientMessage.GetExecId(), intent.ExecClientMessage.GetId(), stream)
 	if !found {
+		if intent.ExecClientMessage.GetSubagentResult() != nil {
+			if finalizing, ok := selectPendingSubagentFinalization(intent.ExecClientMessage.GetExecId(), intent.ExecClientMessage.GetId(), stream); ok {
+				result, err := service.execBridge.ApplyExecClientMessage(intent.ExecClientMessage, finalizing)
+				if err != nil {
+					return err
+				}
+				return service.finalizeSubagentExecResult(stream, finalizing, intent.ExecClientMessage, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
+			}
+		}
 		if service.observeMissingBackgroundShellExecClientMessage(stream, intent.ExecClientMessage) {
 			return nil
 		}
@@ -1160,6 +1170,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	if !result.IsTerminal {
 		return nil
 	}
+	if strings.TrimSpace(pending.ExecKind) == "subagent" {
+		return service.finalizeSubagentExecResult(stream, pending, intent.ExecClientMessage, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
+	}
 	markExecCompleted(stream, pending)
 	backgroundShellToolCallID := ""
 	if strings.TrimSpace(pending.ExecKind) == "shell" && shellToolCallIsBackgrounded(result.ToolCall) {
@@ -1189,15 +1202,6 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 			}
 		}
 	}
-	if strings.TrimSpace(pending.ExecKind) == "subagent" {
-		if err := service.reconcileParentTodoFromSubagentResult(stream, pending, intent.ExecClientMessage); err != nil {
-			return err
-		}
-		if err := service.closeSubagentDispatch(stream, pending, "tool_result"); err != nil {
-			return err
-		}
-		service.removePendingSubagentLaunch(stream.ConversationID, pending.ToolCallID)
-	}
 	displayToolCall := stripTaskPromptForDisplay(result.ToolCall)
 	if err := service.publishToolCallCompleted(intent.RequestID, result.ToolCallID, pending.ModelCallID, displayToolCall); err != nil {
 		return err
@@ -1209,6 +1213,191 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return err
 	}
 	return service.reconcileStream(stream)
+}
+
+func subagentFinalizationKey(pending runtimecore.PendingExec) string {
+	return fmt.Sprintf("%s|%s|%d", strings.TrimSpace(pending.ToolCallID), strings.TrimSpace(pending.ExecID), pending.MessageID)
+}
+
+func subagentFinalizationSnapshot(stream *ActiveStream, pending runtimecore.PendingExec) SubagentFinalizationState {
+	if stream == nil {
+		return SubagentFinalizationState{}
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if state := stream.SubagentFinalizations[subagentFinalizationKey(pending)]; state != nil {
+		return *state
+	}
+	return SubagentFinalizationState{}
+}
+
+func updateSubagentFinalization(stream *ActiveStream, pending runtimecore.PendingExec, update func(*SubagentFinalizationState)) {
+	if stream == nil || update == nil {
+		return
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if stream.SubagentFinalizations == nil {
+		stream.SubagentFinalizations = make(map[string]*SubagentFinalizationState)
+	}
+	key := subagentFinalizationKey(pending)
+	state := stream.SubagentFinalizations[key]
+	if state == nil {
+		state = &SubagentFinalizationState{Pending: pending}
+		stream.SubagentFinalizations[key] = state
+	} else if strings.TrimSpace(state.Pending.ExecID) == "" {
+		state.Pending = pending
+	}
+	update(state)
+	stream.UpdatedAt = time.Now().UTC()
+}
+
+func (service *Service) subagentFinalizeRuntime(stream *ActiveStream, pending runtimecore.PendingExec, stage string, disposition string) {
+	if stream == nil {
+		return
+	}
+	stream.mu.Lock()
+	pendingExecCount := len(stream.PendingExecs)
+	generation := pending.ProviderPass
+	status := stream.Status
+	phase := stream.Phase
+	conversationID := stream.ConversationID
+	requestID := stream.RequestID
+	stream.mu.Unlock()
+	if service != nil && service.debug != nil {
+		service.debug.LogRuntime(context.Background(), requestID, conversationID, "subagent_result_finalize", map[string]any{
+			"stage":              strings.TrimSpace(stage),
+			"tool_call_id":       strings.TrimSpace(pending.ToolCallID),
+			"exec_id":            strings.TrimSpace(pending.ExecID),
+			"message_id":         pending.MessageID,
+			"pending_exec_count": pendingExecCount,
+			"batch_generation":   generation,
+			"disposition":        strings.TrimSpace(disposition),
+			"phase":              phase,
+			"status":             status,
+		})
+	}
+	log.Printf("forwarder subagent finalize request_id=%s tool_call_id=%s exec_id=%s message_id=%d stage=%s pending_exec_count=%d batch_generation=%d disposition=%s phase=%s status=%s",
+		strings.TrimSpace(requestID), strings.TrimSpace(pending.ToolCallID), strings.TrimSpace(pending.ExecID), pending.MessageID,
+		strings.TrimSpace(stage), pendingExecCount, generation, strings.TrimSpace(disposition), phase, status)
+}
+
+func (service *Service) finalizeSubagentExecResult(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage, resultToolCallID string, resultPayload string, toolCall *agentv1.ToolCall) error {
+	if stream == nil || message == nil || message.GetSubagentResult() == nil {
+		return nil
+	}
+	stream.mu.Lock()
+	terminal := isTerminalStreamStatus(stream.Status) || stream.Phase == TurnPhaseCanceled || stream.Phase == TurnPhaseCompleted || stream.Phase == TurnPhaseFailed
+	completion := stream.PendingProviderCompletion
+	stream.mu.Unlock()
+	if terminal {
+		service.subagentFinalizeRuntime(stream, pending, "late_result_ignored", "terminal_parent")
+		return nil
+	}
+	disposition := ""
+	if completion != nil {
+		disposition = string(completion.Disposition)
+	}
+	state := subagentFinalizationSnapshot(stream, pending)
+	if !state.ResultReceived {
+		if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+			newMetadataEntry(stream.TurnSeq, stream.RequestID, "subagent_result_finalize", map[string]any{
+				"stage":            "result_received",
+				"tool_call_id":     pending.ToolCallID,
+				"exec_id":          pending.ExecID,
+				"message_id":       pending.MessageID,
+				"batch_generation": pending.ProviderPass,
+				"disposition":      disposition,
+			}),
+		}); err != nil {
+			return err
+		}
+		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.ResultReceived = true })
+		service.subagentFinalizeRuntime(stream, pending, "result_received", disposition)
+		state.ResultReceived = true
+	}
+	if !state.ToolResultPersisted {
+		resolvedToolCall := toolCall
+		if taskToolCall := resolvedToolCall.GetTaskToolCall(); taskToolCall != nil && taskToolCall.GetArgs() != nil {
+			resolvedToolCall = service.rewriteTaskToolCallModelForResolvedID(resolvedToolCall, taskToolCall.GetArgs().GetModel())
+		}
+		toolCallID := firstNonEmpty(strings.TrimSpace(resultToolCallID), strings.TrimSpace(pending.ToolCallID))
+		if err := service.appendToolResult(stream, toolCallID, deriveToolNameFromPendingExec(pending), pending.ArgsJSON, resultPayload, pending.ReasoningContent, resolvedToolCall); err != nil {
+			return err
+		}
+		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.ToolResultPersisted = true })
+		service.subagentFinalizeRuntime(stream, pending, "tool_result_persisted", disposition)
+		state.ToolResultPersisted = true
+	}
+	if !state.TodoReconciled {
+		if err := service.reconcileParentTodoFromSubagentResult(stream, pending, message); err != nil {
+			return err
+		}
+		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.TodoReconciled = true })
+		state.TodoReconciled = true
+	}
+	if !state.ClosureMetadataPersisted {
+		if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+			newMetadataEntry(stream.TurnSeq, stream.RequestID, "subagent_result_finalize", map[string]any{
+				"stage":                 "closure_ready",
+				"tool_call_id":          pending.ToolCallID,
+				"exec_id":               pending.ExecID,
+				"message_id":            pending.MessageID,
+				"batch_generation":      pending.ProviderPass,
+				"disposition":           disposition,
+				"tool_result_persisted": true,
+				"todo_reconciled":       true,
+			}),
+		}); err != nil {
+			return err
+		}
+		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.ClosureMetadataPersisted = true })
+		state.ClosureMetadataPersisted = true
+	}
+	if !state.TaskBatchTerminal {
+		markExecCompleted(stream, pending)
+		clearStreamTimer(stream, providerTimerKey(streamTimerSubagentResult, pending.ExecID))
+		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.TaskBatchTerminal = true })
+		service.subagentFinalizeRuntime(stream, pending, "task_batch_terminal", disposition)
+		state.TaskBatchTerminal = true
+	}
+	if !state.DispatchClosed {
+		if err := service.closeSubagentDispatch(stream, pending, "tool_result"); err != nil {
+			return err
+		}
+		service.removePendingSubagentLaunch(stream.ConversationID, pending.ToolCallID)
+		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.DispatchClosed = true })
+		service.subagentFinalizeRuntime(stream, pending, "dispatch_closed", disposition)
+		state.DispatchClosed = true
+	}
+	if !state.ToolCompletedPublished {
+		displayToolCall := stripTaskPromptForDisplay(toolCall)
+		if err := service.publishToolCallCompleted(stream.RequestID, firstNonEmpty(strings.TrimSpace(resultToolCallID), pending.ToolCallID), pending.ModelCallID, displayToolCall); err != nil {
+			return err
+		}
+		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.ToolCompletedPublished = true })
+		service.subagentFinalizeRuntime(stream, pending, "tool_completed_published", disposition)
+		state.ToolCompletedPublished = true
+	}
+	if err := service.syncSummaryCarryForward(stream.ConversationID, stream.RequestID, pending.ModelCallID); err != nil {
+		return err
+	}
+	if !state.CheckpointPublished {
+		if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
+			return err
+		}
+		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.CheckpointPublished = true })
+		service.subagentFinalizeRuntime(stream, pending, "checkpoint_published", disposition)
+		state.CheckpointPublished = true
+	}
+	if !state.ReconcileRequested {
+		service.subagentFinalizeRuntime(stream, pending, "parent_reconcile_requested", disposition)
+		if err := service.reconcileStream(stream); err != nil {
+			return err
+		}
+		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.ReconcileRequested = true })
+	}
+	return nil
 }
 
 // handleExecControl 处理执行桥控制面结果，例如 stream_close 或 throw。
@@ -3385,6 +3574,25 @@ func selectPendingInteraction(message *agentv1.InteractionResponse, stream *Acti
 	defer stream.mu.Unlock()
 	item, ok := stream.PendingInteractions[interactionID]
 	return item, ok
+}
+
+func selectPendingSubagentFinalization(execID string, messageID uint32, stream *ActiveStream) (runtimecore.PendingExec, bool) {
+	if stream == nil {
+		return runtimecore.PendingExec{}, false
+	}
+	execID = strings.TrimSpace(execID)
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	for _, state := range stream.SubagentFinalizations {
+		if state == nil || !state.ResultReceived || state.ReconcileRequested {
+			continue
+		}
+		pending := state.Pending
+		if (execID != "" && strings.TrimSpace(pending.ExecID) == execID) || (messageID != 0 && pending.MessageID == messageID) {
+			return pending, true
+		}
+	}
+	return runtimecore.PendingExec{}, false
 }
 
 // selectPendingExecByControl 根据控制消息的桥消息 ID 查找挂起执行桥。

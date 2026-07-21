@@ -186,6 +186,20 @@ func (service *Service) streamForIntent(intent InboundIntent) (*ActiveStream, er
 			return nil, fmt.Errorf("request is not active: %s", intent.RequestID)
 		}
 		if isTerminalIntentStream(stream) {
+			if intent.ExecClientMessage != nil && intent.ExecClientMessage.GetSubagentResult() != nil && service.debug != nil {
+				stream.mu.Lock()
+				status := stream.Status
+				phase := stream.Phase
+				conversationID := stream.ConversationID
+				stream.mu.Unlock()
+				service.debug.LogRuntime(context.Background(), intent.RequestID, conversationID, "subagent_result_finalize", map[string]any{
+					"stage":      "late_result_ignored",
+					"exec_id":    strings.TrimSpace(intent.ExecClientMessage.GetExecId()),
+					"message_id": intent.ExecClientMessage.GetId(),
+					"phase":      phase,
+					"status":     status,
+				})
+			}
 			return nil, nil
 		}
 		return stream, nil
@@ -372,6 +386,54 @@ func (service *Service) requestProviderAction(stream *ActiveStream, action provi
 	return service.reconcileStream(stream)
 }
 
+func (service *Service) logParentReconcile(stream *ActiveStream, stage string, generation int, endSent bool) {
+	if service == nil || service.debug == nil || stream == nil {
+		return
+	}
+	stream.mu.Lock()
+	requestID := stream.RequestID
+	conversationID := stream.ConversationID
+	status := stream.Status
+	phase := stream.Phase
+	action := stream.PendingProviderAction
+	providerActive := stream.ProviderActive
+	pendingExecCount := len(stream.PendingExecs)
+	pendingInteractionCount := len(stream.PendingInteractions)
+	disposition := completionDispositionNone
+	if stream.PendingProviderCompletion != nil {
+		disposition = stream.PendingProviderCompletion.Disposition
+	}
+	providerToken := stream.CurrentProviderToken
+	actorMailboxReady := stream.ActorMailbox != nil && stream.ActorDone != nil
+	actorDone := stream.ActorDone
+	resumeTimerToken := stream.TimerTokens[providerTimerKey(streamTimerProviderResume, "")]
+	stream.mu.Unlock()
+	actorStopped := false
+	if actorDone != nil {
+		select {
+		case <-actorDone:
+			actorStopped = true
+		default:
+		}
+	}
+	service.debug.LogRuntime(context.Background(), requestID, conversationID, "parent_reconcile", map[string]any{
+		"stage":                     strings.TrimSpace(stage),
+		"provider_action":           action,
+		"provider_active":           providerActive,
+		"pending_exec_count":        pendingExecCount,
+		"pending_interaction_count": pendingInteractionCount,
+		"batch_generation":          generation,
+		"completion_disposition":    disposition,
+		"provider_token":            providerToken,
+		"actor_mailbox_ready":       actorMailboxReady,
+		"actor_stopped":             actorStopped,
+		"resume_timer_token":        resumeTimerToken,
+		"phase":                     phase,
+		"status":                    status,
+		"end_sent":                  endSent,
+	})
+}
+
 func (service *Service) reconcileStream(stream *ActiveStream) error {
 	if stream == nil {
 		return nil
@@ -388,9 +450,12 @@ func (service *Service) reconcileStream(stream *ActiveStream) error {
 	hasPendingCompaction := stream.PendingCompaction != nil
 	action := stream.PendingProviderAction
 	completion := stream.PendingProviderCompletion
+	providerPass := stream.ProviderPassCount
 	stream.mu.Unlock()
+	service.logParentReconcile(stream, "entered", providerPass, false)
 
 	if providerActive {
+		service.logParentReconcile(stream, "provider_active", providerPass, false)
 		return nil
 	}
 	if pendingExecCount+pendingInteractionCount > 0 {
@@ -401,11 +466,13 @@ func (service *Service) reconcileStream(stream *ActiveStream) error {
 		} else {
 			service.setTurnPhase(stream, TurnPhaseWaitingExternal)
 		}
+		service.logParentReconcile(stream, "pending_external", providerPass, false)
 		return nil
 	}
 	generation, batchReady := taskBatchAllowsParentNotification(stream)
 	if !batchReady {
 		service.setTurnPhase(stream, TurnPhaseWaitingExternal)
+		service.logParentReconcile(stream, "batch_pending", generation, false)
 		return nil
 	}
 	if generation > 0 && service.debug != nil {
@@ -432,22 +499,25 @@ func (service *Service) reconcileStream(stream *ActiveStream) error {
 			action = providerActionResume
 		} else {
 			clearPendingProviderCompletion(stream)
+			service.logParentReconcile(stream, "complete_after_external", generation, false)
 			if err := service.completeSuccessfulTurn(stream, *completion); err != nil {
 				return service.failStreamIfNonTerminal(stream, "unknown", err)
 			}
+			service.logParentReconcile(stream, "end_sent", generation, true)
 			return nil
 		}
 	}
 
 	switch action {
 	case providerActionStart:
+		service.logParentReconcile(stream, "provider_start", generation, false)
 		return service.driveProvider(stream)
 	case providerActionResume:
-		service.setTurnPhase(stream, TurnPhaseWaitingExternal)
-		service.scheduleStreamTimer(stream, providerTimerKey(streamTimerProviderResume, ""), providerResumeDebounce, streamTimerProviderResume, "", 0, "")
-		return nil
+		service.logParentReconcile(stream, "provider_resume", generation, false)
+		return service.driveProvider(stream)
 	default:
 		service.setTurnPhase(stream, TurnPhaseIdle)
+		service.logParentReconcile(stream, "idle", generation, false)
 		return nil
 	}
 }
