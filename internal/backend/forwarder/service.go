@@ -1170,6 +1170,7 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	if !result.IsTerminal {
 		return nil
 	}
+	service.logShellTerminalResult(stream, pending, intent.ExecClientMessage)
 	if strings.TrimSpace(pending.ExecKind) == "subagent" {
 		return service.finalizeSubagentExecResult(stream, pending, intent.ExecClientMessage, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
 	}
@@ -1213,6 +1214,87 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return err
 	}
 	return service.reconcileStream(stream)
+}
+
+func (service *Service) logShellTerminalResult(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) {
+	if service == nil || service.debug == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+		return
+	}
+	service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_terminal_result", map[string]any{
+		"source":       shellTerminalResultSource(message),
+		"tool_call_id": strings.TrimSpace(pending.ToolCallID),
+		"exec_id":      strings.TrimSpace(pending.ExecID),
+		"message_id":   pending.MessageID,
+		"stream_state": strings.TrimSpace(pending.StreamState),
+	})
+}
+
+func shellTerminalResultSource(message *agentv1.ExecClientMessage) string {
+	if message == nil {
+		return "protocol_error_synthetic"
+	}
+	if legacy := message.GetShellResult(); legacy != nil {
+		switch item := legacy.GetResult().(type) {
+		case *agentv1.ShellResult_Success:
+			if item.Success == nil {
+				return "protocol_error_synthetic"
+			}
+		case *agentv1.ShellResult_Failure:
+			if item.Failure == nil {
+				return "protocol_error_synthetic"
+			}
+		case *agentv1.ShellResult_Timeout:
+			if item.Timeout == nil {
+				return "protocol_error_synthetic"
+			}
+		case *agentv1.ShellResult_SpawnError:
+			if item.SpawnError == nil {
+				return "protocol_error_synthetic"
+			}
+		case *agentv1.ShellResult_Rejected:
+			if item.Rejected == nil {
+				return "protocol_error_synthetic"
+			}
+			if strings.Contains(strings.ToLower(strings.TrimSpace(item.Rejected.GetReason())), "skip") {
+				return "skipped_terminal"
+			}
+		case *agentv1.ShellResult_PermissionDenied:
+			if item.PermissionDenied == nil {
+				return "protocol_error_synthetic"
+			}
+		default:
+			return "protocol_error_synthetic"
+		}
+		return "legacy_shell_result"
+	}
+	stream := message.GetShellStream()
+	if stream == nil {
+		return "protocol_error_synthetic"
+	}
+	switch event := stream.GetEvent().(type) {
+	case *agentv1.ShellStream_Exit:
+		if event.Exit == nil {
+			return "protocol_error_synthetic"
+		}
+	case *agentv1.ShellStream_Rejected:
+		if event.Rejected == nil {
+			return "protocol_error_synthetic"
+		}
+		if strings.Contains(strings.ToLower(strings.TrimSpace(event.Rejected.GetReason())), "skip") {
+			return "skipped_terminal"
+		}
+	case *agentv1.ShellStream_PermissionDenied:
+		if event.PermissionDenied == nil {
+			return "protocol_error_synthetic"
+		}
+	case *agentv1.ShellStream_Backgrounded:
+		if event.Backgrounded == nil {
+			return "protocol_error_synthetic"
+		}
+	default:
+		return "protocol_error_synthetic"
+	}
+	return "shell_stream_terminal"
 }
 
 func subagentFinalizationKey(pending runtimecore.PendingExec) string {
@@ -2109,13 +2191,15 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	stream.mu.Lock()
 	mode := stream.Mode
 	subagentTypeName := ""
+	subagentRole := ""
 	if stream.CheckpointConversation != nil {
 		subagentTypeName = strings.TrimSpace(stream.CheckpointConversation.SubagentTypeName)
+		subagentRole = normalizeSubagentRole(stream.CheckpointConversation.SubagentRole)
 	}
 	stream.ToolInvocationCount++
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
-	if err := validateSubagentToolInvocation(mode, subagentTypeName, trimmedToolName, invocation.ArgsJSON); err != nil {
+	if err := validateSubagentToolInvocationForConversation(mode, subagentTypeName, subagentRole, trimmedToolName, invocation.ArgsJSON); err != nil {
 		return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
 	}
 	if trimmedToolName == "Task" {
@@ -2478,6 +2562,9 @@ func (service *Service) applyExecProgress(stream *ActiveStream, pending runtimec
 	now := time.Now().UTC()
 	switch event := shellStream.GetEvent().(type) {
 	case *agentv1.ShellStream_Stdout:
+		if event.Stdout == nil {
+			break
+		}
 		if current.FirstChunkAt.IsZero() {
 			current.FirstChunkAt = now
 		}
@@ -2486,6 +2573,9 @@ func (service *Service) applyExecProgress(stream *ActiveStream, pending runtimec
 		current.LastShellActivityAt = now
 		current.StdoutBuffer += execbridge.DecodeShellStdout(event.Stdout)
 	case *agentv1.ShellStream_Stderr:
+		if event.Stderr == nil {
+			break
+		}
 		if current.FirstChunkAt.IsZero() {
 			current.FirstChunkAt = now
 		}
@@ -3628,14 +3718,19 @@ func shouldIgnoreMissingExecResult(message *agentv1.ExecClientMessage, stream *A
 }
 
 func shouldIgnoreMissingExecControl(message *agentv1.ExecClientControlMessage, stream *ActiveStream) bool {
-	if shouldIgnoreStaleExecControl(message) {
-		return true
-	}
 	messageID, ok := execControlMessageID(message)
 	if !ok {
 		return false
 	}
-	return recentlyCompletedExecExists(stream, messageID)
+	if recentlyCompletedExecExists(stream, messageID) {
+		return true
+	}
+	switch message.GetMessage().(type) {
+	case *agentv1.ExecClientControlMessage_Heartbeat:
+		return true
+	default:
+		return false
+	}
 }
 
 func shouldIgnoreStaleExecControl(message *agentv1.ExecClientControlMessage) bool {

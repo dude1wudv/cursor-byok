@@ -27,6 +27,15 @@ func NewToolCatalog(models ...modeladapter.SubagentModelDirectory) *DefaultToolC
 
 // Load 按 mode 读取工具资产，并过滤出当前阶段真正允许暴露的工具。
 func (catalog *DefaultToolCatalog) Load(mode agentv1.AgentMode, subagentTypeName string) ([]json.RawMessage, []string, error) {
+	return catalog.load(mode, subagentTypeName, "")
+}
+
+// LoadForConversation additionally applies the child role when selecting and shaping tools.
+func (catalog *DefaultToolCatalog) LoadForConversation(mode agentv1.AgentMode, subagentTypeName string, subagentRole string) ([]json.RawMessage, []string, error) {
+	return catalog.load(mode, subagentTypeName, normalizeSubagentRole(subagentRole))
+}
+
+func (catalog *DefaultToolCatalog) load(mode agentv1.AgentMode, subagentTypeName string, subagentRole string) ([]json.RawMessage, []string, error) {
 	assetMode, err := toolAssetModeForConversation(mode, subagentTypeName)
 	if err != nil {
 		return nil, nil, err
@@ -46,11 +55,16 @@ func (catalog *DefaultToolCatalog) Load(mode agentv1.AgentMode, subagentTypeName
 		if err != nil {
 			return nil, nil, err
 		}
-		if !isToolAllowedInMode(mode, subagentTypeName, name) {
+		if !isToolAllowedInConversation(mode, subagentTypeName, subagentRole, name) {
 			continue
 		}
-		if name == "Task" && !isChildConversationSubagentTypeName(subagentTypeName) {
-			item, err = catalog.rewriteRootTaskTool(item)
+		if name == "Task" {
+			switch {
+			case !isChildConversationSubagentTypeName(subagentTypeName):
+				item, err = catalog.rewriteRootTaskTool(item)
+			case subagentRole == "medium_explore":
+				item, err = rewriteMediumExploreTaskTool(item)
+			}
 			if err != nil {
 				return nil, nil, err
 			}
@@ -123,6 +137,53 @@ func (catalog *DefaultToolCatalog) rewriteRootTaskTool(item json.RawMessage) (js
 		function["description"] = description + "\n\nRole-based routing: always set task_role. For automatic routing, omit model entirely; the backend selects the first enabled adapter for that role in configuration order. Set model only for an intentional explicit override. If thinking_effort is omitted, role defaults apply (simple_explore=low, medium_explore=medium, complex_debug=medium)."
 	}
 	return json.Marshal(tool)
+}
+
+func rewriteMediumExploreTaskTool(item json.RawMessage) (json.RawMessage, error) {
+	var tool map[string]any
+	if err := json.Unmarshal(item, &tool); err != nil {
+		return nil, fmt.Errorf("decode Task tool descriptor: %w", err)
+	}
+	function, _ := tool["function"].(map[string]any)
+	parameters, _ := function["parameters"].(map[string]any)
+	properties, _ := parameters["properties"].(map[string]any)
+	subagentType, _ := properties["subagent_type"].(map[string]any)
+	taskRole, _ := properties["task_role"].(map[string]any)
+	readonly, _ := properties["readonly"].(map[string]any)
+	if function == nil || parameters == nil || properties == nil || subagentType == nil || taskRole == nil || readonly == nil {
+		return nil, fmt.Errorf("Task tool descriptor nested exploration schema is missing")
+	}
+	function["description"] = "Delegate one read-only long-context investigation only when long files, many related files, or a cross-module path would consume substantial context. Prefer longContextRead; use explore only when that specialized channel is unavailable. After the child returns candidate files and line ranges, precisely Read and cross-check those ranges yourself before reporting completion."
+	subagentType["enum"] = []string{runtimecore.SubagentTypeLongContextRead, "explore"}
+	subagentType["description"] = "Required read-only child type. Prefer longContextRead; use explore only when longContextRead is unavailable."
+	taskRole["enum"] = []string{"simple_explore", "medium_explore"}
+	taskRole["description"] = "Required read-only exploration role: simple_explore or medium_explore."
+	readonly["enum"] = []bool{true}
+	readonly["description"] = "Must be true. Nested medium_explore delegation is read-only."
+	parameters["required"] = appendRequiredSchemaFields(parameters["required"], "task_role", "readonly")
+	return json.Marshal(tool)
+}
+
+func appendRequiredSchemaFields(value any, fields ...string) []any {
+	required, _ := value.([]any)
+	seen := make(map[string]struct{}, len(required)+len(fields))
+	result := make([]any, 0, len(required)+len(fields))
+	for _, field := range required {
+		text, _ := field.(string)
+		if _, ok := seen[text]; ok {
+			continue
+		}
+		seen[text] = struct{}{}
+		result = append(result, field)
+	}
+	for _, field := range fields {
+		if _, ok := seen[field]; ok {
+			continue
+		}
+		seen[field] = struct{}{}
+		result = append(result, field)
+	}
+	return result
 }
 
 var agentModeToolNames = map[string]struct{}{
@@ -269,6 +330,14 @@ func supportedToolNamesForMode(mode agentv1.AgentMode) map[string]struct{} {
 	}
 }
 
+func isToolAllowedInConversation(mode agentv1.AgentMode, subagentTypeName string, subagentRole string, toolName string) bool {
+	if isChildConversationSubagentTypeName(subagentTypeName) && strings.TrimSpace(toolName) == "Task" {
+		role := normalizeSubagentRole(subagentRole)
+		return role == "medium_explore" || role == "complex_debug"
+	}
+	return isToolAllowedInMode(mode, subagentTypeName, toolName)
+}
+
 func isToolAllowedInMode(mode agentv1.AgentMode, subagentTypeName string, toolName string) bool {
 	trimmedToolName := strings.TrimSpace(toolName)
 	if trimmedToolName == "" {
@@ -332,7 +401,11 @@ func validateTaskSubagentCapability(argsJSON []byte) error {
 }
 
 func validateSubagentToolInvocation(mode agentv1.AgentMode, subagentTypeName string, toolName string, argsJSON []byte) error {
-	if !isToolAllowedInMode(mode, subagentTypeName, toolName) {
+	return validateSubagentToolInvocationForConversation(mode, subagentTypeName, "", toolName, argsJSON)
+}
+
+func validateSubagentToolInvocationForConversation(mode agentv1.AgentMode, subagentTypeName string, subagentRole string, toolName string, argsJSON []byte) error {
+	if !isToolAllowedInConversation(mode, subagentTypeName, subagentRole, toolName) {
 		return fmt.Errorf("tool invocation is not enabled in mode %s: %s", mode.String(), toolName)
 	}
 	if !isChildConversationSubagentTypeName(subagentTypeName) || normalizeMode(mode) != agentv1.AgentMode_AGENT_MODE_PLAN || strings.TrimSpace(toolName) != "FetchMcpResource" {
@@ -352,8 +425,16 @@ func isChildConversationSubagentTypeName(subagentTypeName string) bool {
 	return strings.TrimSpace(subagentTypeName) != ""
 }
 
+func subagentRoleMayDelegate(conversation *ConversationFile) bool {
+	if conversation == nil || !isChildConversationSubagentTypeName(conversation.SubagentTypeName) {
+		return true
+	}
+	role := normalizeSubagentRole(conversation.SubagentRole)
+	return role == "medium_explore" || role == "complex_debug"
+}
+
 func filterTaskToolNamesForSubagentRole(conversation *ConversationFile, names []string) []string {
-	if conversation == nil || !isChildConversationSubagentTypeName(conversation.SubagentTypeName) || normalizeSubagentRole(conversation.SubagentRole) == "complex_debug" {
+	if subagentRoleMayDelegate(conversation) {
 		return names
 	}
 	filtered := make([]string, 0, len(names))
@@ -365,7 +446,7 @@ func filterTaskToolNamesForSubagentRole(conversation *ConversationFile, names []
 	return filtered
 }
 func filterTaskToolForSubagentRole(conversation *ConversationFile, items []json.RawMessage) ([]json.RawMessage, []string, error) {
-	if conversation == nil || !isChildConversationSubagentTypeName(conversation.SubagentTypeName) || normalizeSubagentRole(conversation.SubagentRole) == "complex_debug" {
+	if subagentRoleMayDelegate(conversation) {
 		names := make([]string, 0, len(items))
 		for _, item := range items {
 			name, err := extractToolName(item)

@@ -132,11 +132,7 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 	if callID == "" {
 		return decision, fmt.Errorf("Task tool_call_id is required")
 	}
-	if strings.TrimSpace(readStringMapValue(args, "resume", "resume_agent_id", "resumeAgentId")) != "" {
-		decision.Resume = true
-		decision.QuotaScope = "resume"
-		return decision, nil
-	}
+	resume := strings.TrimSpace(readStringMapValue(args, "resume", "resume_agent_id", "resumeAgentId")) != ""
 
 	stream.mu.Lock()
 	conversation := cloneConversationFile(stream.CheckpointConversation)
@@ -154,20 +150,41 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		return decision, err
 	}
 	decision.Depth = depth
+	parentRole := ""
 	if depth > 1 {
-		parentRole := latestSubagentRole(conversation)
-		if parentRole != "complex_debug" {
-			return decision, fmt.Errorf("only complex_debug subagents may dispatch nested Task calls")
-		}
-		if decision.SubagentRole == "complex_debug" {
-			return decision, fmt.Errorf("complex_debug subagents may only dispatch simple_explore or medium_explore")
-		}
-		if decision.SubagentRole != "" && decision.SubagentRole != "simple_explore" && decision.SubagentRole != "medium_explore" {
-			return decision, fmt.Errorf("nested Task task_role must be simple_explore or medium_explore")
+		parentRole = latestSubagentRole(conversation)
+		switch parentRole {
+		case "complex_debug":
+			if decision.SubagentRole != "simple_explore" && decision.SubagentRole != "medium_explore" {
+				return decision, fmt.Errorf("complex_debug subagents may only dispatch simple_explore or medium_explore")
+			}
+		case "medium_explore":
+			decision.Limit = 1
+			if decision.SubagentType != runtimecore.SubagentTypeLongContextRead && decision.SubagentType != "explore" {
+				return decision, fmt.Errorf("medium_explore subagents may only dispatch longContextRead or explore")
+			}
+			if decision.SubagentRole != "simple_explore" && decision.SubagentRole != "medium_explore" {
+				return decision, fmt.Errorf("medium_explore nested Task task_role must be simple_explore or medium_explore")
+			}
+			readonlyValue, found := args["readonly"]
+			if !found {
+				readonlyValue, found = args["readOnly"]
+			}
+			readonly, ok := readonlyValue.(bool)
+			if !found || !ok || !readonly {
+				return decision, fmt.Errorf("medium_explore nested Task must explicitly set readonly=true")
+			}
+		default:
+			return decision, fmt.Errorf("only medium_explore or complex_debug subagents may dispatch nested Task calls")
 		}
 	}
 	if depth >= subagentMaximumDepth {
 		return decision, fmt.Errorf("subagent depth limit reached: maximum depth is %d", subagentMaximumDepth)
+	}
+	if resume {
+		decision.Resume = true
+		decision.QuotaScope = "resume"
+		return decision, nil
 	}
 	decision.QuotaScope = "conversation"
 	if depth == 1 {
@@ -179,11 +196,11 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 	if duplicate {
 		return decision, nil
 	}
-	if used >= subagentDispatchLimit {
+	if used >= decision.Limit {
 		if depth == 1 {
-			return decision, fmt.Errorf("Task limit reached: %d direct subagents per root turn", subagentDispatchLimit)
+			return decision, fmt.Errorf("Task limit reached: %d direct subagents per root turn", decision.Limit)
 		}
-		return decision, fmt.Errorf("Task limit reached: %d direct subagents per subagent conversation", subagentDispatchLimit)
+		return decision, fmt.Errorf("Task limit reached: %d direct subagents per subagent conversation", decision.Limit)
 	}
 	effectiveThinkingEffort := requestedThinkingEffort
 	if effectiveThinkingEffort == "" {

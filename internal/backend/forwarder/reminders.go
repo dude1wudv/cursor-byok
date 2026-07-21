@@ -46,7 +46,7 @@ func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversa
 		return appendCurrentTurnAttentionReminders(PromptReminders{
 			SystemParts: reminders,
 			PromptContexts: []PromptContextMessage{
-				newPromptContextReminder(promptContextSourceSubagentContract, subagentContractText(readonly, conversation.SubagentTypeName)),
+				newPromptContextReminder(promptContextSourceSubagentContract, subagentContractText(readonly, conversation.SubagentTypeName, conversation.SubagentRole, conversation.SubagentDepth)),
 				newPromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, true, readonly)),
 			},
 		}, latestUserText)
@@ -175,23 +175,31 @@ func newPromptContextReminder(source string, content string) PromptContextMessag
 	)
 }
 
-func subagentContractText(readonly bool, subagentType string) string {
+func subagentContractText(readonly bool, subagentType string, subagentRole string, subagentDepth int) string {
 	responsibility := "You are a writable implementation child. Make the requested changes only in the owned_paths named in your task, then verify those changes before reporting the result. Do not stop at investigation."
 	if readonly {
 		responsibility = "You are a read-only investigation child. Do not modify files, start processes, or save downloaded resources; report only concise findings to the parent agent."
 	}
 	if strings.TrimSpace(subagentType) == runtimecore.SubagentTypeLongContextRead {
-		responsibility = "You are the read-only long-context investigation child. Use this run only to scan a large codebase, long logs, or many documents quickly. Do not modify files or perform ordinary implementation work. Return compressed conclusions with precise file paths and line evidence."
+		responsibility = "You are the read-only long-context investigation child. Use this run only to scan a large codebase, long logs, or many documents quickly. Do not modify files or perform ordinary implementation work. Return compressed conclusions with candidate file paths, precise line ranges, module relationships, and unresolved points; do not copy large source excerpts."
 	}
-	return strings.Join([]string{
-		"The turn that contains this reminder runs inside a subagent child conversation. Work for the parent agent, not as the final user-facing assistant.",
+	parts := []string{
+		"This conversation runs inside a subagent child. Work for the parent agent, not as the final user-facing assistant.",
 		responsibility,
 		"The inherited <current_plan> and <todo_list> are an immutable snapshot from dispatch time. Use them for scope and dependencies, but do not treat child TodoWrite or CreatePlan calls as updates to the parent conversation.",
 		"Report the outcome and evidence to the parent. The parent coordinator owns acceptance, workspace verification, and advancing the matching parent Todo.",
 		"Return a short textual result: lead with the conclusion, keep only the key evidence, and do not produce a long response.",
 		"Use the available agent tools when they materially improve correctness or efficiency. Do not ask the user questions. If required information is missing, report the gap to the parent agent instead of asking the user directly.",
 		"The parent may provide a subagent_dispatch_context block containing immutable dispatch-time snapshots of the plan file path/URI, owned_paths, related_paths, and a short user-context summary. Treat paths as locating hints, use the inherited plan text snapshot as the source of truth, and do not treat later file changes as a parent-plan update.",
-	}, "\n\n")
+	}
+	if normalizeSubagentRole(subagentRole) == "medium_explore" && subagentDepth == 2 {
+		parts = append(parts,
+			"You may delegate at most one read-only third-level investigation, and only when long files, many related files, a cross-module call path, or direct reading would consume substantial context. Read one or two clearly identified files yourself instead of delegating.",
+			"Prefer subagent_type=longContextRead; use explore only when the specialized channel is explicitly unavailable. The child must be readonly and use task_role=simple_explore or medium_explore. Require only candidate files, key line ranges, module relationships, and unresolved points, never large source excerpts.",
+			"After the third-level result returns, precisely Read every cited range needed for the conclusion and cross-check it against related evidence. Do not merely repeat the report or treat child completion as completion of your own task.",
+		)
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func currentModeContractText(mode agentv1.AgentMode, childSubagent bool, childReadonly bool) string {

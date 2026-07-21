@@ -233,12 +233,18 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 		result.IsTerminal = true
 		return result, nil
 	case "shell":
+		if legacyResult := msg.GetShellResult(); legacyResult != nil {
+			return applyLegacyShellResult(result, pending, legacyResult), nil
+		}
 		shellResult := msg.GetShellStream()
 		if shellResult == nil {
-			return ExecApplyResult{}, fmt.Errorf("shell stream payload is required")
+			return buildSyntheticShellProtocolFailure(result, pending, "expected shell_stream or legacy shell_result payload"), nil
 		}
 		switch event := shellResult.GetEvent().(type) {
 		case *agentv1.ShellStream_Stdout:
+			if event.Stdout == nil {
+				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream stdout event is empty"), nil
+			}
 			stdoutText := DecodeShellStdout(event.Stdout)
 			result.ShellOutputDelta = &agentv1.ShellOutputDeltaUpdate{
 				Event: &agentv1.ShellOutputDeltaUpdate_Stdout{
@@ -248,6 +254,9 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 			result.ToolResultPayload = stdoutText
 			return result, nil
 		case *agentv1.ShellStream_Stderr:
+			if event.Stderr == nil {
+				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream stderr event is empty"), nil
+			}
 			result.ShellOutputDelta = &agentv1.ShellOutputDeltaUpdate{
 				Event: &agentv1.ShellOutputDeltaUpdate_Stderr{
 					Stderr: event.Stderr,
@@ -256,6 +265,9 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 			result.ToolResultPayload = event.Stderr.GetData()
 			return result, nil
 		case *agentv1.ShellStream_Start:
+			if event.Start == nil {
+				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream start event is empty"), nil
+			}
 			result.ShellOutputDelta = &agentv1.ShellOutputDeltaUpdate{
 				Event: &agentv1.ShellOutputDeltaUpdate_Start{
 					Start: event.Start,
@@ -263,6 +275,9 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 			}
 			return result, nil
 		case *agentv1.ShellStream_Exit:
+			if event.Exit == nil {
+				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream exit event is empty"), nil
+			}
 			result.ShellOutputDelta = &agentv1.ShellOutputDeltaUpdate{
 				Event: &agentv1.ShellOutputDeltaUpdate_Exit{
 					Exit: event.Exit,
@@ -274,22 +289,31 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 			result.IsTerminal = true
 			return result, nil
 		case *agentv1.ShellStream_Rejected:
+			if event.Rejected == nil {
+				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream rejected event is empty"), nil
+			}
 			result.ToolResultPayload = fmt.Sprintf("shell rejected: %s", strings.TrimSpace(event.Rejected.GetReason()))
 			result.ToolCall = buildShellRejectedToolCall(pending.ToolCallID, pending.ArgsJSON, event.Rejected)
 			result.IsTerminal = true
 			return result, nil
 		case *agentv1.ShellStream_PermissionDenied:
+			if event.PermissionDenied == nil {
+				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream permission_denied event is empty"), nil
+			}
 			result.ToolResultPayload = fmt.Sprintf("shell permission denied: %s", strings.TrimSpace(event.PermissionDenied.GetError()))
 			result.ToolCall = buildShellPermissionDeniedToolCall(pending.ToolCallID, pending.ArgsJSON, event.PermissionDenied)
 			result.IsTerminal = true
 			return result, nil
 		case *agentv1.ShellStream_Backgrounded:
+			if event.Backgrounded == nil {
+				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream backgrounded event is empty"), nil
+			}
 			result.ToolResultPayload = fmt.Sprintf("shell backgrounded: %d", event.Backgrounded.GetShellId())
 			result.ToolCall = buildShellBackgroundedToolCall(pending.ToolCallID, pending.ArgsJSON, event.Backgrounded)
 			result.IsTerminal = true
 			return result, nil
 		default:
-			return ExecApplyResult{}, fmt.Errorf("unsupported shell stream event")
+			return buildSyntheticShellProtocolFailure(result, pending, "shell_stream event is empty or unsupported"), nil
 		}
 	default:
 		return ExecApplyResult{}, fmt.Errorf("unsupported pending exec kind: %s", pending.ExecKind)
@@ -1848,6 +1872,137 @@ func subagentTypeProtoFromString(raw string) *agentv1.SubagentType {
 				Custom: &agentv1.SubagentTypeCustom{Name: strings.TrimSpace(raw)},
 			},
 		}
+	}
+}
+
+// applyLegacyShellResult 把旧版一次性 ShellResult 归一为流式 shell 的完成态产物。
+func applyLegacyShellResult(result ExecApplyResult, pending runtimecore.PendingExec, legacy *agentv1.ShellResult) ExecApplyResult {
+	if legacy == nil {
+		return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result payload is empty")
+	}
+	normalized := normalizeLegacyShellResultForReplay(legacy)
+	result.IsTerminal = true
+	result.ToolCall = buildShellResultToolCall(pending.ToolCallID, pending.ArgsJSON, normalized)
+	switch item := normalized.GetResult().(type) {
+	case *agentv1.ShellResult_Success:
+		if item.Success == nil {
+			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result success payload is empty")
+		}
+		result.ToolResultPayload = summarizeLegacyShellOutput(item.Success.GetStdout(), item.Success.GetStderr(), fmt.Sprintf("shell exited with code=%d", item.Success.GetExitCode()))
+		if normalized.GetIsBackground() || item.Success.GetShellId() != 0 {
+			result.ToolResultPayload = summarizeLegacyShellOutput(item.Success.GetStdout(), item.Success.GetStderr(), fmt.Sprintf("shell backgrounded: %d", item.Success.GetShellId()))
+		}
+	case *agentv1.ShellResult_Failure:
+		if item.Failure == nil {
+			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result failure payload is empty")
+		}
+		result.ToolResultPayload = summarizeLegacyShellOutput(item.Failure.GetStdout(), item.Failure.GetStderr(), fmt.Sprintf("shell exited with code=%d", item.Failure.GetExitCode()))
+	case *agentv1.ShellResult_Timeout:
+		if item.Timeout == nil {
+			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result timeout payload is empty")
+		}
+		result.ToolResultPayload = fmt.Sprintf("shell timed out after %dms", item.Timeout.GetTimeoutMs())
+	case *agentv1.ShellResult_SpawnError:
+		if item.SpawnError == nil {
+			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result spawn_error payload is empty")
+		}
+		result.ToolResultPayload = fmt.Sprintf("shell spawn failed: %s", strings.TrimSpace(item.SpawnError.GetError()))
+	case *agentv1.ShellResult_Rejected:
+		if item.Rejected == nil {
+			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result rejected payload is empty")
+		}
+		result.ToolResultPayload = fmt.Sprintf("shell rejected: %s", strings.TrimSpace(item.Rejected.GetReason()))
+	case *agentv1.ShellResult_PermissionDenied:
+		if item.PermissionDenied == nil {
+			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result permission_denied payload is empty")
+		}
+		result.ToolResultPayload = fmt.Sprintf("shell permission denied: %s", strings.TrimSpace(item.PermissionDenied.GetError()))
+	default:
+		return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result variant is empty or unsupported")
+	}
+	return result
+}
+
+func normalizeLegacyShellResultForReplay(result *agentv1.ShellResult) *agentv1.ShellResult {
+	cloned, ok := proto.Clone(result).(*agentv1.ShellResult)
+	if !ok || cloned == nil {
+		return result
+	}
+	switch item := cloned.GetResult().(type) {
+	case *agentv1.ShellResult_Success:
+		if item.Success != nil {
+			item.Success.Stdout, item.Success.Stderr = truncateShellStreamsForReplay(item.Success.GetStdout(), item.Success.GetStderr())
+			item.Success.InterleavedOutput = buildShellInterleavedOutput(item.Success.GetStdout(), item.Success.GetStderr())
+		}
+	case *agentv1.ShellResult_Failure:
+		if item.Failure != nil {
+			item.Failure.Stdout, item.Failure.Stderr = truncateShellStreamsForReplay(item.Failure.GetStdout(), item.Failure.GetStderr())
+			item.Failure.InterleavedOutput = buildShellInterleavedOutput(item.Failure.GetStdout(), item.Failure.GetStderr())
+		}
+	}
+	return cloned
+}
+
+func summarizeLegacyShellOutput(stdout string, stderr string, fallback string) string {
+	if output := summarizeCapturedShellProtocolOutput(stdout, stderr); output != "" {
+		return output
+	}
+	return fallback
+}
+
+func summarizeCapturedShellProtocolOutput(stdout string, stderr string) string {
+	output := summarizeShellTerminalPayload(stdout, stderr, nil, false)
+	if output == "shell completed without captured output" {
+		return ""
+	}
+	return output
+}
+
+func buildSyntheticShellProtocolFailure(result ExecApplyResult, pending runtimecore.PendingExec, reason string) ExecApplyResult {
+	message := "shell protocol error: " + strings.TrimSpace(reason)
+	stdout, stderr := truncateShellStreamsForReplay(pending.StdoutBuffer, pending.StderrBuffer)
+	result.ToolResultPayload = message
+	if captured := summarizeCapturedShellProtocolOutput(stdout, stderr); captured != "" {
+		result.ToolResultPayload = captured + "\n\n" + message
+	}
+	if strings.TrimSpace(stderr) == "" {
+		stderr = message
+	} else {
+		stderr += "\n" + message
+	}
+	args := decodeShellArgsForResult(pending.ArgsJSON)
+	result.ToolCall = buildShellResultToolCall(pending.ToolCallID, pending.ArgsJSON, &agentv1.ShellResult{
+		Result: &agentv1.ShellResult_Failure{
+			Failure: &agentv1.ShellFailure{
+				Command:           args.Command,
+				WorkingDirectory:  args.WorkingDirectory,
+				ExitCode:          -1,
+				Stdout:            stdout,
+				Stderr:            stderr,
+				InterleavedOutput: buildShellInterleavedOutput(stdout, stderr),
+			},
+		},
+	})
+	result.IsTerminal = true
+	return result
+}
+
+func buildShellResultToolCall(toolCallID string, argsJSON []byte, result *agentv1.ShellResult) *agentv1.ToolCall {
+	args := decodeShellArgsForResult(argsJSON)
+	return &agentv1.ToolCall{
+		Tool: &agentv1.ToolCall_ShellToolCall{
+			ShellToolCall: &agentv1.ShellToolCall{
+				Args: &agentv1.ShellArgs{
+					Command:          args.Command,
+					WorkingDirectory: args.WorkingDirectory,
+					Timeout:          shellTimeoutFromArgs(args),
+					ToolCallId:       toolCallID,
+					Description:      stringPtr(strings.TrimSpace(args.Description)),
+				},
+				Result:      result,
+				Description: stringPtr(strings.TrimSpace(args.Description)),
+			},
+		},
 	}
 }
 

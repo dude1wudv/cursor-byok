@@ -39,4 +39,7 @@
 - 新建子代理任务必须声明 `task_role`：`simple_explore`（简单定位，Luna / Low）、`medium_explore`（中等调查，Terra / Medium）或 `complex_debug`（复杂调试，Sol / Medium）。定位阶段不要使用 Sol High；父代理使用 Sol Medium 做综合。
 - `model` 可以省略；省略时由服务端按配置列表顺序选择勾选该角色的第一个模型。显式 model 优先，但必须是允许作为子代理的适配器。
 - 未显式指定 thinking_effort 时按角色使用 simple=low、medium=medium、complex=medium；不要无脑继承父级 High。显式 effort 才覆盖默认值。
-- 只有 complex_debug 子代理可以继续调用 Task，且只能派 simple_explore 或 medium_explore；simple/medium 子代理不可调用 Task。
+- `complex_debug` 子代理保留受控嵌套能力，只能派 `simple_explore` 或 `medium_explore`；`simple_explore` 和 depth=3 子代理不可调用 Task。
+- depth=2 的只读 `medium_explore` 仅在长文件、多相关文件、跨模块调用链或直接读取会显著占用上下文时，最多派发 1 个只读三级；1–2 个明确文件必须自行读取，不得派发。
+- 三级类型优先使用 `longContextRead`；专用渠道明确不可用时才回退 `explore`。三级角色只能是 `simple_explore` 或 `medium_explore`，并必须要求其仅回传候选文件、关键行段、模块关系和未确认点，不复制大段源码。
+- 三级返回后，二级必须用 Read 精准读取其引用区段并交叉验证；不得直接转述三级报告，也不得把三级成功当作自身任务完成。

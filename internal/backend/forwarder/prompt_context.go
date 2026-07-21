@@ -66,11 +66,14 @@ func collectCurrentTurnPromptContextKeys(conversation *ConversationFile) map[str
 		return keys
 	}
 	for _, entry := range conversation.Entries {
-		if entry.TurnSeq != currentTurnSeq || strings.TrimSpace(entry.Kind) != "prompt_context" {
+		if strings.TrimSpace(entry.Kind) != "prompt_context" {
 			continue
 		}
 		var payload promptContextEntryPayload
 		if err := json.Unmarshal(entry.Payload, &payload); err != nil {
+			continue
+		}
+		if entry.TurnSeq != currentTurnSeq && strings.TrimSpace(payload.Source) != promptContextSourceSubagentContract {
 			continue
 		}
 		context := normalizePromptContextMessage(PromptContextMessage{

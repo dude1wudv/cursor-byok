@@ -12,8 +12,8 @@ import (
 const shellTerminalRecoveryGrace = 1500 * time.Millisecond
 
 const (
-	shellRecoveryReasonForegroundDeadline = "foreground_deadline_exceeded"
-	shellRecoveryReasonTransportClosed    = "transport_closed_without_terminal"
+	shellRecoveryReasonForegroundDeadline = "foreground_deadline"
+	shellRecoveryReasonTransportClosed    = "transport_closed"
 )
 
 func initializePendingExecForTracking(pending runtimecore.PendingExec) runtimecore.PendingExec {

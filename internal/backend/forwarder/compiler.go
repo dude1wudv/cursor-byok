@@ -54,7 +54,7 @@ func (compiler *DefaultPromptCompiler) Compile(conversation *ConversationFile, m
 	if err != nil {
 		return CompiledConversation{}, err
 	}
-	tools, _, err := compiler.catalog.Load(normalizedMode, subagentTypeName)
+	tools, _, err := loadToolCatalogForConversation(compiler.catalog, normalizedMode, conversation)
 	if err != nil {
 		return CompiledConversation{}, err
 	}
@@ -113,11 +113,7 @@ func (compiler *DefaultPromptCompiler) DerivePromptContexts(conversation *Conver
 	if err != nil {
 		return nil, err
 	}
-	subagentTypeName := ""
-	if conversation != nil {
-		subagentTypeName = conversation.SubagentTypeName
-	}
-	_, toolNames, err := compiler.catalog.Load(normalizedMode, subagentTypeName)
+	_, toolNames, err := loadToolCatalogForConversation(compiler.catalog, normalizedMode, conversation)
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +144,21 @@ func (compiler *DefaultPromptCompiler) DerivePromptContexts(conversation *Conver
 		candidates[index].Persist = true
 	}
 	return filterCurrentTurnPromptContexts(conversation, candidates), nil
+}
+
+func loadToolCatalogForConversation(catalog ToolCatalog, mode agentv1.AgentMode, conversation *ConversationFile) ([]json.RawMessage, []string, error) {
+	subagentTypeName := ""
+	subagentRole := ""
+	if conversation != nil {
+		subagentTypeName = conversation.SubagentTypeName
+		subagentRole = conversation.SubagentRole
+	}
+	if roleAware, ok := catalog.(interface {
+		LoadForConversation(agentv1.AgentMode, string, string) ([]json.RawMessage, []string, error)
+	}); ok {
+		return roleAware.LoadForConversation(mode, subagentTypeName, subagentRole)
+	}
+	return catalog.Load(mode, subagentTypeName)
 }
 
 func filterTaskToolAtMaximumSubagentDepth(conversation *ConversationFile, tools []json.RawMessage, toolNames []string) ([]json.RawMessage, []string, error) {
