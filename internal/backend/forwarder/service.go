@@ -42,6 +42,9 @@ const (
 	defaultSummaryCompletedThought = "Chat context summarized"
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
+	shellRejectionLocalBlockLimit  = 2
+	shellRejectionLoopGuardSource  = "shell_rejection_loop_guard"
+	shellRejectionLoopGuardText    = "The same Shell command was rejected twice during this turn. Do not issue that command again. Use a materially different command or another tool; if no safe alternative exists, explain the blocker and finish the turn."
 
 	runtimeThinkingEffortParameterID = "thinking_effort"
 )
@@ -1122,7 +1125,11 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	if intent.ExecClientMessage == nil {
 		return fmt.Errorf("exec client message is required")
 	}
-	pending, found := selectPendingExec(intent.ExecClientMessage.GetExecId(), intent.ExecClientMessage.GetId(), stream)
+	pending, found, correlationMismatch := selectPendingExecStrict(intent.ExecClientMessage.GetExecId(), intent.ExecClientMessage.GetId(), stream)
+	if correlationMismatch {
+		service.recordExecCorrelationMismatch(stream, intent.ExecClientMessage)
+		return fmt.Errorf("exec correlation mismatch: exec_id and message_id identify different pending executions")
+	}
 	if !found {
 		if intent.ExecClientMessage.GetSubagentResult() != nil {
 			if finalizing, ok := selectPendingSubagentFinalization(intent.ExecClientMessage.GetExecId(), intent.ExecClientMessage.GetId(), stream); ok {
@@ -1171,6 +1178,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return nil
 	}
 	service.logShellTerminalResult(stream, pending, intent.ExecClientMessage)
+	if err := service.recordShellRejection(stream, pending, intent.ExecClientMessage); err != nil {
+		return err
+	}
 	if strings.TrimSpace(pending.ExecKind) == "subagent" {
 		return service.finalizeSubagentExecResult(stream, pending, intent.ExecClientMessage, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
 	}
@@ -1220,13 +1230,337 @@ func (service *Service) logShellTerminalResult(stream *ActiveStream, pending run
 	if service == nil || service.debug == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
 		return
 	}
+	reason, rejectionClass := shellTerminalRejection(message)
+	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
+	providerItemID, providerCallID, providerStatus := providerToolCorrelation(stream, pending.ToolCallID)
 	service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_terminal_result", map[string]any{
-		"source":       shellTerminalResultSource(message),
-		"tool_call_id": strings.TrimSpace(pending.ToolCallID),
-		"exec_id":      strings.TrimSpace(pending.ExecID),
-		"message_id":   pending.MessageID,
-		"stream_state": strings.TrimSpace(pending.StreamState),
+		"source":           shellTerminalResultSource(message),
+		"terminal_variant": shellTerminalVariant(message),
+		"provider_pass":    pending.ProviderPass,
+		"model_call_id":    strings.TrimSpace(pending.ModelCallID),
+		"provider_item_id": providerItemID,
+		"provider_call_id": providerCallID,
+		"provider_status":  providerStatus,
+		"tool_call_id":     strings.TrimSpace(pending.ToolCallID),
+		"exec_id":          strings.TrimSpace(pending.ExecID),
+		"message_id":       pending.MessageID,
+		"stream_state":     strings.TrimSpace(pending.StreamState),
+		"dispatch_order":   "started_then_checkpoint_then_exec",
+		"command_hash":     commandHash,
+		"args_hash":        argsHash,
+		"cwd_hash":         cwdHash,
+		"rejection_class":  rejectionClass,
+		"rejected_reason":  sanitizeShellRejectedReason(reason),
 	})
+}
+
+type shellRejectionRecord struct {
+	Fingerprint string
+	ToolName    string
+	CommandHash string
+	CWDHash     string
+	Class       string
+	Count       int
+	LocalBlocks int
+}
+
+func (service *Service) recordShellRejection(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
+	if service == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+		return nil
+	}
+	reason, rejectionClass := shellTerminalRejection(message)
+	if rejectionClass == "" {
+		return nil
+	}
+	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
+	providerItemID, providerCallID, providerStatus := providerToolCorrelation(stream, pending.ToolCallID)
+	fingerprint := planContentHash(strings.Join([]string{"Shell", commandHash, cwdHash, rejectionClass}, "\x00"))
+	count := currentTurnShellRejectionCount(stream, fingerprint) + 1
+	values := map[string]any{
+		"source":           "shell_terminal",
+		"provider_pass":    pending.ProviderPass,
+		"model_call_id":    strings.TrimSpace(pending.ModelCallID),
+		"provider_item_id": providerItemID,
+		"provider_call_id": providerCallID,
+		"provider_status":  providerStatus,
+		"tool_call_id":     strings.TrimSpace(pending.ToolCallID),
+		"exec_id":          strings.TrimSpace(pending.ExecID),
+		"message_id":       pending.MessageID,
+		"terminal_variant": shellTerminalVariant(message),
+		"rejection_class":  rejectionClass,
+		"rejected_reason":  sanitizeShellRejectedReason(reason),
+		"fingerprint":      fingerprint,
+		"tool_name":        "Shell",
+		"command_hash":     commandHash,
+		"args_hash":        argsHash,
+		"cwd_hash":         cwdHash,
+		"count":            count,
+		"reminder_active":  count >= 2,
+		"reminder_source":  shellRejectionLoopGuardSource,
+	}
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_rejection_fingerprint", values),
+	})
+	return err
+}
+
+func shellTerminalRejection(message *agentv1.ExecClientMessage) (string, string) {
+	if message == nil {
+		return "", ""
+	}
+	if legacy := message.GetShellResult(); legacy != nil {
+		switch item := legacy.GetResult().(type) {
+		case *agentv1.ShellResult_Rejected:
+			if item.Rejected != nil {
+				return item.Rejected.GetReason(), classifyShellRejection(item.Rejected.GetReason())
+			}
+		case *agentv1.ShellResult_PermissionDenied:
+			if item.PermissionDenied != nil {
+				return item.PermissionDenied.GetError(), "permission"
+			}
+		}
+		return "", ""
+	}
+	stream := message.GetShellStream()
+	if stream == nil {
+		return "", ""
+	}
+	switch event := stream.GetEvent().(type) {
+	case *agentv1.ShellStream_Rejected:
+		if event.Rejected != nil {
+			return event.Rejected.GetReason(), classifyShellRejection(event.Rejected.GetReason())
+		}
+	case *agentv1.ShellStream_PermissionDenied:
+		if event.PermissionDenied != nil {
+			return event.PermissionDenied.GetError(), "permission"
+		}
+	}
+	return "", ""
+}
+
+func classifyShellRejection(reason string) string {
+	normalized := strings.ToLower(strings.TrimSpace(reason))
+	switch {
+	case strings.Contains(normalized, "skip"):
+		return "skipped"
+	case strings.Contains(normalized, "permission"), strings.Contains(normalized, "denied"):
+		return "permission"
+	default:
+		return "policy"
+	}
+}
+
+func shellTerminalVariant(message *agentv1.ExecClientMessage) string {
+	if message == nil {
+		return "synthetic_protocol_error"
+	}
+	if legacy := message.GetShellResult(); legacy != nil {
+		switch legacy.GetResult().(type) {
+		case *agentv1.ShellResult_Rejected:
+			return "legacy_rejected"
+		case *agentv1.ShellResult_PermissionDenied:
+			return "legacy_permission_denied"
+		case *agentv1.ShellResult_Success:
+			return "legacy_success"
+		case *agentv1.ShellResult_Failure:
+			return "legacy_failure"
+		case *agentv1.ShellResult_Timeout:
+			return "legacy_timeout"
+		case *agentv1.ShellResult_SpawnError:
+			return "legacy_spawn_error"
+		default:
+			return "legacy_unknown"
+		}
+	}
+	stream := message.GetShellStream()
+	if stream == nil {
+		return "synthetic_protocol_error"
+	}
+	switch stream.GetEvent().(type) {
+	case *agentv1.ShellStream_Exit:
+		return "stream_exit"
+	case *agentv1.ShellStream_Rejected:
+		return "stream_rejected"
+	case *agentv1.ShellStream_PermissionDenied:
+		return "stream_permission_denied"
+	case *agentv1.ShellStream_Backgrounded:
+		return "stream_backgrounded"
+	default:
+		return "stream_unknown"
+	}
+}
+
+func sanitizeShellRejectedReason(reason string) string {
+	const maxReasonBytes = 512
+	trimmed := strings.TrimSpace(reason)
+	if trimmed == "" {
+		return ""
+	}
+	words := strings.Fields(trimmed)
+	redactFollowing := 0
+	for index, word := range words {
+		if redactFollowing > 0 {
+			words[index] = "[redacted]"
+			redactFollowing--
+			continue
+		}
+		normalized := strings.ToLower(word)
+		switch {
+		case strings.HasPrefix(normalized, "authorization:"):
+			words[index] = "[redacted]"
+			redactFollowing = 2
+		case normalized == "bearer":
+			words[index] = "[redacted]"
+			redactFollowing = 1
+		case strings.HasPrefix(normalized, "bearer"), strings.HasPrefix(normalized, "sk-"):
+			words[index] = "[redacted]"
+		case strings.Contains(normalized, "api_key="), strings.Contains(normalized, "apikey="), strings.Contains(normalized, "token="), strings.Contains(normalized, "secret="), strings.Contains(normalized, "password="):
+			if separator := strings.Index(word, "="); separator >= 0 {
+				words[index] = word[:separator+1] + "[redacted]"
+			}
+		}
+	}
+	result := strings.Join(words, " ")
+	if len(result) > maxReasonBytes {
+		result = truncateProjectedUTF8(result, maxReasonBytes-len("…")) + "…"
+	}
+	return result
+}
+
+func providerToolCorrelation(stream *ActiveStream, toolCallID string) (string, string, string) {
+	if stream == nil || strings.TrimSpace(toolCallID) == "" {
+		return "", "", ""
+	}
+	toolCallID = strings.TrimSpace(toolCallID)
+	stream.mu.Lock()
+	conversation := stream.CheckpointConversation
+	entries := []HistoryEntry(nil)
+	if conversation != nil {
+		entries = append(entries, conversation.Entries...)
+	}
+	stream.mu.Unlock()
+	for index := len(entries) - 1; index >= 0; index-- {
+		entry := entries[index]
+		if strings.TrimSpace(entry.Kind) != "tool_call" || strings.TrimSpace(entry.ToolCallID) != toolCallID {
+			continue
+		}
+		var payload toolCallEntryPayload
+		if json.Unmarshal(entry.Payload, &payload) == nil {
+			return strings.TrimSpace(payload.ProviderItemID), strings.TrimSpace(payload.ProviderCallID), strings.TrimSpace(payload.ProviderStatus)
+		}
+	}
+	return "", "", ""
+}
+
+func shellInvocationHashes(argsJSON []byte) (string, string, string) {
+	var args map[string]any
+	_ = json.Unmarshal(argsJSON, &args)
+	command := readStringMapValue(args, "command")
+	cwd := readStringMapValue(args, "working_directory", "workingDirectory")
+	normalizedCommand := strings.ToLower(strings.Join(strings.Fields(command), " "))
+	normalizedCWD := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(cwd), "\\", "/"))
+	return planContentHash(normalizedCommand), planContentHash(strings.TrimSpace(string(argsJSON))), planContentHash(normalizedCWD)
+}
+
+func currentTurnShellRejectionCount(stream *ActiveStream, fingerprint string) int {
+	for _, record := range currentTurnShellRejectionRecords(stream) {
+		if record.Fingerprint == strings.TrimSpace(fingerprint) {
+			return record.Count
+		}
+	}
+	return 0
+}
+
+func currentTurnShellRejectionRecords(stream *ActiveStream) []shellRejectionRecord {
+	if stream == nil {
+		return nil
+	}
+	stream.mu.Lock()
+	conversation := stream.CheckpointConversation
+	turnSeq := stream.TurnSeq
+	entries := []HistoryEntry(nil)
+	if conversation != nil {
+		entries = append(entries, conversation.Entries...)
+	}
+	stream.mu.Unlock()
+	records := make(map[string]shellRejectionRecord)
+	for _, entry := range entries {
+		if entry.TurnSeq != turnSeq || strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if json.Unmarshal(entry.Payload, &payload) != nil {
+			continue
+		}
+		fingerprint := strings.TrimSpace(fmt.Sprint(payload.Value["fingerprint"]))
+		if fingerprint == "" || fingerprint == "<nil>" {
+			continue
+		}
+		record := records[fingerprint]
+		record.Fingerprint = fingerprint
+		switch strings.TrimSpace(payload.Type) {
+		case "shell_rejection_fingerprint":
+			record.ToolName = strings.TrimSpace(fmt.Sprint(payload.Value["tool_name"]))
+			record.CommandHash = strings.TrimSpace(fmt.Sprint(payload.Value["command_hash"]))
+			record.CWDHash = strings.TrimSpace(fmt.Sprint(payload.Value["cwd_hash"]))
+			record.Class = strings.TrimSpace(fmt.Sprint(payload.Value["rejection_class"]))
+			record.Count++
+		case "shell_rejection_local_block":
+			record.LocalBlocks++
+		default:
+			continue
+		}
+		records[fingerprint] = record
+	}
+	result := make([]shellRejectionRecord, 0, len(records))
+	for _, record := range records {
+		result = append(result, record)
+	}
+	return result
+}
+
+func matchingShellRejectionRecord(stream *ActiveStream, invocation runtimecore.ToolInvocation) (shellRejectionRecord, bool) {
+	if strings.TrimSpace(invocation.ToolName) != "Shell" {
+		return shellRejectionRecord{}, false
+	}
+	commandHash, _, cwdHash := shellInvocationHashes(invocation.ArgsJSON)
+	for _, record := range currentTurnShellRejectionRecords(stream) {
+		if record.Count >= 2 && record.ToolName == "Shell" && record.CommandHash == commandHash && record.CWDHash == cwdHash {
+			return record, true
+		}
+	}
+	return shellRejectionRecord{}, false
+}
+
+func currentTurnNeedsShellRejectionReminder(stream *ActiveStream) bool {
+	for _, record := range currentTurnShellRejectionRecords(stream) {
+		if record.Count >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+func (service *Service) recordShellLocalBlock(stream *ActiveStream, invocation runtimecore.ToolInvocation, record shellRejectionRecord) error {
+	if service == nil || stream == nil {
+		return nil
+	}
+	_, argsHash, _ := shellInvocationHashes(invocation.ArgsJSON)
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_rejection_local_block", map[string]any{
+			"source":          "pre_dispatch",
+			"provider_pass":   currentProviderPass(stream),
+			"model_call_id":   strings.TrimSpace(invocation.ModelCallID),
+			"tool_call_id":    strings.TrimSpace(invocation.CallID),
+			"fingerprint":     record.Fingerprint,
+			"rejection_class": record.Class,
+			"command_hash":    record.CommandHash,
+			"args_hash":       argsHash,
+			"cwd_hash":        record.CWDHash,
+			"block_count":     record.LocalBlocks + 1,
+		}),
+	})
+	return err
 }
 
 func shellTerminalResultSource(message *agentv1.ExecClientMessage) string {
@@ -1909,6 +2243,15 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		return service.failStream(stream, "unknown", err)
 	}
 	compiled = guardCompiledConversationForProvider(compiled)
+	if currentTurnNeedsShellRejectionReminder(stream) {
+		context := newPromptContextMessage(
+			shellRejectionLoopGuardSource,
+			modeladapter.Message{Role: "user", Content: wrapSystemReminder(shellRejectionLoopGuardText)},
+			false,
+		)
+		compiled.Messages = append(compiled.Messages, context.Message)
+		compiled.CompileSummary = strings.TrimSpace(compiled.CompileSummary + " latest_suffix=" + context.Source)
+	}
 	if compacted, compactErr := service.maybeCompactBeforeProvider(stream, conversation, compiled); compactErr != nil {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", compactErr)
@@ -2201,10 +2544,60 @@ func (service *Service) runProviderStream(stream *ActiveStream, token uint64, ct
 	})
 }
 
+func (service *Service) toolInvocationAlreadyHandled(stream *ActiveStream, toolCallID string) bool {
+	if stream == nil || strings.TrimSpace(toolCallID) == "" {
+		return false
+	}
+	toolCallID = strings.TrimSpace(toolCallID)
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	providerPass := stream.ProviderPassCount
+	for _, pending := range stream.PendingExecs {
+		if pending.ProviderPass == providerPass && strings.TrimSpace(pending.ToolCallID) == toolCallID {
+			return true
+		}
+	}
+	for _, pending := range stream.PendingInteractions {
+		if strings.TrimSpace(pending.ToolCallID) == toolCallID {
+			return true
+		}
+	}
+	if stream.CheckpointConversation == nil {
+		return false
+	}
+	for _, entry := range stream.CheckpointConversation.Entries {
+		if entry.TurnSeq != stream.TurnSeq || strings.TrimSpace(entry.ToolCallID) != toolCallID {
+			continue
+		}
+		switch strings.TrimSpace(entry.Kind) {
+		case "tool_call", "tool_result":
+			return true
+		}
+	}
+	return false
+}
+
 // handleToolInvocation 把模型产生的工具意图转成 exec/interaction 请求并下发给客户端。
 func (service *Service) handleToolInvocation(stream *ActiveStream, invocation runtimecore.ToolInvocation) error {
 	if err := providerLoopInterruptErr(nil, stream, invocation.ModelCallID); err != nil {
 		return err
+	}
+	if record, blocked := matchingShellRejectionRecord(stream, invocation); blocked {
+		stream.mu.Lock()
+		stream.ToolInvocationCount++
+		stream.UpdatedAt = time.Now().UTC()
+		stream.mu.Unlock()
+		if err := service.recordShellLocalBlock(stream, invocation, record); err != nil {
+			return err
+		}
+		cause := fmt.Errorf("repeated Shell command was blocked locally after %d matching %s rejections; use a different command or tool", record.Count, record.Class)
+		if err := service.completePreDispatchToolError(stream, invocation, nil, false, false, cause); err != nil {
+			return err
+		}
+		if record.LocalBlocks+1 >= shellRejectionLocalBlockLimit {
+			return providerTerminalError{cause: fmt.Errorf("Shell rejection loop stopped after %d local blocks for the same command fingerprint", record.LocalBlocks+1)}
+		}
+		return nil
 	}
 	invocation = service.rewriteDirectMCPToolInvocation(stream, invocation)
 	invocation = service.normalizeCallMCPToolInvocation(stream, invocation)
@@ -2503,19 +2896,30 @@ func (service *Service) recordExecDispatchMetadata(stream *ActiveStream, pending
 		return
 	}
 	toolName := strings.TrimSpace(deriveToolNameFromPendingExec(pending))
+	commandHash, argsHash, cwdHash := "", planContentHash(strings.TrimSpace(string(pending.ArgsJSON))), ""
+	if toolName == "Shell" {
+		commandHash, argsHash, cwdHash = shellInvocationHashes(pending.ArgsJSON)
+	}
+	providerItemID, providerCallID, providerStatus := providerToolCorrelation(stream, pending.ToolCallID)
 	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
 		newMetadataEntry(stream.TurnSeq, stream.RequestID, "exec_dispatch", map[string]any{
-			"tool_call_id":    pending.ToolCallID,
-			"message_id":      pending.MessageID,
-			"exec_id":         pending.ExecID,
-			"exec_kind":       pending.ExecKind,
-			"provider_pass":   pending.ProviderPass,
-			"tool_name":       toolName,
-			"model_call_id":   pending.ModelCallID,
-			"buffered":        buffered,
-			"started_emitted": startedEmitted,
-			"dispatch_order":  strings.TrimSpace(dispatchOrder),
-			"opened_at":       pending.OpenedAt,
+			"tool_call_id":     pending.ToolCallID,
+			"provider_item_id": providerItemID,
+			"provider_call_id": providerCallID,
+			"provider_status":  providerStatus,
+			"message_id":       pending.MessageID,
+			"exec_id":          pending.ExecID,
+			"exec_kind":        pending.ExecKind,
+			"provider_pass":    pending.ProviderPass,
+			"tool_name":        toolName,
+			"model_call_id":    pending.ModelCallID,
+			"command_hash":     commandHash,
+			"args_hash":        argsHash,
+			"cwd_hash":         cwdHash,
+			"buffered":         buffered,
+			"started_emitted":  startedEmitted,
+			"dispatch_order":   strings.TrimSpace(dispatchOrder),
+			"opened_at":        pending.OpenedAt,
 		}),
 	}); err != nil {
 		log.Printf("forwarder exec dispatch metadata failed request_id=%s tool_call_id=%s message_id=%d err=%v", strings.TrimSpace(stream.RequestID), strings.TrimSpace(pending.ToolCallID), pending.MessageID, err)
@@ -3661,19 +4065,84 @@ func currentStreamMode(stream *ActiveStream) agentv1.AgentMode {
 
 // selectPendingExec 按 exec_id 或 message_id 在当前流里查找挂起执行桥。
 func selectPendingExec(execID string, messageID uint32, stream *ActiveStream) (runtimecore.PendingExec, bool) {
+	pending, found, _ := selectPendingExecStrict(execID, messageID, stream)
+	return pending, found
+}
+
+func selectPendingExecStrict(execID string, messageID uint32, stream *ActiveStream) (runtimecore.PendingExec, bool, bool) {
+	if stream == nil {
+		return runtimecore.PendingExec{}, false, false
+	}
+	execID = strings.TrimSpace(execID)
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	if item, ok := stream.PendingExecs[strings.TrimSpace(execID)]; ok {
-		return item, true
-	}
+	execPending, execFound := stream.PendingExecs[execID]
+	var messagePending runtimecore.PendingExec
+	messageFound := false
 	if messageID != 0 {
 		for _, item := range stream.PendingExecs {
 			if item.MessageID == messageID {
-				return item, true
+				messagePending = item
+				messageFound = true
+				break
 			}
 		}
 	}
-	return runtimecore.PendingExec{}, false
+	if execID != "" && messageID != 0 && (!execFound || !messageFound || execPending.ExecID != messagePending.ExecID) {
+		return runtimecore.PendingExec{}, false, true
+	}
+	if execFound {
+		return execPending, true, false
+	}
+	if messageFound {
+		return messagePending, true, false
+	}
+	return runtimecore.PendingExec{}, false, false
+}
+
+func (service *Service) recordExecCorrelationMismatch(stream *ActiveStream, message *agentv1.ExecClientMessage) {
+	if service == nil || stream == nil || message == nil {
+		return
+	}
+	execID := strings.TrimSpace(message.GetExecId())
+	messageID := message.GetId()
+	stream.mu.Lock()
+	providerPass := stream.ProviderPassCount
+	modelCallID := stream.CurrentModelCallID
+	execPending, execFound := stream.PendingExecs[execID]
+	var messagePending runtimecore.PendingExec
+	messageFound := false
+	for _, pending := range stream.PendingExecs {
+		if messageID != 0 && pending.MessageID == messageID {
+			messagePending = pending
+			messageFound = true
+			break
+		}
+	}
+	turnSeq := stream.TurnSeq
+	requestID := stream.RequestID
+	conversationID := stream.ConversationID
+	stream.mu.Unlock()
+	values := map[string]any{
+		"provider_pass":            providerPass,
+		"model_call_id":            strings.TrimSpace(modelCallID),
+		"received_exec_id":         execID,
+		"received_message_id":      messageID,
+		"exec_id_found":            execFound,
+		"message_id_found":         messageFound,
+		"exec_tool_call_id":        strings.TrimSpace(execPending.ToolCallID),
+		"message_tool_call_id":     strings.TrimSpace(messagePending.ToolCallID),
+		"exec_expected_message_id": execPending.MessageID,
+		"message_expected_exec_id": strings.TrimSpace(messagePending.ExecID),
+	}
+	if _, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
+		newMetadataEntry(turnSeq, requestID, "exec_correlation_mismatch", values),
+	}); err != nil {
+		log.Printf("forwarder exec correlation mismatch metadata failed request_id=%s err=%v", requestID, err)
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), requestID, conversationID, "exec_correlation_mismatch", values)
+	}
 }
 
 func selectPendingInteraction(message *agentv1.InteractionResponse, stream *ActiveStream) (runtimecore.PendingInteraction, bool) {

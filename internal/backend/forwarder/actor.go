@@ -652,6 +652,18 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 		if event.ToolInvocation == nil {
 			return fmt.Errorf("tool invocation is required")
 		}
+		if service.toolInvocationAlreadyHandled(stream, event.ToolInvocation.CallID) {
+			if service.debug != nil {
+				service.debug.LogRuntime(context.Background(), requestID, conversationID, "duplicate_tool_completion_ignored", map[string]any{
+					"provider_pass": currentProviderPass(stream),
+					"model_call_id": modelCallID,
+					"tool_call_id":  strings.TrimSpace(event.ToolInvocation.CallID),
+					"provider_item": strings.TrimSpace(event.ToolInvocation.ProviderItemID),
+					"provider_call": strings.TrimSpace(event.ToolInvocation.ProviderCallID),
+				})
+			}
+			return nil
+		}
 		invocation := *event.ToolInvocation
 		invocation.ReasoningContent = reasoningForTool
 		invocation.ReasoningSignature = reasoningSignatureForTool

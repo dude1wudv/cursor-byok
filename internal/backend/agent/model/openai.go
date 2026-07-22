@@ -66,6 +66,99 @@ type openAIToolAccumulator struct {
 	ProviderStatus         string
 }
 
+type openAIResponsesFunctionCallSummary struct {
+	Added          int
+	ArgumentsDelta int
+	ArgumentsDone  int
+	OutputItemDone int
+	Complete       int
+	Discard        int
+}
+
+type openAIResponsesToolProtocolError struct {
+	ItemID string
+	Reason string
+}
+
+func (err *openAIResponsesToolProtocolError) Error() string {
+	if err == nil {
+		return "openai responses function call is invalid"
+	}
+	itemID := strings.TrimSpace(err.ItemID)
+	if itemID == "" {
+		itemID = "unknown"
+	}
+	return fmt.Sprintf("openai responses function call protocol error item_id=%s: %s", itemID, strings.TrimSpace(err.Reason))
+}
+
+func mergeOpenAIResponsesToolArguments(accumulator *openAIToolAccumulator, incoming string, snapshot bool) (string, error) {
+	if accumulator == nil || incoming == "" {
+		return "", nil
+	}
+	if !snapshot {
+		_, _ = accumulator.Args.WriteString(incoming)
+		return incoming, nil
+	}
+	current := accumulator.Args.String()
+	switch {
+	case current == "":
+		_, _ = accumulator.Args.WriteString(incoming)
+		return incoming, nil
+	case incoming == current, strings.HasPrefix(current, incoming):
+		return "", nil
+	case strings.HasPrefix(incoming, current):
+		delta := strings.TrimPrefix(incoming, current)
+		_, _ = accumulator.Args.WriteString(delta)
+		return delta, nil
+	default:
+		return "", fmt.Errorf("arguments snapshot conflicts with streamed prefix (streamed_bytes=%d snapshot_bytes=%d)", len(current), len(incoming))
+	}
+}
+
+func validateOpenAIResponsesToolAccumulator(accumulator *openAIToolAccumulator) error {
+	if accumulator == nil {
+		return &openAIResponsesToolProtocolError{Reason: "function call accumulator is missing"}
+	}
+	itemID := strings.TrimSpace(accumulator.ProviderItemID)
+	if strings.TrimSpace(accumulator.Name) == "" {
+		return &openAIResponsesToolProtocolError{ItemID: itemID, Reason: "tool name is empty"}
+	}
+	if strings.TrimSpace(accumulator.ProviderCallID) == "" {
+		return &openAIResponsesToolProtocolError{ItemID: itemID, Reason: "provider call_id is empty"}
+	}
+	if strings.TrimSpace(accumulator.CallID) == "" {
+		return &openAIResponsesToolProtocolError{ItemID: itemID, Reason: "namespaced call_id is empty"}
+	}
+	arguments := strings.TrimSpace(accumulator.Args.String())
+	if arguments == "" {
+		return &openAIResponsesToolProtocolError{ItemID: itemID, Reason: "arguments are empty"}
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(arguments), &object); err != nil {
+		return &openAIResponsesToolProtocolError{ItemID: itemID, Reason: fmt.Sprintf("arguments are not complete JSON: %v", err)}
+	}
+	if object == nil {
+		return &openAIResponsesToolProtocolError{ItemID: itemID, Reason: "arguments must be a JSON object"}
+	}
+	return nil
+}
+
+func withOpenAIResponsesFunctionCallSummary(payload map[string]any, summary openAIResponsesFunctionCallSummary, pending int) map[string]any {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["responses_function_calls"] = map[string]any{
+		"added":            summary.Added,
+		"arguments_delta":  summary.ArgumentsDelta,
+		"arguments_done":   summary.ArgumentsDone,
+		"output_item_done": summary.OutputItemDone,
+		"complete":         summary.Complete,
+		"discard":          summary.Discard,
+		"pending":          pending,
+	}
+	return payload
+}
+
 type openAIImageGenerationAccumulator struct {
 	CallID         string
 	ImageData      string
@@ -1080,7 +1173,9 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	}
 
 	tools := make(map[string]*openAIToolAccumulator)
+	functionCallAliases := make(map[int]string)
 	completedTools := make(map[string]struct{})
+	functionCallSummary := openAIResponsesFunctionCallSummary{}
 	imageGenerations := make(map[string]*openAIImageGenerationAccumulator)
 	completedImageGenerations := make(map[string]struct{})
 	currentModel := modelID
@@ -1125,6 +1220,24 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	toolKey := func(itemID string, outputIndex int) string {
 		if strings.TrimSpace(itemID) != "" {
 			return strings.TrimSpace(itemID)
+		}
+		return fmt.Sprintf("output:%d", outputIndex)
+	}
+	functionCallKey := func(itemID string, outputIndex int) string {
+		itemID = strings.TrimSpace(itemID)
+		if itemID != "" {
+			fallbackKey := fmt.Sprintf("output:%d", outputIndex)
+			if pending, ok := tools[fallbackKey]; ok {
+				if _, exists := tools[itemID]; !exists {
+					tools[itemID] = pending
+				}
+				delete(tools, fallbackKey)
+			}
+			functionCallAliases[outputIndex] = itemID
+			return itemID
+		}
+		if knownItemID, ok := functionCallAliases[outputIndex]; ok {
+			return knownItemID
 		}
 		return fmt.Sprintf("output:%d", outputIndex)
 	}
@@ -1261,7 +1374,8 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	}
 	fail := func(streamErr error) error {
 		finishedAt = time.Now().UTC()
-		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", currentModel, startedAt, firstEventAt, finishedAt, finishReason, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, streamErr))
+		summary := buildLLMSummaryPayload(req, "openai", currentModel, startedAt, firstEventAt, finishedAt, finishReason, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, streamErr)
+		recordLLMSummaryArtifact(req, withOpenAIResponsesFunctionCallSummary(summary, functionCallSummary, len(tools)))
 		return streamErr
 	}
 	applyUsage := func(usage *openAIResponsesUsage) {
@@ -1288,22 +1402,19 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		if accumulator == nil {
 			return nil
 		}
-		completionKey := firstNonEmptyString(key, accumulator.CallID)
-		if strings.TrimSpace(completionKey) == "" {
-			completionKey = accumulator.Name + ":" + accumulator.Args.String()
+		if err := validateOpenAIResponsesToolAccumulator(accumulator); err != nil {
+			functionCallSummary.Discard++
+			return err
 		}
+		completionKey := firstNonEmptyString(key, accumulator.ProviderItemID)
 		if _, ok := completedTools[completionKey]; ok {
 			return nil
 		}
-		if strings.TrimSpace(accumulator.CallID) != "" {
-			if _, ok := completedTools[strings.TrimSpace(accumulator.CallID)]; ok {
-				return nil
-			}
+		if _, ok := completedTools[strings.TrimSpace(accumulator.ProviderCallID)]; ok {
+			return nil
 		}
 		completedTools[completionKey] = struct{}{}
-		if strings.TrimSpace(accumulator.CallID) != "" {
-			completedTools[strings.TrimSpace(accumulator.CallID)] = struct{}{}
-		}
+		completedTools[strings.TrimSpace(accumulator.ProviderCallID)] = struct{}{}
 		emittedToolInvocation = true
 		if err := sink(ModelEvent{
 			Kind:       ModelEventKindToolLikeCompleted,
@@ -1321,6 +1432,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		}); err != nil {
 			return err
 		}
+		functionCallSummary.Complete++
 		streamIdle.MarkEffectiveContent()
 		return nil
 	}
@@ -1432,7 +1544,15 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			return nil
 		}
 		streamIdle.MarkEffectiveContent()
-		key := toolKey(firstNonEmptyString(item.ID, item.CallID), outputIndex)
+		key := functionCallKey(item.ID, outputIndex)
+		if _, ok := completedTools[key]; ok {
+			return nil
+		}
+		if providerCallID := strings.TrimSpace(item.CallID); providerCallID != "" {
+			if _, ok := completedTools[providerCallID]; ok {
+				return nil
+			}
+		}
 		accumulator, ok := tools[key]
 		if !ok {
 			accumulator = &openAIToolAccumulator{}
@@ -1447,16 +1567,14 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		if strings.TrimSpace(item.CallID) != "" {
 			accumulator.ProviderCallID = strings.TrimSpace(item.CallID)
 			accumulator.CallID = namespaceToolCallID(req.ModelCallID, item.CallID)
-		} else if strings.TrimSpace(item.ID) != "" {
-			accumulator.CallID = namespaceToolCallID(req.ModelCallID, item.ID)
 		}
 		if strings.TrimSpace(item.Name) != "" {
 			accumulator.Name = strings.TrimSpace(item.Name)
 		}
-		argsTextDelta := ""
-		if item.Arguments != "" && accumulator.Args.Len() == 0 {
-			_, _ = accumulator.Args.WriteString(item.Arguments)
-			argsTextDelta = item.Arguments
+		argsTextDelta, err := mergeOpenAIResponsesToolArguments(accumulator, item.Arguments, true)
+		if err != nil {
+			functionCallSummary.Discard++
+			return &openAIResponsesToolProtocolError{ItemID: accumulator.ProviderItemID, Reason: err.Error()}
 		}
 		if argsTextDelta != "" || (strings.TrimSpace(accumulator.Name) == "CreatePlan" && accumulator.Args.Len() > 0) {
 			if err := emitOpenAIToolProgress(sink, currentModel, accumulator, argsTextDelta); err != nil {
@@ -1527,7 +1645,12 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		payloadLine := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payloadLine == "[DONE]" {
 			if !terminalSeen {
-				return fail(fmt.Errorf("openai responses stream ended before terminal response event"))
+				return fail(&IncompleteStreamError{
+					Provider:         "openai",
+					Endpoint:         "responses",
+					DoneSeen:         true,
+					PartialToolCount: len(tools),
+				})
 			}
 			if err := flushThinkingCompleted(); err != nil {
 				return fail(err)
@@ -1556,35 +1679,54 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			}
 		case "response.output_item.added":
 			if event.Item != nil {
+				if strings.TrimSpace(event.Item.Type) == "function_call" {
+					functionCallSummary.Added++
+				}
 				if err := applyOutputItem(*event.Item, event.OutputIndex, false); err != nil {
 					return fail(err)
 				}
 			}
 		case "response.function_call_arguments.delta":
-			key := toolKey(event.ItemID, event.OutputIndex)
+			functionCallSummary.ArgumentsDelta++
+			key := functionCallKey(event.ItemID, event.OutputIndex)
 			accumulator, ok := tools[key]
 			if !ok {
 				accumulator = &openAIToolAccumulator{}
 				tools[key] = accumulator
 			}
-			if event.Delta != "" {
-				_, _ = accumulator.Args.WriteString(event.Delta)
+			if itemID := strings.TrimSpace(event.ItemID); itemID != "" {
+				accumulator.ProviderItemID = itemID
+			}
+			argsTextDelta, err := mergeOpenAIResponsesToolArguments(accumulator, event.Delta, false)
+			if err != nil {
+				functionCallSummary.Discard++
+				return fail(&openAIResponsesToolProtocolError{ItemID: accumulator.ProviderItemID, Reason: err.Error()})
+			}
+			if argsTextDelta != "" {
 				streamIdle.MarkEffectiveContent()
-				if err := emitOpenAIToolProgress(sink, currentModel, accumulator, event.Delta); err != nil {
+				if err := emitOpenAIToolProgress(sink, currentModel, accumulator, argsTextDelta); err != nil {
 					return fail(err)
 				}
 			}
 		case "response.function_call_arguments.done":
-			key := toolKey(event.ItemID, event.OutputIndex)
+			functionCallSummary.ArgumentsDone++
+			key := functionCallKey(event.ItemID, event.OutputIndex)
 			accumulator, ok := tools[key]
 			if !ok {
 				accumulator = &openAIToolAccumulator{}
 				tools[key] = accumulator
 			}
-			if event.Arguments != "" && accumulator.Args.Len() == 0 {
-				_, _ = accumulator.Args.WriteString(event.Arguments)
+			if itemID := strings.TrimSpace(event.ItemID); itemID != "" {
+				accumulator.ProviderItemID = itemID
+			}
+			argsTextDelta, err := mergeOpenAIResponsesToolArguments(accumulator, event.Arguments, true)
+			if err != nil {
+				functionCallSummary.Discard++
+				return fail(&openAIResponsesToolProtocolError{ItemID: accumulator.ProviderItemID, Reason: err.Error()})
+			}
+			if argsTextDelta != "" {
 				streamIdle.MarkEffectiveContent()
-				if err := emitOpenAIToolProgress(sink, currentModel, accumulator, event.Arguments); err != nil {
+				if err := emitOpenAIToolProgress(sink, currentModel, accumulator, argsTextDelta); err != nil {
 					return fail(err)
 				}
 			}
@@ -1614,6 +1756,9 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			}
 		case "response.output_item.done":
 			if event.Item != nil {
+				if strings.TrimSpace(event.Item.Type) == "function_call" {
+					functionCallSummary.OutputItemDone++
+				}
 				if err := applyOutputItem(*event.Item, event.OutputIndex, true); err != nil {
 					return fail(err)
 				}
@@ -1661,8 +1806,9 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 				}
 			}
 			if event.Response != nil {
+				responseCompleted := strings.TrimSpace(event.Type) == "response.completed"
 				for index, item := range event.Response.Output {
-					completeItem := !responseIncomplete || strings.TrimSpace(item.Status) == "completed"
+					completeItem := responseCompleted && strings.TrimSpace(item.Status) == "completed"
 					if err := applyOutputItem(item, index, completeItem); err != nil {
 						return fail(err)
 					}
@@ -1689,23 +1835,20 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		}
 		return fail(err)
 	}
-	// response.incomplete 可能在 function_call_arguments.done 之前终止，
-	// 此时 accumulator 仍在 tools 中。把它显式收口为一次工具意图，交给
-	// forwarder 的 pre-dispatch 校验/错误恢复，而不是留下客户端永远 pending。
-	for key, accumulator := range tools {
-		if accumulator == nil {
-			continue
-		}
-		if strings.TrimSpace(accumulator.CallID) == "" {
-			accumulator.CallID = namespaceToolCallID(req.ModelCallID, key)
-		}
-		if err := completeTool(key, accumulator); err != nil {
-			return fail(err)
-		}
-	}
-	tools = make(map[string]*openAIToolAccumulator)
 	if !terminalSeen {
-		return fail(fmt.Errorf("openai responses stream ended before terminal response event"))
+		return fail(&IncompleteStreamError{
+			Provider:         "openai",
+			Endpoint:         "responses",
+			PartialToolCount: len(tools),
+		})
+	}
+	if len(tools) > 0 {
+		functionCallSummary.Discard += len(tools)
+		pendingCount := len(tools)
+		tools = make(map[string]*openAIToolAccumulator)
+		if !responseIncomplete {
+			return fail(&openAIResponsesToolProtocolError{Reason: fmt.Sprintf("terminal response left %d function call(s) incomplete", pendingCount)})
+		}
 	}
 	if err := flushThinkingCompleted(); err != nil {
 		return fail(err)
@@ -1714,7 +1857,8 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		return fail(err)
 	}
 	finishedAt = time.Now().UTC()
-	recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", currentModel, startedAt, firstEventAt, finishedAt, effectiveFinishReason(), inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, nil))
+	summary := buildLLMSummaryPayload(req, "openai", currentModel, startedAt, firstEventAt, finishedAt, effectiveFinishReason(), inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, nil)
+	recordLLMSummaryArtifact(req, withOpenAIResponsesFunctionCallSummary(summary, functionCallSummary, 0))
 	return nil
 }
 

@@ -2205,16 +2205,24 @@ func buildShellPermissionDeniedToolCall(toolCallID string, argsJSON []byte, deni
 // buildSimpleShellCommands 生成最小 simple_commands 列表。
 func buildSimpleShellCommands(command string) []string {
 	trimmed := strings.TrimSpace(command)
-	if trimmed == "" {
+	if trimmed == "" || !isReliableSimpleShellCommand(trimmed) {
 		return nil
 	}
 	return []string{trimmed}
 }
 
+func isReliableSimpleShellCommand(command string) bool {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return false
+	}
+	return !strings.ContainsAny(trimmed, "$;|&'\"`\r\n")
+}
+
 // buildShellParsingResultProto 生成最小 shell parsing_result。
 func buildShellParsingResultProto(command string) *agentv1.ShellCommandParsingResult {
 	trimmed := strings.TrimSpace(command)
-	if trimmed == "" {
+	if trimmed == "" || !isReliableSimpleShellCommand(trimmed) {
 		return nil
 	}
 	parts := strings.Fields(trimmed)
