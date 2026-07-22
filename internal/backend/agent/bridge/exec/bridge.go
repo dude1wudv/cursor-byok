@@ -643,6 +643,7 @@ func (bridge *Bridge) openShell(toolCall runtimecore.ToolInvocation) (*agentv1.A
 		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode Shell args failed: %w", err)
 	}
 	timeout := shellTimeoutFromArgs(args)
+	simpleCommands, parsingResult := buildShellParsingMetadata(args.Command)
 	messageID := bridge.nextID()
 	execID := fmt.Sprintf("exec-shell-%d", time.Now().UnixNano())
 	serverMessage := &agentv1.AgentServerMessage{
@@ -656,12 +657,12 @@ func (bridge *Bridge) openShell(toolCall runtimecore.ToolInvocation) (*agentv1.A
 						WorkingDirectory:         args.WorkingDirectory,
 						Timeout:                  timeout,
 						ToolCallId:               toolCall.CallID,
-						SimpleCommands:           buildSimpleShellCommands(args.Command),
-						ParsingResult:            buildShellParsingResultProto(args.Command),
+						SimpleCommands:           simpleCommands,
+						ParsingResult:            parsingResult,
 						FileOutputThresholdBytes: uint64Ptr(40000),
 						TimeoutBehavior:          agentv1.TimeoutBehavior_TIMEOUT_BEHAVIOR_BACKGROUND,
 						HardTimeout:              int32Ptr(86400000),
-						Description:              stringPtr(args.Description),
+						Description:              stringPtrIfNonEmpty(args.Description),
 						OutputNotification:       buildShellOutputNotificationConfig(args.NotifyOnOutput),
 					},
 				},
@@ -2202,48 +2203,30 @@ func buildShellPermissionDeniedToolCall(toolCallID string, argsJSON []byte, deni
 	}
 }
 
-// buildSimpleShellCommands 生成最小 simple_commands 列表。
-func buildSimpleShellCommands(command string) []string {
+// buildShellParsingMetadata keeps Cursor's required parsing_result present
+// without claiming that complex shell syntax was parsed successfully.
+func buildShellParsingMetadata(command string) ([]string, *agentv1.ShellCommandParsingResult) {
 	trimmed := strings.TrimSpace(command)
-	if trimmed == "" || !isReliableSimpleShellCommand(trimmed) {
-		return nil
-	}
-	return []string{trimmed}
-}
-
-func isReliableSimpleShellCommand(command string) bool {
-	trimmed := strings.TrimSpace(command)
-	if trimmed == "" {
-		return false
-	}
-	return !strings.ContainsAny(trimmed, "$;|&'\"`\r\n")
-}
-
-// buildShellParsingResultProto 生成最小 shell parsing_result。
-func buildShellParsingResultProto(command string) *agentv1.ShellCommandParsingResult {
-	trimmed := strings.TrimSpace(command)
-	if trimmed == "" || !isReliableSimpleShellCommand(trimmed) {
-		return nil
+	failed := &agentv1.ShellCommandParsingResult{ParsingFailed: true}
+	if trimmed == "" || strings.ContainsAny(trimmed, "$;|&'\"`<>(){}[]^\r\n") {
+		return nil, failed
 	}
 	parts := strings.Fields(trimmed)
-	if len(parts) == 0 {
-		return nil
+	if len(parts) == 0 || strings.Contains(parts[0], "=") {
+		return nil, failed
 	}
 	args := make([]*agentv1.ShellCommandParsingResult_ExecutableCommandArg, 0, len(parts)-1)
-	for _, part := range parts[1:] {
-		value := strings.TrimSpace(part)
-		if value == "" {
-			continue
-		}
+	for _, value := range parts[1:] {
 		args = append(args, &agentv1.ShellCommandParsingResult_ExecutableCommandArg{
 			Type:  "word",
 			Value: value,
 		})
 	}
-	return &agentv1.ShellCommandParsingResult{
+	executable := parts[0]
+	return []string{executable}, &agentv1.ShellCommandParsingResult{
 		ExecutableCommands: []*agentv1.ShellCommandParsingResult_ExecutableCommand{
 			{
-				Name:     strings.TrimSpace(parts[0]),
+				Name:     executable,
 				Args:     args,
 				FullText: trimmed,
 			},

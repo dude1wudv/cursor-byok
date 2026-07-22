@@ -572,19 +572,19 @@ func (projector *HistoryProjector) ProjectLegacyCheckpoint(conversation *Convers
 				if err := json.Unmarshal(entry.Payload, &payload); err != nil {
 					return nil, err
 				}
-				if strings.TrimSpace(payload.ReasoningContent) != "" {
-					stepPayload, err := marshalThinkingStep(payload.ReasoningContent)
-					if err != nil {
-						return nil, err
-					}
-					steps = append(steps, stepPayload)
-				}
 				toolCall := &agentv1.ToolCall{}
 				if err := protojson.Unmarshal(payload.ToolCall, toolCall); err != nil {
 					return nil, err
 				}
 				if !shouldPersistToolResultName(firstNonEmpty(strings.TrimSpace(payload.ToolName), inferToolName(toolCall))) {
 					continue
+				}
+				if strings.TrimSpace(payload.ReasoningContent) != "" {
+					stepPayload, err := marshalThinkingStep(payload.ReasoningContent)
+					if err != nil {
+						return nil, err
+					}
+					steps = append(steps, stepPayload)
 				}
 				stepPayload, err := proto.Marshal(&agentv1.ConversationStep{
 					Message: &agentv1.ConversationStep_ToolCall{
@@ -610,14 +610,17 @@ func (projector *HistoryProjector) ProjectLegacyCheckpoint(conversation *Convers
 						continue
 					}
 				}
-				if strings.TrimSpace(payload.ReasoningContent) != "" {
-					stepPayload, err := marshalThinkingStep(payload.ReasoningContent)
-					if err != nil {
-						return nil, err
-					}
-					steps = append(steps, stepPayload)
+				if toolName := strings.TrimSpace(payload.ToolName); toolName != "" && !shouldPersistToolResultName(toolName) {
+					continue
 				}
 				if len(payload.ToolCall) == 0 {
+					if strings.TrimSpace(payload.ReasoningContent) != "" {
+						stepPayload, err := marshalThinkingStep(payload.ReasoningContent)
+						if err != nil {
+							return nil, err
+						}
+						steps = append(steps, stepPayload)
+					}
 					continue
 				}
 				toolCall := &agentv1.ToolCall{}
@@ -626,6 +629,13 @@ func (projector *HistoryProjector) ProjectLegacyCheckpoint(conversation *Convers
 				}
 				if !shouldPersistToolResultName(firstNonEmpty(strings.TrimSpace(payload.ToolName), inferToolName(toolCall))) {
 					continue
+				}
+				if strings.TrimSpace(payload.ReasoningContent) != "" {
+					stepPayload, err := marshalThinkingStep(payload.ReasoningContent)
+					if err != nil {
+						return nil, err
+					}
+					steps = append(steps, stepPayload)
 				}
 				stepPayload, err := proto.Marshal(&agentv1.ConversationStep{
 					Message: &agentv1.ConversationStep_ToolCall{

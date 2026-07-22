@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -42,12 +43,36 @@ const (
 	defaultSummaryCompletedThought = "Chat context summarized"
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
-	shellRejectionLocalBlockLimit  = 2
-	shellRejectionLoopGuardSource  = "shell_rejection_loop_guard"
-	shellRejectionLoopGuardText    = "The same Shell command was rejected twice during this turn. Do not issue that command again. Use a materially different command or another tool; if no safe alternative exists, explain the blocker and finish the turn."
+	shellCircuitLocalBlockLimit    = 2
+	shellCircuitPromptSource       = "shell_circuit"
+	shellCircuitPromptText         = "Shell is unavailable for the rest of this turn after Cursor rejected it. Do not issue Shell again; use Read, Grep, Glob, or another non-Shell tool, or explain the blocker and finish the turn."
 
 	runtimeThinkingEffortParameterID = "thinking_effort"
 )
+
+func writeGPTToolDebugLog(location string, message string, hypothesisID string, data map[string]any) {
+	// #region agent log
+	payload := map[string]any{
+		"sessionId":    "cb43403c-f2ab-49a7-8930-9ffed00df9c7",
+		"runId":        "pre-fix",
+		"hypothesisId": hypothesisID,
+		"location":     location,
+		"message":      message,
+		"data":         data,
+		"timestamp":    time.Now().UnixMilli(),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	file, err := os.OpenFile(`C:\Users\sun\OneDrive\桌面\.cursor\debug-cb43403c-f2ab-49a7-8930-9ffed00df9c7.log`, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = file.Write(append(encoded, '\n'))
+	_ = file.Close()
+	// #endregion
+}
 
 type parsedSubagentModelOverrides struct {
 	Overrides map[string]runtimecore.SubagentModelOverrideSelection
@@ -1125,6 +1150,16 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	if intent.ExecClientMessage == nil {
 		return fmt.Errorf("exec client message is required")
 	}
+	// #region agent log
+	writeGPTToolDebugLog("forwarder/service.go:handleExecResult", "exec client message received", "H2,H3,H4", map[string]any{
+		"request_id":       intent.RequestID,
+		"exec_id":          strings.TrimSpace(intent.ExecClientMessage.GetExecId()),
+		"message_id":       intent.ExecClientMessage.GetId(),
+		"has_shell_stream": intent.ExecClientMessage.GetShellStream() != nil,
+		"has_shell_result": intent.ExecClientMessage.GetShellResult() != nil,
+		"terminal_variant": shellTerminalVariant(intent.ExecClientMessage),
+	})
+	// #endregion
 	pending, found, correlationMismatch := selectPendingExecStrict(intent.ExecClientMessage.GetExecId(), intent.ExecClientMessage.GetId(), stream)
 	if correlationMismatch {
 		service.recordExecCorrelationMismatch(stream, intent.ExecClientMessage)
@@ -1227,12 +1262,33 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 }
 
 func (service *Service) logShellTerminalResult(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) {
-	if service == nil || service.debug == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+	if service == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
 		return
 	}
 	reason, rejectionClass := shellTerminalRejection(message)
 	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
 	providerItemID, providerCallID, providerStatus := providerToolCorrelation(stream, pending.ToolCallID)
+	// #region agent log
+	writeGPTToolDebugLog("forwarder/service.go:logShellTerminalResult", "shell terminal observed", "H2,H4", map[string]any{
+		"request_id":       stream.RequestID,
+		"provider_pass":    pending.ProviderPass,
+		"model_call_id":    strings.TrimSpace(pending.ModelCallID),
+		"tool_call_id":     strings.TrimSpace(pending.ToolCallID),
+		"exec_id":          strings.TrimSpace(pending.ExecID),
+		"message_id":       pending.MessageID,
+		"terminal_variant": shellTerminalVariant(message),
+		"stream_state":     strings.TrimSpace(pending.StreamState),
+		"rejection_class":  rejectionClass,
+		"rejected_reason":  sanitizeShellRejectedReason(reason),
+		"command_hash":     commandHash,
+		"provider_item_id": providerItemID,
+		"provider_call_id": providerCallID,
+		"provider_status":  providerStatus,
+	})
+	// #endregion
+	if service.debug == nil {
+		return
+	}
 	service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_terminal_result", map[string]any{
 		"source":           shellTerminalResultSource(message),
 		"terminal_variant": shellTerminalVariant(message),
@@ -1254,14 +1310,13 @@ func (service *Service) logShellTerminalResult(stream *ActiveStream, pending run
 	})
 }
 
-type shellRejectionRecord struct {
-	Fingerprint string
-	ToolName    string
-	CommandHash string
-	CWDHash     string
-	Class       string
-	Count       int
-	LocalBlocks int
+type shellCircuitState struct {
+	Open            bool
+	RejectionClass  string
+	Reason          string
+	ParseRejections int
+	LocalBlocks     int
+	FingerprintHits map[string]int
 }
 
 func (service *Service) recordShellRejection(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
@@ -1270,12 +1325,13 @@ func (service *Service) recordShellRejection(stream *ActiveStream, pending runti
 	}
 	reason, rejectionClass := shellTerminalRejection(message)
 	if rejectionClass == "" {
-		return nil
+		return service.recordShellCircuitSuccess(stream, pending, message)
 	}
 	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
 	providerItemID, providerCallID, providerStatus := providerToolCorrelation(stream, pending.ToolCallID)
 	fingerprint := planContentHash(strings.Join([]string{"Shell", commandHash, cwdHash, rejectionClass}, "\x00"))
-	count := currentTurnShellRejectionCount(stream, fingerprint) + 1
+	circuit := currentTurnShellCircuit(stream)
+	count := circuit.FingerprintHits[fingerprint] + 1
 	values := map[string]any{
 		"source":           "shell_terminal",
 		"provider_pass":    pending.ProviderPass,
@@ -1295,13 +1351,78 @@ func (service *Service) recordShellRejection(stream *ActiveStream, pending runti
 		"args_hash":        argsHash,
 		"cwd_hash":         cwdHash,
 		"count":            count,
-		"reminder_active":  count >= 2,
-		"reminder_source":  shellRejectionLoopGuardSource,
+	}
+	entries := []HistoryEntry{newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_rejection_fingerprint", values)}
+	openCircuit := shouldOpenShellCircuit(circuit, rejectionClass)
+	if openCircuit {
+		entries = append(entries, newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_circuit_open", map[string]any{
+			"source":                "shell_terminal",
+			"provider_pass":         pending.ProviderPass,
+			"model_call_id":         strings.TrimSpace(pending.ModelCallID),
+			"tool_call_id":          strings.TrimSpace(pending.ToolCallID),
+			"exec_id":               strings.TrimSpace(pending.ExecID),
+			"message_id":            pending.MessageID,
+			"rejection_class":       rejectionClass,
+			"rejected_reason":       sanitizeShellRejectedReason(reason),
+			"parse_rejection_count": circuit.ParseRejections + boolToInt(rejectionClass == "command_parse"),
+		}))
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_circuit_decision", map[string]any{
+			"tool_call_id":      strings.TrimSpace(pending.ToolCallID),
+			"exec_id":           strings.TrimSpace(pending.ExecID),
+			"rejection_class":   rejectionClass,
+			"rejected_reason":   sanitizeShellRejectedReason(reason),
+			"circuit_open":      openCircuit || circuit.Open,
+			"parse_rejections":  circuit.ParseRejections + boolToInt(rejectionClass == "command_parse"),
+			"command_hash":      commandHash,
+			"cwd_hash":          cwdHash,
+			"fingerprint_count": count,
+		})
+	}
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, entries)
+	return err
+}
+
+func shouldOpenShellCircuit(circuit shellCircuitState, rejectionClass string) bool {
+	return !circuit.Open && (rejectionClass != "command_parse" || circuit.ParseRejections+1 >= 2)
+}
+
+func (service *Service) recordShellCircuitSuccess(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
+	if !shellTerminalSucceeded(message) {
+		return nil
+	}
+	circuit := currentTurnShellCircuit(stream)
+	if circuit.Open || circuit.ParseRejections == 0 {
+		return nil
 	}
 	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
-		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_rejection_fingerprint", values),
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_circuit_parse_reset", map[string]any{
+			"source":               "shell_success",
+			"provider_pass":        pending.ProviderPass,
+			"model_call_id":        strings.TrimSpace(pending.ModelCallID),
+			"tool_call_id":         strings.TrimSpace(pending.ToolCallID),
+			"exec_id":              strings.TrimSpace(pending.ExecID),
+			"previous_parse_count": circuit.ParseRejections,
+		}),
 	})
 	return err
+}
+
+func shellTerminalSucceeded(message *agentv1.ExecClientMessage) bool {
+	if message == nil {
+		return false
+	}
+	if legacy := message.GetShellResult(); legacy != nil {
+		_, ok := legacy.GetResult().(*agentv1.ShellResult_Success)
+		return ok
+	}
+	if stream := message.GetShellStream(); stream != nil {
+		if exit, ok := stream.GetEvent().(*agentv1.ShellStream_Exit); ok && exit.Exit != nil {
+			return exit.Exit.GetCode() == 0
+		}
+	}
+	return false
 }
 
 func shellTerminalRejection(message *agentv1.ExecClientMessage) (string, string) {
@@ -1341,10 +1462,12 @@ func shellTerminalRejection(message *agentv1.ExecClientMessage) (string, string)
 func classifyShellRejection(reason string) string {
 	normalized := strings.ToLower(strings.TrimSpace(reason))
 	switch {
-	case strings.Contains(normalized, "skip"):
-		return "skipped"
 	case strings.Contains(normalized, "permission"), strings.Contains(normalized, "denied"):
 		return "permission"
+	case strings.Contains(normalized, "parse"), strings.Contains(normalized, "syntax"):
+		return "command_parse"
+	case strings.Contains(normalized, "skip"):
+		return "capability"
 	default:
 		return "policy"
 	}
@@ -1462,18 +1585,10 @@ func shellInvocationHashes(argsJSON []byte) (string, string, string) {
 	return planContentHash(normalizedCommand), planContentHash(strings.TrimSpace(string(argsJSON))), planContentHash(normalizedCWD)
 }
 
-func currentTurnShellRejectionCount(stream *ActiveStream, fingerprint string) int {
-	for _, record := range currentTurnShellRejectionRecords(stream) {
-		if record.Fingerprint == strings.TrimSpace(fingerprint) {
-			return record.Count
-		}
-	}
-	return 0
-}
-
-func currentTurnShellRejectionRecords(stream *ActiveStream) []shellRejectionRecord {
+func currentTurnShellCircuit(stream *ActiveStream) shellCircuitState {
+	state := shellCircuitState{FingerprintHits: make(map[string]int)}
 	if stream == nil {
-		return nil
+		return state
 	}
 	stream.mu.Lock()
 	conversation := stream.CheckpointConversation
@@ -1483,7 +1598,6 @@ func currentTurnShellRejectionRecords(stream *ActiveStream) []shellRejectionReco
 		entries = append(entries, conversation.Entries...)
 	}
 	stream.mu.Unlock()
-	records := make(map[string]shellRejectionRecord)
 	for _, entry := range entries {
 		if entry.TurnSeq != turnSeq || strings.TrimSpace(entry.Kind) != "metadata" {
 			continue
@@ -1492,75 +1606,59 @@ func currentTurnShellRejectionRecords(stream *ActiveStream) []shellRejectionReco
 		if json.Unmarshal(entry.Payload, &payload) != nil {
 			continue
 		}
-		fingerprint := strings.TrimSpace(fmt.Sprint(payload.Value["fingerprint"]))
-		if fingerprint == "" || fingerprint == "<nil>" {
-			continue
-		}
-		record := records[fingerprint]
-		record.Fingerprint = fingerprint
 		switch strings.TrimSpace(payload.Type) {
 		case "shell_rejection_fingerprint":
-			record.ToolName = strings.TrimSpace(fmt.Sprint(payload.Value["tool_name"]))
-			record.CommandHash = strings.TrimSpace(fmt.Sprint(payload.Value["command_hash"]))
-			record.CWDHash = strings.TrimSpace(fmt.Sprint(payload.Value["cwd_hash"]))
-			record.Class = strings.TrimSpace(fmt.Sprint(payload.Value["rejection_class"]))
-			record.Count++
-		case "shell_rejection_local_block":
-			record.LocalBlocks++
-		default:
-			continue
-		}
-		records[fingerprint] = record
-	}
-	result := make([]shellRejectionRecord, 0, len(records))
-	for _, record := range records {
-		result = append(result, record)
-	}
-	return result
-}
-
-func matchingShellRejectionRecord(stream *ActiveStream, invocation runtimecore.ToolInvocation) (shellRejectionRecord, bool) {
-	if strings.TrimSpace(invocation.ToolName) != "Shell" {
-		return shellRejectionRecord{}, false
-	}
-	commandHash, _, cwdHash := shellInvocationHashes(invocation.ArgsJSON)
-	for _, record := range currentTurnShellRejectionRecords(stream) {
-		if record.Count >= 2 && record.ToolName == "Shell" && record.CommandHash == commandHash && record.CWDHash == cwdHash {
-			return record, true
+			fingerprint := strings.TrimSpace(fmt.Sprint(payload.Value["fingerprint"]))
+			if fingerprint != "" && fingerprint != "<nil>" {
+				state.FingerprintHits[fingerprint]++
+			}
+			if strings.TrimSpace(fmt.Sprint(payload.Value["rejection_class"])) == "command_parse" {
+				state.ParseRejections++
+			}
+		case "shell_circuit_parse_reset":
+			state.ParseRejections = 0
+		case "shell_circuit_open":
+			state.Open = true
+			state.RejectionClass = strings.TrimSpace(fmt.Sprint(payload.Value["rejection_class"]))
+			state.Reason = strings.TrimSpace(fmt.Sprint(payload.Value["rejected_reason"]))
+		case "shell_circuit_local_block":
+			state.LocalBlocks++
 		}
 	}
-	return shellRejectionRecord{}, false
+	return state
 }
 
-func currentTurnNeedsShellRejectionReminder(stream *ActiveStream) bool {
-	for _, record := range currentTurnShellRejectionRecords(stream) {
-		if record.Count >= 2 {
-			return true
-		}
-	}
-	return false
-}
-
-func (service *Service) recordShellLocalBlock(stream *ActiveStream, invocation runtimecore.ToolInvocation, record shellRejectionRecord) error {
+func (service *Service) recordShellCircuitLocalBlock(stream *ActiveStream, invocation runtimecore.ToolInvocation, circuit shellCircuitState) error {
 	if service == nil || stream == nil {
 		return nil
 	}
-	_, argsHash, _ := shellInvocationHashes(invocation.ArgsJSON)
+	commandHash, argsHash, cwdHash := shellInvocationHashes(invocation.ArgsJSON)
+	values := map[string]any{
+		"source":          "pre_dispatch",
+		"provider_pass":   currentProviderPass(stream),
+		"model_call_id":   strings.TrimSpace(invocation.ModelCallID),
+		"tool_call_id":    strings.TrimSpace(invocation.CallID),
+		"rejection_class": circuit.RejectionClass,
+		"rejected_reason": circuit.Reason,
+		"command_hash":    commandHash,
+		"args_hash":       argsHash,
+		"cwd_hash":        cwdHash,
+		"block_count":     circuit.LocalBlocks + 1,
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_circuit_local_block", values)
+	}
 	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
-		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_rejection_local_block", map[string]any{
-			"source":          "pre_dispatch",
-			"provider_pass":   currentProviderPass(stream),
-			"model_call_id":   strings.TrimSpace(invocation.ModelCallID),
-			"tool_call_id":    strings.TrimSpace(invocation.CallID),
-			"fingerprint":     record.Fingerprint,
-			"rejection_class": record.Class,
-			"command_hash":    record.CommandHash,
-			"args_hash":       argsHash,
-			"cwd_hash":        record.CWDHash,
-			"block_count":     record.LocalBlocks + 1,
-		}),
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_circuit_local_block", values),
 	})
 	return err
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func shellTerminalResultSource(message *agentv1.ExecClientMessage) string {
@@ -1828,6 +1926,12 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 	if intent.ExecClientControlMessage == nil {
 		return fmt.Errorf("exec client control message is required")
 	}
+	// #region agent log
+	writeGPTToolDebugLog("forwarder/service.go:handleExecControl", "exec control message received", "H2,H3", map[string]any{
+		"request_id":   intent.RequestID,
+		"control_type": fmt.Sprintf("%T", intent.ExecClientControlMessage.GetMessage()),
+	})
+	// #endregion
 	pending, found := selectPendingExecByControl(intent.ExecClientControlMessage, stream)
 	if !found {
 		if shouldIgnoreMissingExecControl(intent.ExecClientControlMessage, stream) {
@@ -2243,10 +2347,10 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		return service.failStream(stream, "unknown", err)
 	}
 	compiled = guardCompiledConversationForProvider(compiled)
-	if currentTurnNeedsShellRejectionReminder(stream) {
+	if currentTurnShellCircuit(stream).Open {
 		context := newPromptContextMessage(
-			shellRejectionLoopGuardSource,
-			modeladapter.Message{Role: "user", Content: wrapSystemReminder(shellRejectionLoopGuardText)},
+			shellCircuitPromptSource,
+			modeladapter.Message{Role: "user", Content: wrapSystemReminder(shellCircuitPromptText)},
 			false,
 		)
 		compiled.Messages = append(compiled.Messages, context.Message)
@@ -2582,22 +2686,25 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	if err := providerLoopInterruptErr(nil, stream, invocation.ModelCallID); err != nil {
 		return err
 	}
-	if record, blocked := matchingShellRejectionRecord(stream, invocation); blocked {
-		stream.mu.Lock()
-		stream.ToolInvocationCount++
-		stream.UpdatedAt = time.Now().UTC()
-		stream.mu.Unlock()
-		if err := service.recordShellLocalBlock(stream, invocation, record); err != nil {
-			return err
+	if strings.TrimSpace(invocation.ToolName) == "Shell" {
+		circuit := currentTurnShellCircuit(stream)
+		if circuit.Open {
+			stream.mu.Lock()
+			stream.ToolInvocationCount++
+			stream.UpdatedAt = time.Now().UTC()
+			stream.mu.Unlock()
+			if err := service.recordShellCircuitLocalBlock(stream, invocation, circuit); err != nil {
+				return err
+			}
+			cause := fmt.Errorf("Shell is unavailable for the rest of this turn after a %s rejection; use a non-Shell tool or finish with the blocker", circuit.RejectionClass)
+			if err := service.completePreDispatchToolError(stream, invocation, nil, false, false, cause); err != nil {
+				return err
+			}
+			if circuit.LocalBlocks+1 >= shellCircuitLocalBlockLimit {
+				return providerTerminalError{cause: fmt.Errorf("Shell circuit stopped the provider loop after %d local blocks", circuit.LocalBlocks+1)}
+			}
+			return nil
 		}
-		cause := fmt.Errorf("repeated Shell command was blocked locally after %d matching %s rejections; use a different command or tool", record.Count, record.Class)
-		if err := service.completePreDispatchToolError(stream, invocation, nil, false, false, cause); err != nil {
-			return err
-		}
-		if record.LocalBlocks+1 >= shellRejectionLocalBlockLimit {
-			return providerTerminalError{cause: fmt.Errorf("Shell rejection loop stopped after %d local blocks for the same command fingerprint", record.LocalBlocks+1)}
-		}
-		return nil
 	}
 	invocation = service.rewriteDirectMCPToolInvocation(stream, invocation)
 	invocation = service.normalizeCallMCPToolInvocation(stream, invocation)
@@ -2774,6 +2881,33 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		pendingExec.ProviderPass = stream.ProviderPassCount
 		stream.PendingExecs[pendingExec.ExecID] = pendingExec
 		stream.mu.Unlock()
+		if strings.TrimSpace(pendingExec.ExecKind) == "shell" {
+			shellArgs := serverMessage.GetExecServerMessage().GetShellStreamArgs()
+			simpleCommandCount := 0
+			hasParsingResult := false
+			if shellArgs != nil {
+				simpleCommandCount = len(shellArgs.GetSimpleCommands())
+				hasParsingResult = shellArgs.GetParsingResult() != nil
+			}
+			commandHash, argsHash, cwdHash := shellInvocationHashes(invocation.ArgsJSON)
+			// #region agent log
+			writeGPTToolDebugLog("forwarder/service.go:handleToolInvocation", "shell exec dispatched", "H3,H4,H5", map[string]any{
+				"request_id":           stream.RequestID,
+				"provider_pass":        pendingExec.ProviderPass,
+				"model_call_id":        strings.TrimSpace(invocation.ModelCallID),
+				"tool_call_id":         strings.TrimSpace(invocation.CallID),
+				"provider_item_id":     strings.TrimSpace(invocation.ProviderItemID),
+				"provider_call_id":     strings.TrimSpace(invocation.ProviderCallID),
+				"exec_id":              strings.TrimSpace(pendingExec.ExecID),
+				"message_id":           pendingExec.MessageID,
+				"command_hash":         commandHash,
+				"args_hash":            argsHash,
+				"cwd_hash":             cwdHash,
+				"simple_command_count": simpleCommandCount,
+				"has_parsing_result":   hasParsingResult,
+			})
+			// #endregion
+		}
 		if strings.TrimSpace(pendingExec.ExecKind) == "subagent" {
 			registerTaskBatchMember(stream, pendingExec)
 		}

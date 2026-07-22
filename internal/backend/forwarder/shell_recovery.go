@@ -147,6 +147,21 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 	if stream == nil {
 		return nil
 	}
+	// #region agent log
+	writeGPTToolDebugLog("forwarder/shell_recovery.go:recoverShellWithoutTerminal", "synthetic shell recovery triggered", "H2,H3", map[string]any{
+		"request_id":    stream.RequestID,
+		"provider_pass": pending.ProviderPass,
+		"model_call_id": strings.TrimSpace(pending.ModelCallID),
+		"tool_call_id":  strings.TrimSpace(pending.ToolCallID),
+		"exec_id":       strings.TrimSpace(pending.ExecID),
+		"message_id":    pending.MessageID,
+		"reason":        strings.TrimSpace(reason),
+		"stream_state":  strings.TrimSpace(pending.StreamState),
+		"chunk_count":   pending.ChunkCount,
+		"stdout_bytes":  len(pending.StdoutBuffer),
+		"stderr_bytes":  len(pending.StderrBuffer),
+	})
+	// #endregion
 	pending.ShellRecoveryScheduled = true
 	markExecCompleted(stream, pending)
 	resultPayload := buildSyntheticShellResultPayload(pending, reason)

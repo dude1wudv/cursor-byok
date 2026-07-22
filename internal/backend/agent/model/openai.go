@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,30 @@ import (
 type OpenAIAdapter struct {
 	// client 负责发送 HTTP 请求。
 	client *http.Client
+}
+
+func writeOpenAIResponsesDebugLog(location string, message string, hypothesisID string, data map[string]any) {
+	// #region agent log
+	payload := map[string]any{
+		"sessionId":    "cb43403c-f2ab-49a7-8930-9ffed00df9c7",
+		"runId":        "pre-fix",
+		"hypothesisId": hypothesisID,
+		"location":     location,
+		"message":      message,
+		"data":         data,
+		"timestamp":    time.Now().UnixMilli(),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	file, err := os.OpenFile(`C:\Users\sun\OneDrive\桌面\.cursor\debug-cb43403c-f2ab-49a7-8930-9ffed00df9c7.log`, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = file.Write(append(encoded, '\n'))
+	_ = file.Close()
+	// #endregion
 }
 
 type openAIRequestBody struct {
@@ -1402,6 +1427,23 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		if accumulator == nil {
 			return nil
 		}
+		var argsObject map[string]any
+		argsJSONValid := json.Unmarshal([]byte(accumulator.Args.String()), &argsObject) == nil && argsObject != nil
+		_, alreadyCompleted := completedTools[key]
+		// #region agent log
+		writeOpenAIResponsesDebugLog("agent/model/openai.go:completeTool", "responses function call completion attempted", "H1,H5", map[string]any{
+			"request_id":            req.RequestID,
+			"model_call_id":         req.ModelCallID,
+			"provider_item_id":      strings.TrimSpace(accumulator.ProviderItemID),
+			"provider_call_id":      strings.TrimSpace(accumulator.ProviderCallID),
+			"provider_status":       strings.TrimSpace(accumulator.ProviderStatus),
+			"tool_name":             strings.TrimSpace(accumulator.Name),
+			"call_id_present":       strings.TrimSpace(accumulator.CallID) != "",
+			"arguments_bytes":       accumulator.Args.Len(),
+			"arguments_json_object": argsJSONValid,
+			"already_completed_key": alreadyCompleted,
+		})
+		// #endregion
 		if err := validateOpenAIResponsesToolAccumulator(accumulator); err != nil {
 			functionCallSummary.Discard++
 			return err
