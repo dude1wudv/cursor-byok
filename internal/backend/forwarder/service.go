@@ -487,14 +487,20 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 	appendSeqno := req.Msg.GetAppendSeqno()
 	dataHex := req.Msg.GetData()
 	appendTicket, staleAppend, err := service.appendSeq.Acquire(ctx, requestID, appendSeqno)
+	appendEpoch, currentNext, appendDisposition := appendTicket.Snapshot()
 	if err != nil {
 		return nil, connect.NewError(connect.CodeCanceled, err)
 	}
 	if staleAppend {
-		log.Printf("forwarder ignored stale bidi append request_id=%s append_seqno=%d", requestID, appendSeqno)
-		service.debug.LogBidiRaw(ctx, requestID, "", appendSeqno, dataHex, "stale", nil)
+		log.Printf("forwarder ignored stale bidi append request_id=%s append_seqno=%d epoch=%d current_next=%d disposition=%s", requestID, appendSeqno, appendEpoch, currentNext, appendDisposition)
+		service.debug.LogBidiRaw(ctx, requestID, "", appendSeqno, dataHex, "stale", map[string]any{
+			"epoch":        appendEpoch,
+			"current_next": currentNext,
+			"disposition":  appendDisposition,
+		})
 		return connect.NewResponse(&aiserverv1.BidiAppendResponse{}), nil
 	}
+	defer appendTicket.DiscardEpochCandidate()
 	defer appendTicket.Release()
 	message, clientKind, err := protocol.DecodeAgentClientMessage(dataHex)
 	if err != nil {
@@ -514,8 +520,14 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 		})
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
+	if strings.TrimSpace(intent.Kind) == "run" {
+		intent.AppendSequenceTicket = &appendTicket
+	}
 	service.debug.LogBidiRaw(ctx, requestID, intent.ConversationID, appendSeqno, dataHex, "accepted", map[string]any{
-		"client_kind": strings.TrimSpace(clientKind),
+		"client_kind":  strings.TrimSpace(clientKind),
+		"epoch":        appendEpoch,
+		"current_next": currentNext,
+		"disposition":  appendDisposition,
 	})
 	service.debug.LogBidiDecoded(ctx, requestID, intent.ConversationID, appendSeqno, clientKind, message, intent, nil)
 	if err := service.dispatchInboundIntent(intent); err != nil {
@@ -1048,6 +1060,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		return err
 	}
 	if intent.Prewarm {
+		service.commitRunAppendEpoch(intent)
 		stream.mu.Lock()
 		stream.RunAccepted = true
 		providerActive := stream.ProviderActive
@@ -1065,6 +1078,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	if err := service.requestProviderAction(stream, providerActionStart); err != nil {
 		return err
 	}
+	service.commitRunAppendEpoch(intent)
 	stream.mu.Lock()
 	stream.RunAccepted = true
 	providerActive := stream.ProviderActive
@@ -1078,6 +1092,21 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		"provider_pass_count": providerPassCount,
 	})
 	return nil
+}
+
+func (service *Service) commitRunAppendEpoch(intent InboundIntent) {
+	if intent.AppendSequenceTicket == nil || !intent.AppendSequenceTicket.CommitEpoch() {
+		return
+	}
+	epoch, currentNext, disposition := intent.AppendSequenceTicket.Snapshot()
+	log.Printf("forwarder switched bidi append epoch request_id=%s epoch=%d current_next=%d disposition=%s", strings.TrimSpace(intent.RequestID), epoch, currentNext, disposition)
+	if service != nil && service.debug != nil {
+		service.debug.LogRuntime(context.Background(), intent.RequestID, intent.ConversationID, "bidi_append_epoch_switched", map[string]any{
+			"epoch":        epoch,
+			"current_next": currentNext,
+			"disposition":  disposition,
+		})
+	}
 }
 
 func (service *Service) loadPreviousSummaryReplay(conversationID string) ([][]byte, bool, error) {

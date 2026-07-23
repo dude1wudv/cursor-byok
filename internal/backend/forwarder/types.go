@@ -470,6 +470,7 @@ type InboundIntent struct {
 	ExecClientControlMessage *agentv1.ExecClientControlMessage
 	InteractionResponse      *agentv1.InteractionResponse
 	KVClientMessage          *agentv1.KvClientMessage
+	AppendSequenceTicket     *appendSequenceTicket
 	CancelReason             string
 	IgnoredReason            string
 	Prewarm                  bool

@@ -382,6 +382,20 @@ func TestBackgroundAckDetachesWithoutTerminalAndLateResultFinalizesOnce(t *testi
 	if toolResults != 1 || closures != 1 {
 		t.Fatalf("finalization artifacts tool_results=%d closures=%d, want exactly once", toolResults, closures)
 	}
+	completedUpdates := 0
+	for _, event := range stream.Backlog {
+		if update := event.Message.GetInteractionUpdate(); update != nil {
+			if _, ok := update.GetMessage().(*agentv1.InteractionUpdate_ToolCallCompleted); ok {
+				completedUpdates++
+			}
+		}
+	}
+	if completedUpdates != 1 {
+		t.Fatalf("ToolCallCompleted count=%d, want 1", completedUpdates)
+	}
+	if batch := stream.TaskBatches[pending.ProviderPass]; batch == nil || !batch.ParentNotified {
+		t.Fatalf("parent flow was not notified after final subagent result: %#v", batch)
+	}
 }
 
 func TestExplicitCancelFinalizesDetachedSubagentAsAborted(t *testing.T) {
