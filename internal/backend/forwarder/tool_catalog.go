@@ -113,8 +113,9 @@ func (catalog *DefaultToolCatalog) rewriteRootTaskTool(item json.RawMessage) (js
 	parameters, _ := function["parameters"].(map[string]any)
 	properties, _ := parameters["properties"].(map[string]any)
 	model, _ := properties["model"].(map[string]any)
-	if function == nil || parameters == nil || properties == nil || model == nil {
-		return nil, fmt.Errorf("Task tool descriptor model schema is missing")
+	accessMode, _ := properties["access_mode"].(map[string]any)
+	if function == nil || parameters == nil || properties == nil || model == nil || accessMode == nil {
+		return nil, fmt.Errorf("Task tool descriptor model or access_mode schema is missing")
 	}
 	model["enum"] = enum
 	roleEnum := []string{"simple_explore", "medium_explore", "complex_debug"}
@@ -131,7 +132,7 @@ func (catalog *DefaultToolCatalog) rewriteRootTaskTool(item json.RawMessage) (js
 		}
 		filteredRequired = append(filteredRequired, field)
 	}
-	parameters["required"] = append(filteredRequired, "task_role")
+	parameters["required"] = appendRequiredSchemaFields(filteredRequired, "task_role", "access_mode")
 	model["description"] = "Optional adapter override for a new subagent. Omit this field for automatic task_role routing; do not copy the parent model or choose a role candidate yourself. Set it only when intentionally overriding automatic routing with a specific enabled adapter ID. Explicit model IDs take priority and must be enabled. Enabled adapters (roles | display name | adapter ID | provider model | note):\n" + strings.Join(details, "\n")
 	if description, ok := function["description"].(string); ok {
 		function["description"] = description + "\n\nRole-based routing: always set task_role. For automatic routing, omit model entirely; the backend selects the first enabled adapter for that role in configuration order. Set model only for an intentional explicit override. If thinking_effort is omitted, role defaults apply (simple_explore=low, medium_explore=medium, complex_debug=medium)."
@@ -149,8 +150,8 @@ func rewriteMediumExploreTaskTool(item json.RawMessage) (json.RawMessage, error)
 	properties, _ := parameters["properties"].(map[string]any)
 	subagentType, _ := properties["subagent_type"].(map[string]any)
 	taskRole, _ := properties["task_role"].(map[string]any)
-	readonly, _ := properties["readonly"].(map[string]any)
-	if function == nil || parameters == nil || properties == nil || subagentType == nil || taskRole == nil || readonly == nil {
+	accessMode, _ := properties["access_mode"].(map[string]any)
+	if function == nil || parameters == nil || properties == nil || subagentType == nil || taskRole == nil || accessMode == nil {
 		return nil, fmt.Errorf("Task tool descriptor nested exploration schema is missing")
 	}
 	function["description"] = "Delegate one read-only long-context investigation only when long files, many related files, or a cross-module path would consume substantial context. Prefer longContextRead; use explore only when that specialized channel is unavailable. After the child returns candidate files and line ranges, precisely Read and cross-check those ranges yourself before reporting completion."
@@ -158,9 +159,9 @@ func rewriteMediumExploreTaskTool(item json.RawMessage) (json.RawMessage, error)
 	subagentType["description"] = "Required read-only child type. Prefer longContextRead; use explore only when longContextRead is unavailable."
 	taskRole["enum"] = []string{"simple_explore", "medium_explore"}
 	taskRole["description"] = "Required read-only exploration role: simple_explore or medium_explore."
-	readonly["enum"] = []bool{true}
-	readonly["description"] = "Must be true. Nested medium_explore delegation is read-only."
-	parameters["required"] = appendRequiredSchemaFields(parameters["required"], "task_role", "readonly")
+	accessMode["enum"] = []string{runtimecore.TaskAccessModeInspect}
+	accessMode["description"] = "Must be inspect. Nested medium_explore delegation is read-only."
+	parameters["required"] = appendRequiredSchemaFields(parameters["required"], "task_role", "access_mode")
 	return json.Marshal(tool)
 }
 
@@ -384,19 +385,7 @@ func validateTaskSubagentCapability(argsJSON []byte) error {
 	if err != nil {
 		return fmt.Errorf("decode Task args: %w", err)
 	}
-	value, found := args["readonly"]
-	if !found {
-		value, found = args["readOnly"]
-	}
-	var readonly *bool
-	if found {
-		parsed, ok := value.(bool)
-		if !ok {
-			return fmt.Errorf("task readonly must be boolean")
-		}
-		readonly = &parsed
-	}
-	_, err = runtimecore.ResolveTaskSubagentCapability(runtimecore.ReadStringArg(args, "subagent_type", "subagentType"), readonly)
+	_, err = runtimecore.ResolveTaskSubagentCapabilityFromArgs(args)
 	return err
 }
 

@@ -797,11 +797,7 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 	if err != nil {
 		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode Task args failed: %w", err)
 	}
-	readonly, err := readBoolPtrArg(args, "readonly", "readOnly")
-	if err != nil {
-		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode Task readonly failed: %w", err)
-	}
-	capability, err := runtimecore.ResolveTaskSubagentCapability(readStringArg(args, "subagent_type", "subagentType"), readonly)
+	capability, err := runtimecore.ResolveTaskSubagentCapabilityFromArgs(args)
 	if err != nil {
 		return nil, runtimecore.PendingExec{}, err
 	}
@@ -1804,7 +1800,7 @@ func buildReadLintsCompletedToolCall(argsJSON []byte, result *agentv1.Diagnostic
 // buildTaskCompletedToolCall 构造 Task 对应的完成态 ToolCall。
 func buildTaskCompletedToolCall(argsJSON []byte, result *agentv1.SubagentResult) *agentv1.ToolCall {
 	args, _ := decodeArgsMap(argsJSON)
-	readonly := readBoolArg(args, "readonly", "readOnly")
+	capability, _ := runtimecore.ResolveTaskSubagentCapabilityFromArgs(args)
 	model := strings.TrimSpace(readStringArg(args, "model"))
 	if effort := taskThinkingEffortDisplayName(readStringArg(args, "thinking_effort", "thinkingEffort")); model != "" && effort != "" {
 		model = fmt.Sprintf("%s · %s", model, effort)
@@ -1816,7 +1812,7 @@ func buildTaskCompletedToolCall(argsJSON []byte, result *agentv1.SubagentResult)
 		Model:        stringPtr(model),
 		Resume:       stringPtr(strings.TrimSpace(readStringArg(args, "resume"))),
 		Attachments:  readStringSliceArg(args, "attachments"),
-		Mode:         taskModeFromReadonly(readonly),
+		Mode:         taskModeFromReadonly(capability.Readonly),
 	}
 	if agentID := strings.TrimSpace(readStringArg(args, "agentId", "agent_id")); agentID != "" {
 		taskArgs.AgentId = &agentID

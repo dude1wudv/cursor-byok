@@ -62,16 +62,15 @@ type openAIRequestBody struct {
 }
 
 type openAIResponsesRequestBody struct {
-	Model           string                    `json:"model"`
-	Instructions    string                    `json:"instructions,omitempty"`
-	Input           []map[string]any          `json:"input"`
-	Tools           []map[string]any          `json:"tools,omitempty"`
-	Stream          bool                      `json:"stream"`
-	MaxOutputTokens int                       `json:"max_output_tokens,omitempty"`
-	Reasoning       *openAIResponsesReasoning `json:"reasoning,omitempty"`
-	Include         []string                  `json:"include,omitempty"`
-	PromptCacheKey  string                    `json:"prompt_cache_key,omitempty"`
-	Store           bool                      `json:"store"`
+	Model          string                    `json:"model"`
+	Instructions   string                    `json:"instructions,omitempty"`
+	Input          []map[string]any          `json:"input"`
+	Tools          []map[string]any          `json:"tools,omitempty"`
+	Stream         bool                      `json:"stream"`
+	Reasoning      *openAIResponsesReasoning `json:"reasoning,omitempty"`
+	Include        []string                  `json:"include,omitempty"`
+	PromptCacheKey string                    `json:"prompt_cache_key,omitempty"`
+	Store          bool                      `json:"store"`
 }
 
 type openAIResponsesReasoning struct {
@@ -564,7 +563,7 @@ func (adapter *OpenAIAdapter) Stream(ctx context.Context, req StreamRequest, sin
 	req.OpenAIEndpoint = endpoint
 	if req.RequestKnobs != nil {
 		req.RequestKnobs["openai_endpoint"] = endpoint
-		if modelchannel.OpenAIEndpointShape(endpoint) == "responses" {
+		if modelchannel.OpenAIEndpointShape(endpoint) == "responses" && shouldSendOpenAIMaxOutputTokens(modelID) {
 			req.RequestKnobs["max_output_tokens"] = req.MaxTokens
 		}
 	}
@@ -626,7 +625,7 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		return err
 	}
 	applyOpenAIFastMode(bodyMap, req.FastMode)
-	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 {
+	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 && shouldSendOpenAIMaxOutputTokens(modelID) {
 		bodyMap["max_output_tokens"] = req.MaxTokens
 	}
 	body = bodyMap
@@ -1040,12 +1039,11 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			return err
 		}
 		requestBody := openAIResponsesRequestBody{
-			Model:           modelID,
-			Instructions:    instructions,
-			Input:           input,
-			Stream:          true,
-			Store:           false,
-			MaxOutputTokens: req.MaxTokens,
+			Model:        modelID,
+			Instructions: instructions,
+			Input:        input,
+			Stream:       true,
+			Store:        false,
 		}
 		if key := openAIPromptCacheKey(req, modelID); key != "" {
 			requestBody.PromptCacheKey = key
@@ -1087,7 +1085,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	}
 	applyOpenAIResponsesReasoningSummary(bodyMap)
 	applyOpenAIFastMode(bodyMap, req.FastMode)
-	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 {
+	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 && shouldSendOpenAIMaxOutputTokens(modelID) {
 		bodyMap["max_output_tokens"] = req.MaxTokens
 	}
 	body = bodyMap

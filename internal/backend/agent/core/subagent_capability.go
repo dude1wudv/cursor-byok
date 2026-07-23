@@ -5,7 +5,11 @@ import (
 	"strings"
 )
 
-const SubagentTypeLongContextRead = "longContextRead"
+const (
+	SubagentTypeLongContextRead = "longContextRead"
+	TaskAccessModeInspect       = "inspect"
+	TaskAccessModeAct           = "act"
+)
 
 // SubagentCapability is the normalized authorization for a Task child.
 type SubagentCapability struct {
@@ -13,16 +17,59 @@ type SubagentCapability struct {
 	Readonly bool
 }
 
-// ResolveTaskSubagentCapability applies the Task access default before validation.
-func ResolveTaskSubagentCapability(subagentType string, readonly *bool) (SubagentCapability, error) {
-	requestedReadonly := false
-	if readonly != nil {
-		requestedReadonly = *readonly
+// ResolveTaskSubagentCapabilityFromArgs parses current access_mode and legacy readonly arguments.
+func ResolveTaskSubagentCapabilityFromArgs(args map[string]any) (SubagentCapability, error) {
+	var readonly *bool
+	for _, key := range []string{"readonly", "readOnly"} {
+		value, found := args[key]
+		if !found {
+			continue
+		}
+		parsed, ok := value.(bool)
+		if !ok {
+			return SubagentCapability{}, fmt.Errorf("Task readonly must be boolean")
+		}
+		readonly = &parsed
+		break
 	}
-	if strings.TrimSpace(subagentType) == "explore" || strings.TrimSpace(subagentType) == SubagentTypeLongContextRead {
+	return ResolveTaskSubagentCapability(
+		ReadStringArg(args, "subagent_type", "subagentType"),
+		ReadStringArg(args, "access_mode", "accessMode"),
+		readonly,
+	)
+}
+
+// ResolveTaskSubagentCapability applies access intent while preserving legacy readonly behavior.
+func ResolveTaskSubagentCapability(subagentType string, accessMode string, readonly *bool) (SubagentCapability, error) {
+	typeName := strings.TrimSpace(subagentType)
+	mode := strings.TrimSpace(accessMode)
+	if mode == "" {
+		requestedReadonly := false
+		if readonly != nil {
+			requestedReadonly = *readonly
+		}
+		if typeName == "explore" || typeName == SubagentTypeLongContextRead {
+			requestedReadonly = true
+		}
+		return ResolveSubagentCapability(typeName, requestedReadonly)
+	}
+
+	var requestedReadonly bool
+	switch mode {
+	case TaskAccessModeInspect:
 		requestedReadonly = true
+	case TaskAccessModeAct:
+		if typeName != "generalPurpose" {
+			return SubagentCapability{}, fmt.Errorf("Task access_mode %q requires subagent_type %q", TaskAccessModeAct, "generalPurpose")
+		}
+		requestedReadonly = false
+	default:
+		return SubagentCapability{}, fmt.Errorf("Task access_mode must be %q or %q", TaskAccessModeInspect, TaskAccessModeAct)
 	}
-	return ResolveSubagentCapability(subagentType, requestedReadonly)
+	if readonly != nil && *readonly != requestedReadonly {
+		return SubagentCapability{}, fmt.Errorf("Task access_mode %q conflicts with legacy readonly=%t", mode, *readonly)
+	}
+	return ResolveSubagentCapability(typeName, requestedReadonly)
 }
 
 // ResolveSubagentCapability validates the supported Task type and access pair.
