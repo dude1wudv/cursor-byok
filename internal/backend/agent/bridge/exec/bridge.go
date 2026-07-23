@@ -85,7 +85,7 @@ func (bridge *Bridge) OpenExec(openContext OpenExecContext, toolCall runtimecore
 	case "Ls":
 		return bridge.openLs(toolCall)
 	case "Shell":
-		return bridge.openShell(toolCall)
+		return bridge.openShell(openContext, toolCall)
 	case "WriteShellStdin":
 		return bridge.openWriteShellStdin(toolCall)
 	case "ForceBackgroundShell":
@@ -200,9 +200,13 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 		result.IsTerminal = true
 		return result, nil
 	case "subagent":
-		result.ToolResultPayload = summarizeSubagentResult(msg.GetSubagentResult())
-		result.ToolCall = buildTaskCompletedToolCall(pending.ArgsJSON, msg.GetSubagentResult())
-		result.IsTerminal = true
+		subagentResult := msg.GetSubagentResult()
+		if subagentResult == nil {
+			return result, nil
+		}
+		result.ToolResultPayload = summarizeSubagentResult(subagentResult)
+		result.ToolCall = buildTaskCompletedToolCall(pending.ArgsJSON, subagentResult)
+		result.IsTerminal = !isBackgroundSubagentResult(subagentResult)
 		return result, nil
 	case "write_shell_stdin":
 		writeResult := msg.GetWriteShellStdinResult()
@@ -234,16 +238,16 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 		return result, nil
 	case "shell":
 		if legacyResult := msg.GetShellResult(); legacyResult != nil {
-			return applyLegacyShellResult(result, pending, legacyResult), nil
+			return withShellConversationID(applyLegacyShellResult(result, pending, legacyResult), pending), nil
 		}
 		shellResult := msg.GetShellStream()
 		if shellResult == nil {
-			return buildSyntheticShellProtocolFailure(result, pending, "expected shell_stream or legacy shell_result payload"), nil
+			return result, nil
 		}
 		switch event := shellResult.GetEvent().(type) {
 		case *agentv1.ShellStream_Stdout:
 			if event.Stdout == nil {
-				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream stdout event is empty"), nil
+				return result, nil
 			}
 			stdoutText := DecodeShellStdout(event.Stdout)
 			result.ShellOutputDelta = &agentv1.ShellOutputDeltaUpdate{
@@ -255,7 +259,7 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 			return result, nil
 		case *agentv1.ShellStream_Stderr:
 			if event.Stderr == nil {
-				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream stderr event is empty"), nil
+				return result, nil
 			}
 			result.ShellOutputDelta = &agentv1.ShellOutputDeltaUpdate{
 				Event: &agentv1.ShellOutputDeltaUpdate_Stderr{
@@ -266,7 +270,7 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 			return result, nil
 		case *agentv1.ShellStream_Start:
 			if event.Start == nil {
-				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream start event is empty"), nil
+				return result, nil
 			}
 			result.ShellOutputDelta = &agentv1.ShellOutputDeltaUpdate{
 				Event: &agentv1.ShellOutputDeltaUpdate_Start{
@@ -276,7 +280,7 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 			return result, nil
 		case *agentv1.ShellStream_Exit:
 			if event.Exit == nil {
-				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream exit event is empty"), nil
+				return result, nil
 			}
 			result.ShellOutputDelta = &agentv1.ShellOutputDeltaUpdate{
 				Event: &agentv1.ShellOutputDeltaUpdate_Exit{
@@ -287,33 +291,36 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 			result.ToolResultPayload = summarizeShellTerminalPayload(stdout, stderr, event.Exit, false)
 			result.ToolCall = buildShellCompletedToolCall(pending.ToolCallID, pending.ArgsJSON, stdout, stderr, event.Exit)
 			result.IsTerminal = true
-			return result, nil
+			return withShellConversationID(result, pending), nil
 		case *agentv1.ShellStream_Rejected:
 			if event.Rejected == nil {
-				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream rejected event is empty"), nil
+				return result, nil
+			}
+			if strings.Contains(strings.ToLower(strings.TrimSpace(event.Rejected.GetReason())), "skip") {
+				return result, nil
 			}
 			result.ToolResultPayload = fmt.Sprintf("shell rejected: %s", strings.TrimSpace(event.Rejected.GetReason()))
 			result.ToolCall = buildShellRejectedToolCall(pending.ToolCallID, pending.ArgsJSON, event.Rejected)
 			result.IsTerminal = true
-			return result, nil
+			return withShellConversationID(result, pending), nil
 		case *agentv1.ShellStream_PermissionDenied:
 			if event.PermissionDenied == nil {
-				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream permission_denied event is empty"), nil
+				return result, nil
 			}
 			result.ToolResultPayload = fmt.Sprintf("shell permission denied: %s", strings.TrimSpace(event.PermissionDenied.GetError()))
 			result.ToolCall = buildShellPermissionDeniedToolCall(pending.ToolCallID, pending.ArgsJSON, event.PermissionDenied)
 			result.IsTerminal = true
-			return result, nil
+			return withShellConversationID(result, pending), nil
 		case *agentv1.ShellStream_Backgrounded:
 			if event.Backgrounded == nil {
-				return buildSyntheticShellProtocolFailure(result, pending, "shell_stream backgrounded event is empty"), nil
+				return result, nil
 			}
 			result.ToolResultPayload = fmt.Sprintf("shell backgrounded: %d", event.Backgrounded.GetShellId())
 			result.ToolCall = buildShellBackgroundedToolCall(pending.ToolCallID, pending.ArgsJSON, event.Backgrounded)
 			result.IsTerminal = true
-			return result, nil
+			return withShellConversationID(result, pending), nil
 		default:
-			return buildSyntheticShellProtocolFailure(result, pending, "shell_stream event is empty or unsupported"), nil
+			return result, nil
 		}
 	default:
 		return ExecApplyResult{}, fmt.Errorf("unsupported pending exec kind: %s", pending.ExecKind)
@@ -345,6 +352,9 @@ func (bridge *Bridge) ApplyExecClientControl(msg *agentv1.ExecClientControlMessa
 		result.ToolResultPayload = ""
 		return result, nil
 	case *agentv1.ExecClientControlMessage_Throw:
+		if strings.TrimSpace(pending.ExecKind) == "shell" {
+			return result, nil
+		}
 		result.IsTerminal = true
 		result.ToolResultPayload = fmt.Sprintf("exec throw: %s", strings.TrimSpace(message.Throw.GetError()))
 		return result, nil
@@ -637,7 +647,7 @@ func buildShellOutputNotificationConfig(input *shellOutputNotificationArgs) *age
 }
 
 // openShell 构造 Shell 对应的流式执行桥请求。
-func (bridge *Bridge) openShell(toolCall runtimecore.ToolInvocation) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error) {
+func (bridge *Bridge) openShell(openContext OpenExecContext, toolCall runtimecore.ToolInvocation) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error) {
 	args, err := decodeShellArgs(toolCall.ArgsJSON)
 	if err != nil {
 		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode Shell args failed: %w", err)
@@ -664,19 +674,21 @@ func (bridge *Bridge) openShell(toolCall runtimecore.ToolInvocation) (*agentv1.A
 						HardTimeout:              int32Ptr(86400000),
 						Description:              stringPtrIfNonEmpty(args.Description),
 						OutputNotification:       buildShellOutputNotificationConfig(args.NotifyOnOutput),
+						ConversationId:           stringPtrIfNonEmpty(openContext.ConversationID),
 					},
 				},
 			},
 		},
 	}
 	return serverMessage, runtimecore.PendingExec{
-		MessageID:   messageID,
-		ExecID:      execID,
-		ArgsJSON:    append([]byte(nil), toolCall.ArgsJSON...),
-		ToolCallID:  toolCall.CallID,
-		ExecKind:    "shell",
-		StreamState: "opened",
-		OpenedAt:    time.Now().UTC(),
+		MessageID:      messageID,
+		ExecID:         execID,
+		ConversationID: strings.TrimSpace(openContext.ConversationID),
+		ArgsJSON:       append([]byte(nil), toolCall.ArgsJSON...),
+		ToolCallID:     toolCall.CallID,
+		ExecKind:       "shell",
+		StreamState:    "opened",
+		OpenedAt:       time.Now().UTC(),
 	}, nil
 }
 
@@ -1872,6 +1884,13 @@ func subagentTypeProtoFromString(raw string) *agentv1.SubagentType {
 	}
 }
 
+func withShellConversationID(result ExecApplyResult, pending runtimecore.PendingExec) ExecApplyResult {
+	if shell := result.ToolCall.GetShellToolCall(); shell != nil && shell.Args != nil {
+		shell.Args.ConversationId = stringPtrIfNonEmpty(pending.ConversationID)
+	}
+	return result
+}
+
 // applyLegacyShellResult 把旧版一次性 ShellResult 归一为流式 shell 的完成态产物。
 func applyLegacyShellResult(result ExecApplyResult, pending runtimecore.PendingExec, legacy *agentv1.ShellResult) ExecApplyResult {
 	if legacy == nil {
@@ -1907,6 +1926,11 @@ func applyLegacyShellResult(result ExecApplyResult, pending runtimecore.PendingE
 	case *agentv1.ShellResult_Rejected:
 		if item.Rejected == nil {
 			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result rejected payload is empty")
+		}
+		if strings.Contains(strings.ToLower(strings.TrimSpace(item.Rejected.GetReason())), "skip") {
+			result.IsTerminal = false
+			result.ToolCall = nil
+			return result
 		}
 		result.ToolResultPayload = fmt.Sprintf("shell rejected: %s", strings.TrimSpace(item.Rejected.GetReason()))
 	case *agentv1.ShellResult_PermissionDenied:
@@ -1956,31 +1980,11 @@ func summarizeCapturedShellProtocolOutput(stdout string, stderr string) string {
 }
 
 func buildSyntheticShellProtocolFailure(result ExecApplyResult, pending runtimecore.PendingExec, reason string) ExecApplyResult {
-	message := "shell protocol error: " + strings.TrimSpace(reason)
-	stdout, stderr := truncateShellStreamsForReplay(pending.StdoutBuffer, pending.StderrBuffer)
-	result.ToolResultPayload = message
-	if captured := summarizeCapturedShellProtocolOutput(stdout, stderr); captured != "" {
-		result.ToolResultPayload = captured + "\n\n" + message
-	}
-	if strings.TrimSpace(stderr) == "" {
-		stderr = message
-	} else {
-		stderr += "\n" + message
-	}
-	args := decodeShellArgsForResult(pending.ArgsJSON)
-	result.ToolCall = buildShellResultToolCall(pending.ToolCallID, pending.ArgsJSON, &agentv1.ShellResult{
-		Result: &agentv1.ShellResult_Failure{
-			Failure: &agentv1.ShellFailure{
-				Command:           args.Command,
-				WorkingDirectory:  args.WorkingDirectory,
-				ExitCode:          -1,
-				Stdout:            stdout,
-				Stderr:            stderr,
-				InterleavedOutput: buildShellInterleavedOutput(stdout, stderr),
-			},
-		},
-	})
-	result.IsTerminal = true
+	_ = pending
+	_ = reason
+	result.IsTerminal = false
+	result.ToolResultPayload = ""
+	result.ToolCall = nil
 	return result
 }
 
@@ -3028,6 +3032,14 @@ func convertSubagentResultToTaskResult(result *agentv1.SubagentResult) *agentv1.
 			},
 		}
 	}
+}
+
+func isBackgroundSubagentResult(result *agentv1.SubagentResult) bool {
+	if result == nil || result.GetSuccess() == nil {
+		return false
+	}
+	success := result.GetSuccess()
+	return strings.TrimSpace(success.GetFinalMessage()) == "" && isBackgroundSubagentSuccess(success)
 }
 
 func isBackgroundSubagentSuccess(success *agentv1.SubagentSuccess) bool {

@@ -882,8 +882,10 @@ message ConversationStateStructure {
   optional string communicate_update_final_summary = 25;
   optional string communicate_update_completed_subtitle = 28;
   map<string, CommunicateUpdateTurnState> communicate_update_states_by_parent_tool_call_id = 29;
+  map<string, SubagentRunState> subagent_runs_by_parent_tool_call_id = 30;
   optional uint64 conversation_started_timestamp_ms = 26;
   optional string conversation_started_time_zone = 27;
+  map<string, bytes> subagent_state_refs = 31;
 }
 
 // Copied from: local:agent.v1.ConversationStep (var: zX)
@@ -4230,6 +4232,7 @@ message ShellArgs {
   optional ShellOutputNotificationConfig output_notification = 18;
   optional SmartModeApproval smart_mode_approval = 19;
   optional ShellHookApprovalRequirement hook_approval_requirement = 20;
+  optional string conversation_id = 21;
 }
 
 // Copied from: local:agent.v1.ShellBackgroundReason (var: tk)
@@ -4803,6 +4806,30 @@ message SubagentResult {
     SubagentSuccess success = 1;
     SubagentError error = 2;
   }
+}
+
+// Copied from: local:agent.v1.SubagentRunState (var: _o)
+message SubagentRunState {
+  string parent_tool_call_id = 1;
+  optional string subagent_id = 2;
+  SubagentExecutionEnvironment environment = 3;
+  SubagentRunStatus status = 4;
+  optional string title = 5;
+  optional string detail = 6;
+  optional string transcript_path = 7;
+  optional string output_path = 8;
+  optional uint64 completed_timestamp_ms = 9;
+  optional BackgroundTaskCompletionReason completion_reason = 10;
+}
+
+// Copied from: local:agent.v1.SubagentRunStatus (var: qs)
+enum SubagentRunStatus {
+  SUBAGENT_RUN_STATUS_UNSPECIFIED = 0;
+  SUBAGENT_RUN_STATUS_RUNNING = 1;
+  SUBAGENT_RUN_STATUS_BACKGROUNDED = 2;
+  SUBAGENT_RUN_STATUS_SUCCESS = 3;
+  SUBAGENT_RUN_STATUS_ERROR = 4;
+  SUBAGENT_RUN_STATUS_ABORTED = 5;
 }
 
 // Copied from: local:agent.v1.SubagentStartRequestQuery (var: q0)

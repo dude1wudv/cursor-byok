@@ -995,6 +995,8 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.PendingProviderAction = providerActionNone
 	stream.PendingCompaction = nil
 	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
+	stream.ActiveForegroundShellExecID = ""
+	stream.QueuedForegroundShells = nil
 	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
 	stream.PartialToolCallIDs = make(map[string]struct{})
 	stream.RecentCompletedExecs = make(map[uint32]time.Time)
@@ -1117,12 +1119,32 @@ func (service *Service) handleCancelIntent(intent InboundIntent) error {
 		}
 	}
 	stream.mu.Lock()
-	pendingExecs := make([]runtimecore.PendingExec, 0, len(stream.PendingExecs))
+	pendingExecs := make([]runtimecore.PendingExec, 0, len(stream.PendingExecs)+len(stream.SubagentFinalizations))
+	seenExecIDs := make(map[string]struct{}, len(stream.PendingExecs))
 	for _, pending := range stream.PendingExecs {
 		pendingExecs = append(pendingExecs, pending)
+		seenExecIDs[pending.ExecID] = struct{}{}
+	}
+	for _, state := range stream.SubagentFinalizations {
+		if state == nil || !state.BackgroundAcknowledged || state.ResultReceived || state.ExplicitlyCanceled {
+			continue
+		}
+		if _, exists := seenExecIDs[state.Pending.ExecID]; exists {
+			continue
+		}
+		pendingExecs = append(pendingExecs, state.Pending)
 	}
 	stream.mu.Unlock()
 	for _, pending := range pendingExecs {
+		if strings.TrimSpace(pending.ExecKind) == "subagent" && hasCheckpoint {
+			if err := service.recordSubagentRunState(stream, pending, agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_ABORTED, pending.SubagentResumeID, firstNonEmpty(intent.CancelReason, "user aborted")); err != nil {
+				return err
+			}
+			updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) {
+				item.ExplicitlyCanceled = true
+				item.ReconcileRequested = true
+			})
+		}
 		_ = service.broker.Publish(intent.RequestID, StreamEvent{
 			Message: buildExecAbortMessage(pending),
 		})
@@ -1189,8 +1211,17 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	service.observeBackgroundShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	service.observeShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	pending = service.applyExecProgress(stream, pending, intent.ExecClientMessage)
+	if err := service.recordShellApprovalEvidence(stream, pending, intent.ExecClientMessage); err != nil {
+		return err
+	}
 	if strings.TrimSpace(pending.ExecKind) == "subagent" && intent.ExecClientMessage.GetSubagentResult() == nil {
 		return nil
+	}
+	if strings.TrimSpace(pending.ExecKind) == "subagent" && !subagentGenerationIsCurrent(stream, pending) {
+		return nil
+	}
+	if strings.TrimSpace(pending.ExecKind) == "subagent" && isBackgroundSubagentAck(intent.ExecClientMessage.GetSubagentResult()) {
+		return service.acceptBackgroundSubagentAck(stream, pending, intent.ExecClientMessage)
 	}
 	if isHiddenPatchEditExecKind(pending.ExecKind) {
 		return service.handleHiddenPatchEditExecResult(stream, pending, intent.ExecClientMessage)
@@ -1252,6 +1283,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	if err := service.publishToolCallCompleted(intent.RequestID, result.ToolCallID, pending.ModelCallID, displayToolCall); err != nil {
 		return err
 	}
+	if err := service.advanceForegroundShellQueue(stream, pending); err != nil {
+		return err
+	}
 	if err := service.syncSummaryCarryForward(stream.ConversationID, intent.RequestID, pending.ModelCallID); err != nil {
 		return err
 	}
@@ -1259,6 +1293,30 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return err
 	}
 	return service.reconcileStream(stream)
+}
+
+func (service *Service) recordShellApprovalEvidence(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
+	if service == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" || message == nil {
+		return nil
+	}
+	reason, _ := shellTerminalRejection(message)
+	if strings.TrimSpace(reason) == "" {
+		return nil
+	}
+	status := "rejected"
+	if strings.Contains(strings.ToLower(reason), "skip") {
+		status = "skipped"
+	}
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_approval_evidence", map[string]any{
+			"tool_call_id": pending.ToolCallID,
+			"exec_id":      pending.ExecID,
+			"message_id":   pending.MessageID,
+			"status":       status,
+			"reason":       sanitizeShellRejectedReason(reason),
+		}),
+	})
+	return err
 }
 
 func (service *Service) logShellTerminalResult(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) {
@@ -1385,7 +1443,7 @@ func (service *Service) recordShellRejection(stream *ActiveStream, pending runti
 }
 
 func shouldOpenShellCircuit(circuit shellCircuitState, rejectionClass string) bool {
-	return !circuit.Open && (rejectionClass != "command_parse" || circuit.ParseRejections+1 >= 2)
+	return !circuit.Open && strings.TrimSpace(rejectionClass) != "" && rejectionClass != "command_parse"
 }
 
 func (service *Service) recordShellCircuitSuccess(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
@@ -1797,14 +1855,23 @@ func (service *Service) subagentFinalizeRuntime(stream *ActiveStream, pending ru
 }
 
 func (service *Service) finalizeSubagentExecResult(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage, resultToolCallID string, resultPayload string, toolCall *agentv1.ToolCall) error {
-	if stream == nil || message == nil || message.GetSubagentResult() == nil {
+	if stream == nil || message == nil || message.GetSubagentResult() == nil || isBackgroundSubagentAck(message.GetSubagentResult()) {
+		return nil
+	}
+	if !subagentGenerationIsCurrent(stream, pending) {
+		service.subagentFinalizeRuntime(stream, pending, "late_result_ignored", "stale_generation")
+		return nil
+	}
+	state := subagentFinalizationSnapshot(stream, pending)
+	if state.ExplicitlyCanceled {
+		service.subagentFinalizeRuntime(stream, pending, "late_result_ignored", "explicitly_canceled")
 		return nil
 	}
 	stream.mu.Lock()
 	terminal := isTerminalStreamStatus(stream.Status) || stream.Phase == TurnPhaseCanceled || stream.Phase == TurnPhaseCompleted || stream.Phase == TurnPhaseFailed
 	completion := stream.PendingProviderCompletion
 	stream.mu.Unlock()
-	if terminal {
+	if terminal && !state.BackgroundAcknowledged {
 		service.subagentFinalizeRuntime(stream, pending, "late_result_ignored", "terminal_parent")
 		return nil
 	}
@@ -1812,9 +1879,9 @@ func (service *Service) finalizeSubagentExecResult(stream *ActiveStream, pending
 	if completion != nil {
 		disposition = string(completion.Disposition)
 	}
-	state := subagentFinalizationSnapshot(stream, pending)
 	if !state.ResultReceived {
-		if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		status, subagentID, detail := subagentResultRunState(message.GetSubagentResult())
+		entries := []HistoryEntry{
 			newMetadataEntry(stream.TurnSeq, stream.RequestID, "subagent_result_finalize", map[string]any{
 				"stage":            "result_received",
 				"tool_call_id":     pending.ToolCallID,
@@ -1823,7 +1890,11 @@ func (service *Service) finalizeSubagentExecResult(stream *ActiveStream, pending
 				"batch_generation": pending.ProviderPass,
 				"disposition":      disposition,
 			}),
-		}); err != nil {
+		}
+		if status != agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_UNSPECIFIED {
+			entries = append(entries, subagentRunStateMetadataEntry(stream.TurnSeq, stream.RequestID, pending, status, subagentID, detail))
+		}
+		if _, err := service.appendConversationEntries(stream, stream.ConversationID, entries); err != nil {
 			return err
 		}
 		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.ResultReceived = true })
@@ -1934,6 +2005,11 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 	// #endregion
 	pending, found := selectPendingExecByControl(intent.ExecClientControlMessage, stream)
 	if !found {
+		if messageID, ok := execControlMessageID(intent.ExecClientControlMessage); ok {
+			if _, detached := selectPendingSubagentFinalization("", messageID, stream); detached {
+				return nil
+			}
+		}
 		if shouldIgnoreMissingExecControl(intent.ExecClientControlMessage, stream) {
 			return nil
 		}
@@ -2171,8 +2247,9 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 		return nil
 	}
 	backgroundShellToolCallID, backgroundShellActionWasNew := observeBackgroundShellAction(stream, intent.ClientMessage)
+	canceledSubagent, subagentCanceled := observeExplicitSubagentCancellation(stream, intent.ClientMessage)
 	backgroundSubagentToolCallID, backgroundSubagentActionWasNew := observeBackgroundSubagentAction(stream, intent.ClientMessage)
-	_, subagentCompletions := observeBackgroundSubagentCompletions(stream, intent.ClientMessage)
+	subagentProgresses, subagentCompletionHints := observeBackgroundSubagentCompletions(stream, intent.ClientMessage)
 	observeBackgroundTaskCompletionAction(stream, intent.ClientMessage)
 	if !checkpointConversationInitialized(stream) {
 		if intent.HasExplicitMode {
@@ -2196,10 +2273,29 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 		entries = append(entries, newMetadataEntry(stream.TurnSeq, stream.RequestID, "background_subagent_action", map[string]any{
 			"tool_call_id": backgroundSubagentToolCallID,
 		}))
+		stream.mu.Lock()
+		pending, found := findSubagentPendingLocked(stream, backgroundSubagentToolCallID)
+		stream.mu.Unlock()
+		if found {
+			entries = append(entries, subagentRunStateMetadataEntry(stream.TurnSeq, stream.RequestID, pending, agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_BACKGROUNDED, pending.SubagentResumeID, ""))
+		}
+	}
+	for _, pending := range subagentProgresses {
+		entries = append(entries, subagentRunStateMetadataEntry(stream.TurnSeq, stream.RequestID, pending, agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_BACKGROUNDED, pending.SubagentResumeID, ""))
 	}
 	entries = append(entries, backgroundTaskCompletionMetadataEntries(stream.TurnSeq, stream.RequestID, intent.ClientMessage)...)
-	for _, pending := range subagentCompletions {
-		service.scheduleSubagentResultTimeout(stream.RequestID, pending, subagentResultGrace, "background completion arrived without subagent result")
+	for _, pending := range subagentCompletionHints {
+		entries = append(entries, newMetadataEntry(stream.TurnSeq, stream.RequestID, "subagent_completion_hint", map[string]any{
+			"tool_call_id":    pending.ToolCallID,
+			"exec_id":         pending.ExecID,
+			"message_id":      pending.MessageID,
+			"generation":      pending.ProviderPass,
+			"terminal":        false,
+			"awaiting_result": true,
+		}))
+	}
+	if subagentCanceled {
+		entries = append(entries, subagentRunStateMetadataEntry(stream.TurnSeq, stream.RequestID, canceledSubagent, agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_ABORTED, canceledSubagent.SubagentResumeID, "user canceled subagent"))
 	}
 	if intent.HasExplicitMode {
 		modeEntry, err := newModeMetadataEntry(stream.TurnSeq, stream.RequestID, intent.Mode, true, intent.ModeSource)
@@ -2228,7 +2324,29 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 	if _, err := service.appendConversationEntries(stream, stream.ConversationID, entries); err != nil {
 		return err
 	}
-	if intent.HasExplicitMode {
+	if subagentCanceled {
+		markExecCompleted(stream, canceledSubagent)
+		clearStreamTimer(stream, providerTimerKey(streamTimerSubagentResult, canceledSubagent.ExecID))
+		if err := service.appendToolResult(stream, canceledSubagent.ToolCallID, "Task", canceledSubagent.ArgsJSON, "Task canceled by user.", canceledSubagent.ReasoningContent, nil); err != nil {
+			return err
+		}
+		if err := service.closeSubagentDispatch(stream, canceledSubagent, "user_canceled"); err != nil {
+			return err
+		}
+		if err := service.publishToolCallCompleted(stream.RequestID, canceledSubagent.ToolCallID, canceledSubagent.ModelCallID, nil); err != nil {
+			return err
+		}
+		updateSubagentFinalization(stream, canceledSubagent, func(item *SubagentFinalizationState) {
+			item.ExplicitlyCanceled = true
+			item.ResultReceived = true
+			item.ToolResultPersisted = true
+			item.TaskBatchTerminal = true
+			item.DispatchClosed = true
+			item.ToolCompletedPublished = true
+			item.ReconcileRequested = true
+		})
+	}
+	if intent.HasExplicitMode || backgroundSubagentActionWasNew || len(subagentProgresses) > 0 || subagentCanceled {
 		stream.mu.Lock()
 		modelCallID := strings.TrimSpace(stream.CurrentModelCallID)
 		stream.mu.Unlock()
@@ -2240,6 +2358,9 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 		if err := service.publishCheckpoint(intent.RequestID, stream.ConversationID); err != nil {
 			return err
 		}
+	}
+	if subagentCanceled {
+		return service.reconcileStream(stream)
 	}
 	return nil
 }
@@ -2810,6 +2931,13 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	suppressStartedToolCall := shouldSuppressStartedToolCallAfterPartial(stream, trimmedToolName, invocation.CallID)
 	startedToolCall := service.buildTaskToolCallForDisplay(invocation)
 	historyToolCall := buildStartedToolCall(invocation)
+	if trimmedToolName == "Shell" {
+		for _, toolCall := range []*agentv1.ToolCall{startedToolCall, historyToolCall} {
+			if shell := toolCall.GetShellToolCall(); shell != nil && shell.Args != nil {
+				shell.Args.ConversationId = stringPtr(strings.TrimSpace(stream.ConversationID))
+			}
+		}
+	}
 	startedEmitted := suppressStartedToolCall
 	ensureLoopActive := func() error {
 		return providerLoopInterruptErr(nil, stream, invocation.ModelCallID)
@@ -2910,6 +3038,10 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		}
 		if strings.TrimSpace(pendingExec.ExecKind) == "subagent" {
 			registerTaskBatchMember(stream, pendingExec)
+			if err := service.recordSubagentRunState(stream, pendingExec, agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_RUNNING, "", ""); err != nil {
+				service.rollbackSubagentDispatch(stream, pendingExec, "run_state_metadata_failed")
+				return err
+			}
 		}
 		scheduleExecRecovery := func() {
 			service.scheduleShellForegroundRecovery(stream.RequestID, pendingExec)
@@ -2975,6 +3107,14 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		}
 		if err := ensureLoopActive(); err != nil {
 			return failExecDispatch(err)
+		}
+		if strings.TrimSpace(pendingExec.ExecKind) == "shell" {
+			dispatched, err := service.dispatchOrQueueForegroundShell(stream, serverMessage, pendingExec)
+			if err != nil {
+				return failExecDispatch(err)
+			}
+			service.recordExecDispatchMetadata(stream, pendingExec, !dispatched, startedEmitted, "started_then_checkpoint_then_fifo_exec")
+			return nil
 		}
 		if err := service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage}); err != nil {
 			return failExecDispatch(err)
@@ -4222,8 +4362,13 @@ func selectPendingExecStrict(execID string, messageID uint32, stream *ActiveStre
 			}
 		}
 	}
-	if execID != "" && messageID != 0 && (!execFound || !messageFound || execPending.ExecID != messagePending.ExecID) {
-		return runtimecore.PendingExec{}, false, true
+	if execID != "" && messageID != 0 {
+		if !execFound && !messageFound {
+			return runtimecore.PendingExec{}, false, false
+		}
+		if !execFound || !messageFound || execPending.ExecID != messagePending.ExecID {
+			return runtimecore.PendingExec{}, false, true
+		}
 	}
 	if execFound {
 		return execPending, true, false
@@ -4298,11 +4443,16 @@ func selectPendingSubagentFinalization(execID string, messageID uint32, stream *
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
 	for _, state := range stream.SubagentFinalizations {
-		if state == nil || !state.ResultReceived || state.ReconcileRequested {
+		if state == nil || (!state.BackgroundAcknowledged && !state.ResultReceived) || state.ReconcileRequested {
 			continue
 		}
 		pending := state.Pending
-		if (execID != "" && strings.TrimSpace(pending.ExecID) == execID) || (messageID != 0 && pending.MessageID == messageID) {
+		if pending.ProviderPass != latestSubagentGenerationLocked(stream, pending.ToolCallID) {
+			continue
+		}
+		if (execID != "" || messageID != 0) &&
+			(execID == "" || strings.TrimSpace(pending.ExecID) == execID) &&
+			(messageID == 0 || pending.MessageID == messageID) {
 			return pending, true
 		}
 	}

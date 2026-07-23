@@ -20,6 +20,7 @@ const (
 	subagentDispatchEffective            = "subagent_dispatch_effective"
 	subagentDispatchClosed               = "subagent_dispatch_closed"
 	subagentParentTodoReconciled         = "subagent_parent_todo_reconciled"
+	subagentRunStateMetadata             = "subagent_run_state"
 	subagentTimeoutReasonInactivityLease = "inactivity lease expired"
 	subagentTimeoutReasonMaximumRuntime  = "maximum runtime exceeded"
 )
@@ -59,6 +60,115 @@ type subagentDispatchDecision struct {
 	EffectiveModelID        string
 	Resume                  bool
 	Duplicate               bool
+}
+
+type projectedSubagentRun struct {
+	Generation int64
+	State      *agentv1.SubagentRunState
+}
+
+func subagentRunStatusName(status agentv1.SubagentRunStatus) string {
+	return strings.TrimPrefix(status.String(), "SUBAGENT_RUN_STATUS_")
+}
+
+func parseSubagentRunStatus(value string) agentv1.SubagentRunStatus {
+	return agentv1.SubagentRunStatus(agentv1.SubagentRunStatus_value["SUBAGENT_RUN_STATUS_"+strings.ToUpper(strings.TrimSpace(value))])
+}
+
+func subagentRunStatusRank(status agentv1.SubagentRunStatus) int {
+	switch status {
+	case agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_RUNNING:
+		return 1
+	case agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_BACKGROUNDED:
+		return 2
+	case agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_SUCCESS,
+		agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_ERROR,
+		agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_ABORTED:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func subagentRunStateMetadataEntry(turnSeq int64, requestID string, pending runtimecore.PendingExec, status agentv1.SubagentRunStatus, subagentID string, detail string) HistoryEntry {
+	values := map[string]any{
+		"tool_call_id": pending.ToolCallID,
+		"exec_id":      pending.ExecID,
+		"message_id":   pending.MessageID,
+		"generation":   pending.ProviderPass,
+		"status":       subagentRunStatusName(status),
+		"environment":  "LOCAL",
+	}
+	if value := strings.TrimSpace(subagentID); value != "" {
+		values["subagent_id"] = value
+	}
+	if value := strings.TrimSpace(detail); value != "" {
+		values["detail"] = value
+	}
+	if status == agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_SUCCESS || status == agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_ERROR || status == agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_ABORTED {
+		values["completed_timestamp_ms"] = time.Now().UTC().UnixMilli()
+	}
+	return newMetadataEntry(turnSeq, requestID, subagentRunStateMetadata, values)
+}
+
+func (service *Service) recordSubagentRunState(stream *ActiveStream, pending runtimecore.PendingExec, status agentv1.SubagentRunStatus, subagentID string, detail string) error {
+	if service == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "subagent" || strings.TrimSpace(pending.ToolCallID) == "" {
+		return nil
+	}
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		subagentRunStateMetadataEntry(stream.TurnSeq, stream.RequestID, pending, status, subagentID, detail),
+	})
+	return err
+}
+
+func projectSubagentRunStates(entries []HistoryEntry) map[string]*agentv1.SubagentRunState {
+	projected := make(map[string]projectedSubagentRun)
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if json.Unmarshal(entry.Payload, &payload) != nil || strings.TrimSpace(payload.Type) != subagentRunStateMetadata {
+			continue
+		}
+		toolCallID := strings.TrimSpace(readStringValue(payload.Value["tool_call_id"]))
+		status := parseSubagentRunStatus(readStringValue(payload.Value["status"]))
+		generation := int64Value(payload.Value["generation"])
+		if toolCallID == "" || status == agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_UNSPECIFIED {
+			continue
+		}
+		if previous, ok := projected[toolCallID]; ok {
+			if generation < previous.Generation {
+				continue
+			}
+			if generation == previous.Generation && subagentRunStatusRank(status) <= subagentRunStatusRank(previous.State.GetStatus()) {
+				continue
+			}
+		}
+		state := &agentv1.SubagentRunState{
+			ParentToolCallId: toolCallID,
+			Environment:      agentv1.SubagentExecutionEnvironment_SUBAGENT_EXECUTION_ENVIRONMENT_LOCAL,
+			Status:           status,
+		}
+		if value := strings.TrimSpace(readStringValue(payload.Value["subagent_id"])); value != "" {
+			state.SubagentId = &value
+		}
+		if value := strings.TrimSpace(readStringValue(payload.Value["detail"])); value != "" {
+			state.Detail = &value
+		}
+		if completed := uint64(int64Value(payload.Value["completed_timestamp_ms"])); completed != 0 {
+			state.CompletedTimestampMs = &completed
+		}
+		projected[toolCallID] = projectedSubagentRun{Generation: generation, State: state}
+	}
+	if len(projected) == 0 {
+		return nil
+	}
+	result := make(map[string]*agentv1.SubagentRunState, len(projected))
+	for toolCallID, item := range projected {
+		result[toolCallID] = item.State
+	}
+	return result
 }
 
 func normalizeSubagentRole(value string) string {
@@ -868,6 +978,97 @@ func (service *Service) renewParentSubagentLeaseFromChild(child *ActiveStream, e
 	}
 }
 
+func isBackgroundSubagentAck(result *agentv1.SubagentResult) bool {
+	if result == nil || result.GetSuccess() == nil {
+		return false
+	}
+	success := result.GetSuccess()
+	return strings.TrimSpace(success.GetFinalMessage()) == "" &&
+		(success.GetBackgroundReason() != agentv1.SubagentBackgroundReason_SUBAGENT_BACKGROUND_REASON_UNSPECIFIED || strings.TrimSpace(success.GetTranscriptPath()) != "")
+}
+
+func subagentResultRunState(result *agentv1.SubagentResult) (agentv1.SubagentRunStatus, string, string) {
+	if result == nil {
+		return agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_UNSPECIFIED, "", ""
+	}
+	if success := result.GetSuccess(); success != nil {
+		return agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_SUCCESS, strings.TrimSpace(success.GetAgentId()), strings.TrimSpace(success.GetFinalMessage())
+	}
+	if failure := result.GetError(); failure != nil {
+		return agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_ERROR, strings.TrimSpace(failure.GetAgentId()), strings.TrimSpace(failure.GetError())
+	}
+	return agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_UNSPECIFIED, "", ""
+}
+
+func (service *Service) acceptBackgroundSubagentAck(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
+	if service == nil || stream == nil || message == nil || !isBackgroundSubagentAck(message.GetSubagentResult()) {
+		return nil
+	}
+	if !subagentGenerationIsCurrent(stream, pending) {
+		return nil
+	}
+	success := message.GetSubagentResult().GetSuccess()
+	pending.StreamState = "backgrounded"
+	pending.SubagentResumeID = strings.TrimSpace(success.GetAgentId())
+	stream.mu.Lock()
+	if current, ok := stream.PendingExecs[pending.ExecID]; ok && current.ProviderPass == pending.ProviderPass && current.MessageID == pending.MessageID {
+		current.StreamState = pending.StreamState
+		current.SubagentResumeID = pending.SubagentResumeID
+		stream.PendingExecs[pending.ExecID] = current
+	}
+	stream.mu.Unlock()
+	if err := service.recordSubagentRunState(stream, pending, agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_BACKGROUNDED, pending.SubagentResumeID, ""); err != nil {
+		return err
+	}
+	updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) {
+		item.BackgroundAcknowledged = true
+		item.Pending = pending
+	})
+	releaseTaskBatchParentWait(stream, pending)
+	detachPendingSubagentExec(stream, pending)
+	clearStreamTimer(stream, providerTimerKey(streamTimerSubagentResult, pending.ExecID))
+	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
+		return err
+	}
+	return service.reconcileStream(stream)
+}
+
+func observeExplicitSubagentCancellation(stream *ActiveStream, message *agentv1.AgentClientMessage) (runtimecore.PendingExec, bool) {
+	if stream == nil || message == nil || message.GetConversationAction() == nil {
+		return runtimecore.PendingExec{}, false
+	}
+	action, ok := message.GetConversationAction().GetAction().(*agentv1.ConversationAction_CancelSubagentAction)
+	if !ok || action.CancelSubagentAction == nil {
+		return runtimecore.PendingExec{}, false
+	}
+	identifier := strings.TrimSpace(action.CancelSubagentAction.GetSubagentId())
+	if identifier == "" {
+		return runtimecore.PendingExec{}, false
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	matches := func(pending runtimecore.PendingExec) bool {
+		if strings.TrimSpace(pending.ExecKind) != "subagent" || pending.ProviderPass != latestSubagentGenerationLocked(stream, pending.ToolCallID) {
+			return false
+		}
+		return identifier == strings.TrimSpace(pending.SubagentResumeID) || identifier == strings.TrimSpace(pending.ExecID) || identifier == strings.TrimSpace(pending.ToolCallID)
+	}
+	for _, pending := range stream.PendingExecs {
+		if matches(pending) {
+			return pending, true
+		}
+	}
+	for _, state := range stream.SubagentFinalizations {
+		if state == nil || state.ResultReceived || !state.BackgroundAcknowledged {
+			continue
+		}
+		if matches(state.Pending) {
+			return state.Pending, true
+		}
+	}
+	return runtimecore.PendingExec{}, false
+}
+
 func observeBackgroundSubagentAction(stream *ActiveStream, message *agentv1.AgentClientMessage) (string, bool) {
 	if stream == nil || message == nil || message.GetConversationAction() == nil {
 		return "", false
@@ -882,13 +1083,17 @@ func observeBackgroundSubagentAction(stream *ActiveStream, message *agentv1.Agen
 	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	pending, found := findSubagentPendingLocked(stream, toolCallID)
+	pending, detached, found := findSubagentExecutionLocked(stream, toolCallID)
 	if !found {
 		return toolCallID, false
 	}
 	wasNew := pending.StreamState != "backgrounded"
 	pending.StreamState = "backgrounded"
-	stream.PendingExecs[pending.ExecID] = pending
+	if detached != nil {
+		detached.Pending = pending
+	} else {
+		stream.PendingExecs[pending.ExecID] = pending
+	}
 	stream.UpdatedAt = time.Now().UTC()
 	return toolCallID, wasNew
 }
@@ -910,7 +1115,7 @@ func observeBackgroundSubagentCompletions(stream *ActiveStream, message *agentv1
 		if completion == nil || completion.GetKind() != agentv1.BackgroundTaskKind_BACKGROUND_TASK_KIND_SUBAGENT {
 			continue
 		}
-		pending, found := findSubagentPendingLocked(stream, completion.GetTaskId())
+		pending, detached, found := findSubagentExecutionLocked(stream, completion.GetTaskId())
 		if !found {
 			continue
 		}
@@ -922,29 +1127,26 @@ func observeBackgroundSubagentCompletions(stream *ActiveStream, message *agentv1
 				completion.GetStatus() == agentv1.BackgroundTaskStatus_BACKGROUND_TASK_STATUS_UNSPECIFIED &&
 				(strings.TrimSpace(completion.GetTitle()) != "" || strings.TrimSpace(completion.GetDetail()) != ""))
 		if effectiveProgress {
-			if subagentAwaitingResult(pending.StreamState) {
-				continue
-			}
 			pending = initializePendingSubagentLease(pending, now)
 			pending.StreamState = "backgrounded"
 			pending.LastSubagentProgressAt = now
 			pending.SubagentLeaseDeadline = now.Add(subagentInactivityTimeout)
-			stream.PendingExecs[pending.ExecID] = pending
+			if detached != nil {
+				detached.Pending = pending
+			} else {
+				stream.PendingExecs[pending.ExecID] = pending
+			}
 			progresses = append(progresses, pending)
 			continue
 		}
 		switch completion.GetStatus() {
-		case agentv1.BackgroundTaskStatus_BACKGROUND_TASK_STATUS_SUCCESS:
-			pending.StreamState = "completed_without_result"
-		case agentv1.BackgroundTaskStatus_BACKGROUND_TASK_STATUS_ERROR:
-			pending.StreamState = "failed_without_result"
-		case agentv1.BackgroundTaskStatus_BACKGROUND_TASK_STATUS_ABORTED:
-			pending.StreamState = "aborted_without_result"
+		case agentv1.BackgroundTaskStatus_BACKGROUND_TASK_STATUS_SUCCESS,
+			agentv1.BackgroundTaskStatus_BACKGROUND_TASK_STATUS_ERROR,
+			agentv1.BackgroundTaskStatus_BACKGROUND_TASK_STATUS_ABORTED:
+			completions = append(completions, pending)
 		default:
 			continue
 		}
-		stream.PendingExecs[pending.ExecID] = pending
-		completions = append(completions, pending)
 	}
 	if len(progresses) > 0 || len(completions) > 0 {
 		stream.UpdatedAt = now
@@ -953,19 +1155,33 @@ func observeBackgroundSubagentCompletions(stream *ActiveStream, message *agentv1
 }
 
 func findSubagentPendingLocked(stream *ActiveStream, identifier string) (runtimecore.PendingExec, bool) {
+	pending, detached, found := findSubagentExecutionLocked(stream, identifier)
+	return pending, found && detached == nil
+}
+
+func findSubagentExecutionLocked(stream *ActiveStream, identifier string) (runtimecore.PendingExec, *SubagentFinalizationState, bool) {
 	identifier = strings.TrimSpace(identifier)
 	if stream == nil || identifier == "" {
-		return runtimecore.PendingExec{}, false
+		return runtimecore.PendingExec{}, nil, false
+	}
+	matches := func(pending runtimecore.PendingExec) bool {
+		return strings.TrimSpace(pending.ExecKind) == "subagent" &&
+			(strings.TrimSpace(pending.ToolCallID) == identifier || strings.TrimSpace(pending.ExecID) == identifier || strings.TrimSpace(pending.SubagentResumeID) == identifier)
 	}
 	for _, pending := range stream.PendingExecs {
-		if strings.TrimSpace(pending.ExecKind) != "subagent" {
-			continue
-		}
-		if strings.TrimSpace(pending.ToolCallID) == identifier || strings.TrimSpace(pending.ExecID) == identifier {
-			return pending, true
+		if matches(pending) {
+			return pending, nil, true
 		}
 	}
-	return runtimecore.PendingExec{}, false
+	for _, state := range stream.SubagentFinalizations {
+		if state == nil || !state.BackgroundAcknowledged || state.ResultReceived || state.ExplicitlyCanceled || state.Pending.ProviderPass != latestSubagentGenerationLocked(stream, state.Pending.ToolCallID) {
+			continue
+		}
+		if matches(state.Pending) {
+			return state.Pending, state, true
+		}
+	}
+	return runtimecore.PendingExec{}, nil, false
 }
 
 func (service *Service) scheduleSubagentLeaseTimeout(requestID string, pending runtimecore.PendingExec) {
@@ -1043,34 +1259,7 @@ func (service *Service) cancelActiveSubagentRuns(parent *ActiveStream, pending r
 }
 
 func (service *Service) recoverSubagentStillRunning(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
-	if stream == nil {
-		return nil
-	}
-	markExecCompleted(stream, pending)
-	reason = firstNonEmpty(strings.TrimSpace(reason), "subagent progress timeout")
-	resumeID := strings.TrimSpace(pending.SubagentResumeID)
-	resultPayload := fmt.Sprintf("Task is still running after %s. Do not assume it stopped or cancel it. Wait for its result, or send a short status/progress check by resuming the child.", reason)
-	if resumeID != "" {
-		resultPayload += fmt.Sprintf(" Resume agent ID: %s.", resumeID)
-	} else {
-		resultPayload += " A resumable agent ID has not been reported yet."
-	}
-	if err := service.appendToolResult(stream, pending.ToolCallID, "Task", pending.ArgsJSON, resultPayload, pending.ReasoningContent, nil); err != nil {
-		return err
-	}
-	if err := service.closeSubagentDispatch(stream, pending, "still_running"); err != nil {
-		return err
-	}
-	if err := service.syncSummaryCarryForward(stream.ConversationID, stream.RequestID, pending.ModelCallID); err != nil {
-		return err
-	}
-	if err := service.publishToolCallCompleted(stream.RequestID, pending.ToolCallID, pending.ModelCallID, nil); err != nil {
-		return err
-	}
-	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
-		return err
-	}
-	return service.reconcileStream(stream)
+	return service.recordSubagentResultUnknown(stream, pending, firstNonEmpty(strings.TrimSpace(reason), "subagent progress timeout"))
 }
 
 func (service *Service) reconcileParentTodoFromSubagentResult(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
@@ -1246,6 +1435,68 @@ func registerTaskBatchMember(stream *ActiveStream, pending runtimecore.PendingEx
 	}
 }
 
+func releaseTaskBatchParentWait(stream *ActiveStream, pending runtimecore.PendingExec) {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "subagent" || strings.TrimSpace(pending.ToolCallID) == "" {
+		return
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	batch := stream.TaskBatches[pending.ProviderPass]
+	if batch == nil {
+		return
+	}
+	member := batch.Members[strings.TrimSpace(pending.ToolCallID)]
+	if member == nil || member.Terminal {
+		return
+	}
+	member.ParentReleased = true
+}
+
+func detachPendingSubagentExec(stream *ActiveStream, pending runtimecore.PendingExec) {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "subagent" {
+		return
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	current, ok := stream.PendingExecs[pending.ExecID]
+	if !ok || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass || strings.TrimSpace(current.ToolCallID) != strings.TrimSpace(pending.ToolCallID) {
+		return
+	}
+	delete(stream.PendingExecs, pending.ExecID)
+	stream.UpdatedAt = time.Now().UTC()
+}
+
+func latestSubagentGenerationLocked(stream *ActiveStream, toolCallID string) int {
+	if stream == nil || strings.TrimSpace(toolCallID) == "" {
+		return 0
+	}
+	toolCallID = strings.TrimSpace(toolCallID)
+	latest := 0
+	for _, pending := range stream.PendingExecs {
+		if strings.TrimSpace(pending.ExecKind) == "subagent" && strings.TrimSpace(pending.ToolCallID) == toolCallID && pending.ProviderPass > latest {
+			latest = pending.ProviderPass
+		}
+	}
+	for _, state := range stream.SubagentFinalizations {
+		if state == nil || strings.TrimSpace(state.Pending.ToolCallID) != toolCallID {
+			continue
+		}
+		if state.Pending.ProviderPass > latest {
+			latest = state.Pending.ProviderPass
+		}
+	}
+	return latest
+}
+
+func subagentGenerationIsCurrent(stream *ActiveStream, pending runtimecore.PendingExec) bool {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "subagent" || strings.TrimSpace(pending.ToolCallID) == "" {
+		return false
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	return pending.ProviderPass == latestSubagentGenerationLocked(stream, pending.ToolCallID)
+}
+
 func markTaskBatchTerminalLocked(stream *ActiveStream, pending runtimecore.PendingExec) {
 	if stream == nil || strings.TrimSpace(pending.ExecKind) != "subagent" || strings.TrimSpace(pending.ToolCallID) == "" {
 		return
@@ -1282,7 +1533,7 @@ func taskBatchAllowsParentNotification(stream *ActiveStream) (int, bool) {
 		return 0, true
 	}
 	for _, member := range selected.Members {
-		if member == nil || !member.Terminal {
+		if member == nil || (!member.Terminal && !member.ParentReleased) {
 			return selected.Generation, false
 		}
 	}
@@ -1306,6 +1557,7 @@ func taskBatchDebugSnapshot(stream *ActiveStream, generation int) []map[string]a
 		}
 		members = append(members, map[string]any{
 			"tool_call_id":    member.ToolCallID,
+			"parent_released": member.ParentReleased,
 			"terminal":        member.Terminal,
 			"terminal_source": member.TerminalSource,
 		})
@@ -1353,26 +1605,22 @@ func (service *Service) closeSubagentDispatch(stream *ActiveStream, pending runt
 }
 
 func (service *Service) recoverSubagentWithoutResult(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
-	if stream == nil {
+	return service.recordSubagentResultUnknown(stream, pending, firstNonEmpty(strings.TrimSpace(reason), "subagent result was not returned"))
+}
+
+func (service *Service) recordSubagentResultUnknown(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
+	if service == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "subagent" {
 		return nil
 	}
-	markExecCompleted(stream, pending)
-	reason = firstNonEmpty(strings.TrimSpace(reason), "subagent result was not returned")
-	resultPayload := fmt.Sprintf("Task failed: %s", reason)
-	if err := service.appendToolResult(stream, pending.ToolCallID, "Task", pending.ArgsJSON, resultPayload, pending.ReasoningContent, nil); err != nil {
-		return err
-	}
-	if err := service.closeSubagentDispatch(stream, pending, "result_missing"); err != nil {
-		return err
-	}
-	if err := service.syncSummaryCarryForward(stream.ConversationID, stream.RequestID, pending.ModelCallID); err != nil {
-		return err
-	}
-	if err := service.publishToolCallCompleted(stream.RequestID, pending.ToolCallID, pending.ModelCallID, nil); err != nil {
-		return err
-	}
-	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
-		return err
-	}
-	return service.reconcileStream(stream)
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "subagent_result_unknown", map[string]any{
+			"tool_call_id": pending.ToolCallID,
+			"exec_id":      pending.ExecID,
+			"message_id":   pending.MessageID,
+			"generation":   pending.ProviderPass,
+			"reason":       strings.TrimSpace(reason),
+			"terminal":     false,
+		}),
+	})
+	return err
 }

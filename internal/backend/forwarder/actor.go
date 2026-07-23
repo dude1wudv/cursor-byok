@@ -134,6 +134,17 @@ func (service *Service) dispatchInboundIntent(intent InboundIntent) error {
 	if service == nil {
 		return fmt.Errorf("forwarder service is nil")
 	}
+	if intent.ExecClientMessage != nil && intent.ExecClientMessage.GetSubagentResult() != nil {
+		if stream, ok := service.broker.Get(intent.RequestID); ok && stream != nil && isTerminalIntentStream(stream) {
+			if pending, found := selectPendingSubagentFinalization(intent.ExecClientMessage.GetExecId(), intent.ExecClientMessage.GetId(), stream); found {
+				result, err := service.execBridge.ApplyExecClientMessage(intent.ExecClientMessage, pending)
+				if err != nil {
+					return err
+				}
+				return service.finalizeSubagentExecResult(stream, pending, intent.ExecClientMessage, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
+			}
+		}
+	}
 	stream, err := service.streamForIntent(intent)
 	if err != nil {
 		return err
@@ -1361,15 +1372,7 @@ func (service *Service) handleTimerEvent(stream *ActiveStream, payload *streamTi
 		if !ok || current.MessageID != payload.MessageID || strings.TrimSpace(current.ExecKind) != "subagent" {
 			return nil
 		}
-		if !subagentAwaitingResult(current.StreamState) {
-			delay, reason := subagentTimeoutDelayAndReason(current, time.Now().UTC())
-			if delay > 0 {
-				service.scheduleSubagentResultTimeout(stream.RequestID, current, delay, reason)
-				return nil
-			}
-			return service.recoverSubagentStillRunning(stream, current, reason)
-		}
-		return service.recoverSubagentWithoutResult(stream, current, payload.Reason)
+		return service.recordSubagentResultUnknown(stream, current, payload.Reason)
 	case streamTimerOrphanCancel:
 		stream.mu.Lock()
 		subscriberCount := len(stream.Subscribers)

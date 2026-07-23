@@ -121,6 +121,7 @@ type StreamSubscriber struct {
 
 type TaskBatchMember struct {
 	ToolCallID     string    `json:"tool_call_id"`
+	ParentReleased bool      `json:"parent_released,omitempty"`
 	Terminal       bool      `json:"terminal"`
 	TerminalSource string    `json:"terminal_source,omitempty"`
 	TerminalAt     time.Time `json:"terminal_at,omitempty"`
@@ -134,6 +135,8 @@ type TaskBatch struct {
 }
 type SubagentFinalizationState struct {
 	Pending                  runtimecore.PendingExec
+	BackgroundAcknowledged   bool
+	ExplicitlyCanceled       bool
 	ResultReceived           bool
 	ToolResultPersisted      bool
 	TodoReconciled           bool
@@ -143,6 +146,11 @@ type SubagentFinalizationState struct {
 	ToolCompletedPublished   bool
 	CheckpointPublished      bool
 	ReconcileRequested       bool
+}
+
+type queuedShellDispatch struct {
+	Message *agentv1.AgentServerMessage
+	Pending runtimecore.PendingExec
 }
 
 type ActiveStream struct {
@@ -195,6 +203,8 @@ type ActiveStream struct {
 	Subscribers                 map[string]*StreamSubscriber
 	CheckpointConversation      *ConversationFile
 	PendingExecs                map[string]runtimecore.PendingExec
+	ActiveForegroundShellExecID string
+	QueuedForegroundShells      []queuedShellDispatch
 	PendingInteractions         map[string]runtimecore.PendingInteraction
 	PartialToolCallIDs          map[string]struct{}
 	PatchEditQueues             map[string][]queuedPatchEditOperation

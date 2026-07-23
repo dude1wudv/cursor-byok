@@ -1,6 +1,11 @@
-# Cursor助手 v0.0.63
+# Cursor助手 v0.0.64
 
-本版本修复子代理操作任务被误派为只读的问题，并包含 OpenAI Responses 与 Cursor Shell 协议兼容改进。
+本版本同步 Cursor 3.12.17 执行协议，并修复 PowerShell/Shell 被误显示为 `Skipped`、运行中的子代理被误显示为 `Stopped` 的生命周期兼容问题。
+
+## Cursor 3.12.17 协议
+
+- 同步 `ShellArgs.conversation_id = 21`，确保 Shell 请求与 started/completed 投影使用同一会话关联。
+- 同步 `ConversationStateStructure` 字段 30/31 及 `SubagentRunState`、`SubagentRunStatus`，为客户端提供可重放的子代理运行状态。
 
 ## 子代理派发
 
@@ -17,14 +22,20 @@
 
 ## Cursor Shell 兼容
 
-- Shell 请求始终携带 Cursor 需要的 `parsing_result`。
-- 复杂 PowerShell 语法使用 `parsing_failed=true`，不改写原始命令。
-- Cursor 拒绝 Shell 后在当前 turn 打开有限 circuit，阻止连续产生 `Skipped` 卡。
-- transport incomplete 保持原有 recovery 行为。
+- Shell 请求始终携带 Cursor 需要的 `parsing_result`，复杂 PowerShell 语法保留原文并仅标记 `parsing_failed=true`。
+- 同一 provider pass 的前台 Shell 采用 single-flight/FIFO，前一条收到真实终态后才派发下一条。
+- `Skipped` 审批提示、空 payload、未知事件、transport close 和 stall 不再合成成功或失败终态；迟到的匹配执行结果仍可正常收口。
+- 只有匹配的 exit/backgrounded、确认未执行的拒绝或显式取消才完成 Shell；权威拒绝后的队列会返回明确的本地 blocked 结果。
+
+## 子代理生命周期
+
+- Task 派发、后台运行及真实结果分别投影为 `RUNNING`、`BACKGROUNDED`、`SUCCESS/ERROR`，只有匹配当前运行代次的显式用户取消才投影为 `ABORTED`。
+- 后台空回执与 `TASK_FINISHED` 无结果仅作为进度/完成提示，不再把仍运行的子代理显示为 `Stopped`。
+- 匹配的迟到最终结果可幂等更新 checkpoint；错误 ID、旧 generation、transport close 与 lease/grace timeout 不再伪造终态。
 
 ## Windows 发布资产
 
-- `cursor-byok-0.0.63-windows-amd64.zip`
+- `cursor-byok-0.0.64-windows-amd64.zip`
   - 内含 `cursor-byok-windows-amd64.exe`
 
 适用于 Windows 10/11 amd64。

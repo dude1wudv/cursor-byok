@@ -506,6 +506,7 @@ func (projector *HistoryProjector) ProjectLegacyCheckpoint(conversation *Convers
 	if structuredState.HasTodos {
 		state.Todos = encodeConversationTodoBytes(structuredState.Todos)
 	}
+	state.SubagentRunsByParentToolCallId = projectSubagentRunStates(conversation.Entries)
 	grouped := make(map[int64][]HistoryEntry)
 	order := make([]int64, 0, conversation.NextTurnSeq)
 	for _, entry := range checkpointProjectionEntries(conversation.Entries) {

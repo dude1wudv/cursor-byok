@@ -216,6 +216,8 @@ type PendingExec struct {
 	MessageID uint32
 	// ExecID 是执行桥唯一标识。
 	ExecID string
+	// ConversationID 保存执行桥所属会话，供请求与 started/completed 投影保持一致。
+	ConversationID string
 	// ProviderPass 表示创建该执行桥时所属的 provider pass。
 	ProviderPass int
 	// ModelCallID 是触发该执行桥的模型调用标识。

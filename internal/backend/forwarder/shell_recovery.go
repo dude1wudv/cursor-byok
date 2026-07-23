@@ -1,8 +1,6 @@
 package forwarder
 
 import (
-	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -163,21 +161,13 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 	})
 	// #endregion
 	pending.ShellRecoveryScheduled = true
-	markExecCompleted(stream, pending)
-	resultPayload := buildSyntheticShellResultPayload(pending, reason)
-	log.Printf(
-		"forwarder synthetic shell recovery request_id=%s tool_call_id=%s message_id=%d exec_id=%s reason=%s stream_state=%s",
-		strings.TrimSpace(stream.RequestID),
-		strings.TrimSpace(pending.ToolCallID),
-		pending.MessageID,
-		strings.TrimSpace(pending.ExecID),
-		strings.TrimSpace(reason),
-		strings.TrimSpace(pending.StreamState),
-	)
-	if err := service.appendToolResult(stream, pending.ToolCallID, deriveToolNameFromPendingExec(pending), pending.ArgsJSON, resultPayload, pending.ReasoningContent, nil); err != nil {
-		return err
+	stream.mu.Lock()
+	if current, ok := stream.PendingExecs[pending.ExecID]; ok && current.MessageID == pending.MessageID {
+		current.ShellRecoveryScheduled = true
+		stream.PendingExecs[pending.ExecID] = current
 	}
-	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+	stream.mu.Unlock()
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
 		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_stream_stalled", map[string]any{
 			"tool_call_id":             pending.ToolCallID,
 			"message_id":               pending.MessageID,
@@ -194,60 +184,8 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 			"stdout_buffer_bytes":      len(pending.StdoutBuffer),
 			"stderr_buffer_bytes":      len(pending.StderrBuffer),
 			"shell_recovery_scheduled": pending.ShellRecoveryScheduled,
+			"terminal":                 false,
 		}),
-	}); err != nil {
-		return err
-	}
-	if err := service.syncSummaryCarryForward(stream.ConversationID, stream.RequestID, pending.ModelCallID); err != nil {
-		return err
-	}
-	if err := service.publishToolCallCompleted(stream.RequestID, pending.ToolCallID, pending.ModelCallID, nil); err != nil {
-		return err
-	}
-	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
-		return err
-	}
-	return service.reconcileStream(stream)
-}
-
-func buildSyntheticShellResultPayload(pending runtimecore.PendingExec, reason string) string {
-	sections := make([]string, 0, 2)
-	if captured := summarizeCapturedShellOutput(pending.StdoutBuffer, pending.StderrBuffer); captured != "" {
-		sections = append(sections, captured)
-	}
-	noteLines := []string{
-		"<shell-incomplete>",
-		"Missing terminal shell stream event (expected exit or backgrounded).",
-	}
-	switch strings.TrimSpace(reason) {
-	case shellRecoveryReasonTransportClosed:
-		noteLines = append(noteLines, "The shell transport closed before a terminal event arrived.")
-	case shellRecoveryReasonForegroundDeadline:
-		noteLines = append(noteLines, fmt.Sprintf("The foreground wait window expired after %dms without a terminal event.", shellForegroundTimeoutMS(pending.ArgsJSON)))
-	default:
-		noteLines = append(noteLines, "The shell stream stopped progressing before a terminal event arrived.")
-	}
-	noteLines = append(noteLines,
-		"The command may still be running in the Cursor app client.",
-		"</shell-incomplete>",
-	)
-	sections = append(sections, strings.Join(noteLines, "\n"))
-	return strings.Join(sections, "\n\n")
-}
-
-func summarizeCapturedShellOutput(stdout string, stderr string) string {
-	trimmedStdout := strings.TrimSpace(stdout)
-	trimmedStderr := strings.TrimSpace(stderr)
-	sections := make([]string, 0, 2)
-	if trimmedStdout != "" {
-		sections = append(sections, trimmedStdout)
-	}
-	if trimmedStderr != "" {
-		if trimmedStdout != "" {
-			sections = append(sections, "<stderr>\n"+trimmedStderr+"\n</stderr>")
-		} else {
-			sections = append(sections, trimmedStderr)
-		}
-	}
-	return strings.Join(sections, "\n\n")
+	})
+	return err
 }
