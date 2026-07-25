@@ -140,6 +140,29 @@ func TestTaskSchemaUsesAccessMode(t *testing.T) {
 	assertTaskAccessModeSchema(t, encoded, []string{"inspect"})
 }
 
+func TestRootTaskToolLoadsInEveryMode(t *testing.T) {
+	for _, mode := range []agentv1.AgentMode{
+		agentv1.AgentMode_AGENT_MODE_AGENT,
+		agentv1.AgentMode_AGENT_MODE_ASK,
+		agentv1.AgentMode_AGENT_MODE_PLAN,
+		agentv1.AgentMode_AGENT_MODE_DEBUG,
+		agentv1.AgentMode_AGENT_MODE_MULTITASK,
+	} {
+		t.Run(mode.String(), func(t *testing.T) {
+			_, names, err := NewToolCatalog(capabilityTestModelDirectory{}).Load(mode, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range names {
+				if name == "Task" {
+					return
+				}
+			}
+			t.Fatal("Task tool is missing")
+		})
+	}
+}
+
 func assertTaskAccessModeSchema(t *testing.T, raw []byte, wantModes []string) {
 	t.Helper()
 	var tools []map[string]any

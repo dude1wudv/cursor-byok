@@ -649,7 +649,7 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		}
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("User-Agent", ClaudeCodeUserAgent)
+		httpReq.Header.Set("User-Agent", CodexDesktopUserAgent())
 		if err := ApplyCustomHeaders(httpReq, req.CustomHeadersEnabled, req.CustomHeadersJSON); err != nil {
 			return nil, err
 		}
@@ -1110,7 +1110,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		}
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("User-Agent", ClaudeCodeUserAgent)
+		httpReq.Header.Set("User-Agent", CodexDesktopUserAgent())
 		if err := ApplyCustomHeaders(httpReq, req.CustomHeadersEnabled, req.CustomHeadersJSON); err != nil {
 			return nil, err
 		}

@@ -536,9 +536,13 @@
             "description": "The task for the agent to perform",
             "type": "string"
           },
-          "readonly": {
-            "description": "Optional child access. generalPurpose defaults to writable when omitted; explore and longContextRead are always readonly.",
-            "type": "boolean"
+          "access_mode": {
+            "description": "Required task intent. inspect is read-only. act is required for any Shell command, process launch, edit, delete, build, test, deployment, or filesystem-writing validation and is only valid with generalPurpose.",
+            "enum": [
+              "inspect",
+              "act"
+            ],
+            "type": "string"
           },
           "resume": {
             "description": "Optional agent ID to resume from. If provided, sends a follow-up message to the agent when its turn is complete.",
@@ -554,6 +558,7 @@
           }
         },
         "required": [
+          "access_mode",
           "description",
           "prompt",
           "subagent_type"

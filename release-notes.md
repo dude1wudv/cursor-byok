@@ -1,6 +1,15 @@
-# Cursor助手 v0.0.65
+# Cursor助手 v0.0.66
 
-本版本是基于 v0.0.64 的子代理唤醒热修复，仅修复同一 request ID 跨 run 复用时的 BidiAppend 序号换代问题；v0.0.64 的 Shell 与子代理生命周期修复保持不变。
+本版本在 v0.0.65 的子代理与 BidiAppend 修复基础上，统一 OpenAI 请求的客户端标识，并同步 Task 工具 schema。
+
+## Codex Desktop 请求标识
+
+- OpenAI Chat Completions 与 Responses 请求使用 Codex 原生 `Codex Desktop/<版本>` User-Agent 前缀。
+- 启动后从本机已安装的 Codex Desktop 内置 CLI 自动读取版本；读取失败时使用构建时验证的版本回退值。
+
+## Task schema
+
+- 根模式的 Task 工具要求显式填写 `access_mode`，并限制为 `inspect` 或 `act`。
 
 ## BidiAppend 跨 run 序号
 
@@ -16,7 +25,7 @@
 
 ## Windows 发布资产
 
-- `cursor-byok-0.0.65-windows-amd64.zip`
+- `cursor-byok-0.0.66-windows-amd64.zip`
   - 内含 `cursor-byok-windows-amd64.exe`
 
 适用于 Windows 10/11 amd64。
