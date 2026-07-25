@@ -37,7 +37,6 @@ func NewReminderInjector() *DefaultReminderInjector {
 // Inject 根据 mode、最近用户输入和工具上下文生成本轮附加提醒。
 func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversation *ConversationFile, replayMessages []modeladapter.Message, latestUserText string, toolNames []string) PromptReminders {
 	_ = toolNames
-	reminders := make([]string, 0, 6)
 	normalizedMode, err := validateSupportedActiveMode(mode)
 	if err != nil {
 		normalizedMode = agentv1.AgentMode_AGENT_MODE_AGENT
@@ -45,7 +44,6 @@ func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversa
 	if conversation != nil && isChildConversationSubagentTypeName(conversation.SubagentTypeName) {
 		readonly := normalizedMode == agentv1.AgentMode_AGENT_MODE_PLAN
 		return appendCurrentTurnAttentionReminders(PromptReminders{
-			SystemParts: reminders,
 			PromptContexts: []PromptContextMessage{
 				newPromptContextReminder(promptContextSourceSubagentContract, subagentContractText(readonly, conversation.SubagentTypeName, conversation.SubagentRole, conversation.SubagentDepth)),
 				newPromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, true, readonly)),
@@ -55,31 +53,8 @@ func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversa
 	if normalizedMode == agentv1.AgentMode_AGENT_MODE_DEBUG {
 		return debugModePromptReminders(conversation)
 	}
-	reminders = append(reminders, "If multiple <current_plan> or <todo_list> blocks appear in the conversation, treat the last block of each type as the current source of truth.")
-	switch normalizedMode {
-	case agentv1.AgentMode_AGENT_MODE_ASK:
-		reminders = append(reminders, "You are in ask mode. Prefer direct answers and only use tools when they are necessary to answer accurately.")
-		reminders = append(reminders, "Lead with the conclusion, keep the response concise, and avoid unsolicited example code or long bullet lists.")
-	case agentv1.AgentMode_AGENT_MODE_PLAN:
-		reminders = append(reminders, "You are currently working in plan mode for the user. Prioritize investigation, decomposition, tradeoff analysis, and producing or refining a concrete plan.")
-		reminders = append(reminders, "Do not directly modify files in plan mode. Avoid direct file-editing tools such as Write, Delete, and PatchEdit.")
-		reminders = append(reminders, "For non-trivial plan-mode work, first do a quick reconnaissance yourself, then launch 2-4 parallel Task subagents with subagent_type=\"explore\" to investigate distinct angles before CreatePlan. Avoid using exactly one subagent for broad tasks: either handle narrow tasks directly, or split broad tasks into multiple independent investigations. Synthesize the subagent results yourself; do not delegate the final plan.")
-		reminders = append(reminders, "For narrow, well-scoped tasks, you can investigate directly and then create a lean plan with only the essential stages, tradeoffs, and next steps.")
-		if hasCurrentPlan(conversation) {
-			reminders = append(reminders, "A current plan already exists. Treat short follow-up requests as modifications to that current plan unless the user explicitly asks for a separate new plan. When calling CreatePlan for an existing plan, send the complete revised plan, preserve relevant existing content, incorporate the user's requested changes, and omit the name field. The CreatePlan name field is only allowed on the first CreatePlan call; never use a later name to rename or create a separate plan.")
-		}
-	case agentv1.AgentMode_AGENT_MODE_MULTITASK:
-		reminders = append(reminders, "You are in multitask mode. Act as a coordinator: for a broad investigation, delegate 2-4 independent read-only explore tasks; otherwise delegate one coherent worker task with Task instead of duplicating the work in the foreground.")
-		reminders = append(reminders, "After delegating the only coherent worker task for a request, do not continue the same work in the foreground. Only do distinct coordination work, answer a new independent question, or synthesize after multiple workers return.")
-		reminders = append(reminders, "Do not wait, sleep, or poll just for a running worker to complete. End the response unless there is separate useful coordination to do.")
-		reminders = append(reminders, "Do not over-decompose small or medium tasks into many sibling workers. Use multiple sibling workers only for clearly independent top-level workstreams.")
-	default:
-		reminders = append(reminders, "You are in agent mode. Use the available tools when they materially improve correctness or efficiency.")
-		reminders = append(reminders, "When reporting progress or completion, lead with the result, mention only key changes or verification, and avoid long recaps, exhaustive lists, or unsolicited example code.")
-	}
 
 	result := PromptReminders{
-		SystemParts: reminders,
 		PromptContexts: []PromptContextMessage{
 			newPromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, false, false)),
 		},
@@ -222,7 +197,7 @@ func currentModeContractText(mode agentv1.AgentMode, childSubagent bool, childRe
 	case agentv1.AgentMode_AGENT_MODE_DEBUG:
 		return "For the turn that contains this reminder, the active mode is debug. Follow the Debug Mode workflow from the static debug prompt: inspect or reproduce before editing, keep 3-5 concrete hypotheses, use the injected debug session log path when temporary instrumentation is useful, and verify with runtime evidence. Do not call CreatePlan or SwitchMode."
 	case agentv1.AgentMode_AGENT_MODE_MULTITASK:
-		return "For the turn that contains this reminder, the active mode is multitask. For broad investigation, first do minimal reconnaissance and then delegate 2-4 independent read-only explore tasks with Task; otherwise act as the foreground coordinator for one coherent worker. Avoid duplicating delegated work and do not wait just for a worker to finish. When a Task result returns, verify it against the workspace and acceptance criteria; the child only reports evidence, while you own final acceptance and the matching parent Todo state."
+		return "For the turn that contains this reminder, the active mode is multitask. For broad investigation, first do minimal reconnaissance and then delegate 2-4 independent read-only explore tasks with Task; otherwise coordinate one coherent worker. Avoid duplicating delegated work and do not wait just for a worker to finish. A single worker's non-empty success is the final result and ends the turn without parent restatement. Only synthesize after multiple workers return, or continue when a worker fails, is canceled, backgrounds, or reports a blocker."
 	default:
 		return "For the turn that contains this reminder, the active mode is agent. CreatePlan is not available in this mode; do not call CreatePlan. If the user explicitly asks to create or revise a plan, call SwitchMode to return to plan mode first. If there is an accepted or current plan, execute or continue the implementation using the available agent-mode tools. When a Task result returns, verify it against the workspace and acceptance criteria; the child only reports evidence, while you own final acceptance and the matching parent Todo state."
 	}
@@ -239,7 +214,7 @@ func debugModePromptReminders(conversation *ConversationFile) PromptReminders {
 			newPromptContextMessage(promptContextSourceDebugModeReminder, modeladapter.Message{
 				Role:    "user",
 				Content: strings.TrimSpace(content),
-			}, false),
+			}, true),
 		},
 	}
 }

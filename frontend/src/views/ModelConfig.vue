@@ -264,6 +264,15 @@ onBeforeUnmount(() => {
           <Button variant="primary" :disabled="appState.configSaving || batchTesting" @click="openEditor()">新增模型</Button>
         </div>
       </div>
+      <Card class="mt-3 border-[#31543f] bg-[#1f2b24]">
+        <div class="text-sm font-medium text-white">模型路由说明</div>
+        <div class="mt-1 text-xs leading-5 text-[#a3b8aa]">
+          每张卡代表一个稳定渠道：显示名称用于识别渠道，模型标识是实际发送给 provider 的 model。列表首项只用于全新会话的默认选择；已有会话会固定其渠道，不会因配置顺序变化而切换。
+        </div>
+        <div class="mt-1 text-xs leading-5 text-[#8fa798]">
+          子代理按 task_role 匹配启用渠道；同一角色存在多个候选时，配置顺序才决定自动路由优先级。Task 卡片只显示 worker 使用的模型，不表示父会话模型已切换。
+        </div>
+      </Card>
       <Card class="mt-3">
         <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div class="min-w-0">

@@ -25,6 +25,7 @@ type ConversationFile struct {
 	SubagentRole                    string                                `json:"subagent_role,omitempty"`
 	SubagentDepth                   int                                   `json:"subagent_depth,omitempty"`
 	Mode                            string                                `json:"mode"`
+	SelectedModelAdapterID          string                                `json:"selected_model_adapter_id,omitempty"`
 	ContextVersion                  int64                                 `json:"context_version,omitempty"`
 	CurrentLoopID                   string                                `json:"current_loop_id,omitempty"`
 	CurrentLoopStatus               string                                `json:"current_loop_status,omitempty"`
@@ -89,12 +90,13 @@ type HistoryEntry struct {
 }
 
 type ConversationSummary struct {
-	ConversationID string    `json:"conversation_id"`
-	Mode           string    `json:"mode"`
-	EntriesCount   int       `json:"entries_count"`
-	NextTurnSeq    int64     `json:"next_turn_seq"`
-	NextEntrySeq   int64     `json:"next_entry_seq"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ConversationID         string    `json:"conversation_id"`
+	Mode                   string    `json:"mode"`
+	SelectedModelAdapterID string    `json:"selected_model_adapter_id,omitempty"`
+	EntriesCount           int       `json:"entries_count"`
+	NextTurnSeq            int64     `json:"next_turn_seq"`
+	NextEntrySeq           int64     `json:"next_entry_seq"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 type StreamStatus string
@@ -138,6 +140,7 @@ type SubagentFinalizationState struct {
 	BackgroundAcknowledged   bool
 	ExplicitlyCanceled       bool
 	ResultReceived           bool
+	ResultOutcome            string
 	ToolResultPersisted      bool
 	TodoReconciled           bool
 	ClosureMetadataPersisted bool
@@ -226,6 +229,7 @@ type ActiveStream struct {
 	ShellExecTombstones         map[string]shellExecTombstone
 	PendingInteractions         map[string]runtimecore.PendingInteraction
 	PartialToolCallIDs          map[string]struct{}
+	PartialToolCallArgs         map[string]string
 	PatchEditQueues             map[string][]queuedPatchEditOperation
 	MCPToolServers              map[string]string
 	WorkspacePaths              []string
@@ -328,7 +332,6 @@ type ToolCatalog interface {
 }
 
 type PromptReminders struct {
-	SystemParts    []string
 	TailMessages   []modeladapter.Message
 	PromptContexts []PromptContextMessage
 }

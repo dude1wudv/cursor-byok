@@ -212,27 +212,16 @@ var agentModeToolNames = map[string]struct{}{
 }
 
 var multitaskModeToolNames = map[string]struct{}{
-	"AskQuestion":          {},
-	"CallMcpTool":          {},
-	"Delete":               {},
-	"FetchMcpResource":     {},
-	"GenerateImage":        {},
-	"Glob":                 {},
-	"Grep":                 {},
-	"Ls":                   {},
-	"PatchEdit":            {},
-	"Read":                 {},
-	"ReadLints":            {},
-	"Shell":                {},
-	"AwaitShell":           {},
-	"WriteShellStdin":      {},
-	"ForceBackgroundShell": {},
-	"SwitchMode":           {},
-	"Task":                 {},
-	"TodoWrite":            {},
-	"WebFetch":             {},
-	"WebSearch":            {},
-	"Write":                {},
+	"AskQuestion": {},
+	"Glob":        {},
+	"Grep":        {},
+	"Ls":          {},
+	"Read":        {},
+	"SwitchMode":  {},
+	"Task":        {},
+	"TodoWrite":   {},
+	"WebFetch":    {},
+	"WebSearch":   {},
 }
 
 var debugModeToolNames = map[string]struct{}{
@@ -396,6 +385,15 @@ func validateSubagentToolInvocation(mode agentv1.AgentMode, subagentTypeName str
 func validateSubagentToolInvocationForConversation(mode agentv1.AgentMode, subagentTypeName string, subagentRole string, toolName string, argsJSON []byte) error {
 	if !isToolAllowedInConversation(mode, subagentTypeName, subagentRole, toolName) {
 		return fmt.Errorf("tool invocation is not enabled in mode %s: %s", mode.String(), toolName)
+	}
+	if isChildConversationSubagentTypeName(subagentTypeName) && normalizeSubagentRole(subagentRole) == "medium_explore" && strings.TrimSpace(toolName) == "Task" {
+		args, err := runtimecore.DecodeArgsMap(argsJSON)
+		if err != nil {
+			return fmt.Errorf("decode nested Task args: %w", err)
+		}
+		if strings.TrimSpace(runtimecore.ReadStringArg(args, "access_mode", "accessMode")) != runtimecore.TaskAccessModeInspect {
+			return fmt.Errorf("nested medium_explore Task access_mode must be %q", runtimecore.TaskAccessModeInspect)
+		}
 	}
 	if !isChildConversationSubagentTypeName(subagentTypeName) || normalizeMode(mode) != agentv1.AgentMode_AGENT_MODE_PLAN || strings.TrimSpace(toolName) != "FetchMcpResource" {
 		return nil

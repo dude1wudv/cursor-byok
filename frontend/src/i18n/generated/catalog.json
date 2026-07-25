@@ -723,6 +723,18 @@
         }
       ]
     },
+    "4c82a12d56c26d4a": {
+      "source": "模型路由说明",
+      "kind": "text",
+      "placeholders": 0,
+      "refs": [
+        {
+          "file": "src/views/ModelConfig.vue",
+          "line": 269,
+          "column": 9
+        }
+      ]
+    },
     "4d8c1c5b42830791": {
       "source": "未知",
       "kind": "text",
@@ -797,6 +809,18 @@
           "file": "src/views/ModelConfig.vue",
           "line": 40,
           "column": 12
+        }
+      ]
+    },
+    "61040c69dde14141": {
+      "source": "每张卡代表一个稳定渠道：显示名称用于识别渠道，模型标识是实际发送给 provider 的 model。列表首项只用于全新会话的默认选择；已有会话会固定其渠道，不会因配置顺序变化而切换。",
+      "kind": "text",
+      "placeholders": 0,
+      "refs": [
+        {
+          "file": "src/views/ModelConfig.vue",
+          "line": 271,
+          "column": 11
         }
       ]
     },
@@ -2410,6 +2434,18 @@
           "file": "src/state/appState.js",
           "line": 800,
           "column": 40
+        }
+      ]
+    },
+    "fd8575d04e32b574": {
+      "source": "子代理按 task_role 匹配启用渠道；同一角色存在多个候选时，配置顺序才决定自动路由优先级。Task 卡片只显示 worker 使用的模型，不表示父会话模型已切换。",
+      "kind": "text",
+      "placeholders": 0,
+      "refs": [
+        {
+          "file": "src/views/ModelConfig.vue",
+          "line": 275,
+          "column": 11
         }
       ]
     },

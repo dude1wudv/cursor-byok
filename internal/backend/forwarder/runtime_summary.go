@@ -147,6 +147,7 @@ func (service *Service) syncConversationRecord(conversationID string, conversati
 		item.SubagentTypeName = conversation.SubagentTypeName
 		item.SubagentDepth = conversation.SubagentDepth
 		item.Mode = conversation.Mode
+		item.SelectedModelAdapterID = conversation.SelectedModelAdapterID
 		item.TokenDetailsUsedTokens = conversation.TokenDetailsUsedTokens
 		item.TokenDetailsMaxTokens = conversation.TokenDetailsMaxTokens
 		item.AutoCompactionPending = conversation.AutoCompactionPending

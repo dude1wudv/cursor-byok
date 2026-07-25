@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -28,6 +27,7 @@ import (
 	runtimecore "cursor/internal/backend/agent/core"
 	modeladapter "cursor/internal/backend/agent/model"
 	protocol "cursor/internal/backend/agent/protocol"
+	"cursor/internal/modelchannel"
 )
 
 const (
@@ -49,30 +49,6 @@ const (
 
 	runtimeThinkingEffortParameterID = "thinking_effort"
 )
-
-func writeGPTToolDebugLog(location string, message string, hypothesisID string, data map[string]any) {
-	// #region agent log
-	payload := map[string]any{
-		"sessionId":    "cb43403c-f2ab-49a7-8930-9ffed00df9c7",
-		"runId":        "pre-fix",
-		"hypothesisId": hypothesisID,
-		"location":     location,
-		"message":      message,
-		"data":         data,
-		"timestamp":    time.Now().UnixMilli(),
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-	file, err := os.OpenFile(`C:\Users\sun\OneDrive\桌面\.cursor\debug-cb43403c-f2ab-49a7-8930-9ffed00df9c7.log`, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	_, _ = file.Write(append(encoded, '\n'))
-	_ = file.Close()
-	// #endregion
-}
 
 type parsedSubagentModelOverrides struct {
 	Overrides map[string]runtimecore.SubagentModelOverrideSelection
@@ -776,9 +752,6 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 			"overrides":      subagentModelOverrideSummaries(parsedOverrides.Overrides),
 			"ignored":        parsedOverrides.Ignored,
 		})
-		if intent.ModelID == "" {
-			intent.ModelID = "default"
-		}
 		intent.ModelName = service.resolveRequestedModelName(message, intent.ModelID)
 	case "prewarm_request":
 		prewarmRequest := message.GetPrewarmRequest()
@@ -896,6 +869,67 @@ func planContentHash(planText string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func latestRecordedRootModelID(conversation *ConversationFile) string {
+	if conversation == nil {
+		return ""
+	}
+	for index := len(conversation.Entries) - 1; index >= 0; index-- {
+		entry := conversation.Entries[index]
+		if strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if json.Unmarshal(entry.Payload, &payload) != nil || strings.TrimSpace(payload.Type) != "run_request" {
+			continue
+		}
+		modelID := strings.TrimSpace(readStringValue(payload.Value["model_id"]))
+		if modelID != "" && !modelchannel.IsMetaModelAlias(modelID) {
+			return modelID
+		}
+	}
+	return ""
+}
+
+func (service *Service) applyRootConversationModelAffinity(intent *InboundIntent) error {
+	if service == nil || intent == nil || intent.Prewarm || intent.ClientMessage == nil || intent.ClientMessage.GetRunRequest() == nil || isChildConversationSubagentTypeName(intent.SubagentTypeName) {
+		return nil
+	}
+	if service.resolver == nil {
+		return fmt.Errorf("model adapter resolver is unavailable")
+	}
+	var conversation *ConversationFile
+	var err error
+	if service.store != nil {
+		conversation, err = service.store.LoadConversation(intent.ConversationID)
+		if err != nil {
+			return err
+		}
+	}
+	requestedModelID := strings.TrimSpace(intent.ModelID)
+	if conversation != nil && (requestedModelID == "" || modelchannel.IsMetaModelAlias(requestedModelID)) {
+		requestedModelID = firstNonEmpty(
+			strings.TrimSpace(conversation.SelectedModelAdapterID),
+			latestRecordedRootModelID(conversation),
+		)
+		if requestedModelID == "" {
+			return fmt.Errorf("conversation %q has no persisted model adapter; select a concrete model to resume it", strings.TrimSpace(intent.ConversationID))
+		}
+	}
+	if requestedModelID == "" {
+		requestedModelID = "default"
+	}
+	channel, err := service.resolver.SelectChannelForModel(context.Background(), requestedModelID)
+	if err != nil {
+		return fmt.Errorf("resolve model adapter %q for conversation %q: %w", requestedModelID, strings.TrimSpace(intent.ConversationID), err)
+	}
+	if channel == nil || strings.TrimSpace(channel.ID) == "" {
+		return fmt.Errorf("resolved model adapter is empty for conversation %q", strings.TrimSpace(intent.ConversationID))
+	}
+	intent.ModelID = strings.TrimSpace(channel.ID)
+	intent.ModelName = firstNonEmpty(strings.TrimSpace(channel.Name), service.resolveRequestedModelName(intent.ClientMessage, intent.ModelID), intent.ModelID)
+	return nil
+}
+
 // handleRunIntent 处理 run/prewarm 类 intent，负责建会话、写 turn 和拉起 provider。
 func (service *Service) handleRunIntent(intent InboundIntent) error {
 	intent.UserMessage = normalizeUserMessageForStorage(intent.UserMessage)
@@ -916,6 +950,9 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 			})
 			return nil
 		}
+	}
+	if err := service.applyRootConversationModelAffinity(&intent); err != nil {
+		return err
 	}
 	if !intent.Prewarm {
 		service.cancelOtherConversationActors(
@@ -939,6 +976,9 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	conversation, effectiveMode, turnSeq, initialEntries, err := service.bootstrapRuntimeConversation(intent)
 	if err != nil {
 		return err
+	}
+	if !intent.Prewarm && intent.ClientMessage != nil && intent.ClientMessage.GetRunRequest() != nil && !isChildConversationSubagentTypeName(intent.SubagentTypeName) {
+		conversation.SelectedModelAdapterID = strings.TrimSpace(intent.ModelID)
 	}
 	if isChildConversationSubagentTypeName(intent.SubagentTypeName) && !hasMatchedLaunch && strings.TrimSpace(conversation.ParentConversationID) == "" {
 		prompt := userMessageText(intent.UserMessage)
@@ -1034,6 +1074,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.ShellExecTombstones = make(map[string]shellExecTombstone)
 	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
 	stream.PartialToolCallIDs = make(map[string]struct{})
+	stream.PartialToolCallArgs = make(map[string]string)
 	stream.RecentCompletedExecs = make(map[uint32]time.Time)
 	stream.SubagentFinalizations = make(map[string]*SubagentFinalizationState)
 	stream.TaskBatches = make(map[int]*TaskBatch)
@@ -1224,16 +1265,6 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	if intent.ExecClientMessage == nil {
 		return fmt.Errorf("exec client message is required")
 	}
-	// #region agent log
-	writeGPTToolDebugLog("forwarder/service.go:handleExecResult", "exec client message received", "H2,H3,H4", map[string]any{
-		"request_id":       intent.RequestID,
-		"exec_id":          strings.TrimSpace(intent.ExecClientMessage.GetExecId()),
-		"message_id":       intent.ExecClientMessage.GetId(),
-		"has_shell_stream": intent.ExecClientMessage.GetShellStream() != nil,
-		"has_shell_result": intent.ExecClientMessage.GetShellResult() != nil,
-		"terminal_variant": shellTerminalVariant(intent.ExecClientMessage),
-	})
-	// #endregion
 	pending, found, correlationMismatch := selectPendingExecStrict(intent.ExecClientMessage.GetExecId(), intent.ExecClientMessage.GetId(), stream)
 	if correlationMismatch {
 		service.recordExecCorrelationMismatch(stream, intent.ExecClientMessage)
@@ -1382,24 +1413,6 @@ func (service *Service) logShellTerminalResult(stream *ActiveStream, pending run
 	reason, rejectionClass := shellTerminalRejection(message)
 	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
 	providerItemID, providerCallID, providerStatus := providerToolCorrelation(stream, pending.ToolCallID)
-	// #region agent log
-	writeGPTToolDebugLog("forwarder/service.go:logShellTerminalResult", "shell terminal observed", "H2,H4", map[string]any{
-		"request_id":       stream.RequestID,
-		"provider_pass":    pending.ProviderPass,
-		"model_call_id":    strings.TrimSpace(pending.ModelCallID),
-		"tool_call_id":     strings.TrimSpace(pending.ToolCallID),
-		"exec_id":          strings.TrimSpace(pending.ExecID),
-		"message_id":       pending.MessageID,
-		"terminal_variant": shellTerminalVariant(message),
-		"stream_state":     strings.TrimSpace(pending.StreamState),
-		"rejection_class":  rejectionClass,
-		"rejected_reason":  sanitizeShellRejectedReason(reason),
-		"command_hash":     commandHash,
-		"provider_item_id": providerItemID,
-		"provider_call_id": providerCallID,
-		"provider_status":  providerStatus,
-	})
-	// #endregion
 	if service.debug == nil {
 		return
 	}
@@ -1953,7 +1966,10 @@ func (service *Service) finalizeSubagentExecResult(stream *ActiveStream, pending
 		if _, err := service.appendConversationEntries(stream, stream.ConversationID, entries); err != nil {
 			return err
 		}
-		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) { item.ResultReceived = true })
+		updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) {
+			item.ResultReceived = true
+			item.ResultOutcome = subagentResultOutcome(message.GetSubagentResult())
+		})
 		service.subagentFinalizeRuntime(stream, pending, "result_received", disposition)
 		state.ResultReceived = true
 	}
@@ -2053,12 +2069,6 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 	if intent.ExecClientControlMessage == nil {
 		return fmt.Errorf("exec client control message is required")
 	}
-	// #region agent log
-	writeGPTToolDebugLog("forwarder/service.go:handleExecControl", "exec control message received", "H2,H3", map[string]any{
-		"request_id":   intent.RequestID,
-		"control_type": fmt.Sprintf("%T", intent.ExecClientControlMessage.GetMessage()),
-	})
-	// #endregion
 	pending, found := selectPendingExecByControl(intent.ExecClientControlMessage, stream)
 	if !found {
 		if messageID, ok := execControlMessageID(intent.ExecClientControlMessage); ok {
@@ -3069,33 +3079,6 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		pendingExec.ProviderPass = stream.ProviderPassCount
 		stream.PendingExecs[pendingExec.ExecID] = pendingExec
 		stream.mu.Unlock()
-		if strings.TrimSpace(pendingExec.ExecKind) == "shell" {
-			shellArgs := serverMessage.GetExecServerMessage().GetShellStreamArgs()
-			simpleCommandCount := 0
-			hasParsingResult := false
-			if shellArgs != nil {
-				simpleCommandCount = len(shellArgs.GetSimpleCommands())
-				hasParsingResult = shellArgs.GetParsingResult() != nil
-			}
-			commandHash, argsHash, cwdHash := shellInvocationHashes(invocation.ArgsJSON)
-			// #region agent log
-			writeGPTToolDebugLog("forwarder/service.go:handleToolInvocation", "shell exec dispatched", "H3,H4,H5", map[string]any{
-				"request_id":           stream.RequestID,
-				"provider_pass":        pendingExec.ProviderPass,
-				"model_call_id":        strings.TrimSpace(invocation.ModelCallID),
-				"tool_call_id":         strings.TrimSpace(invocation.CallID),
-				"provider_item_id":     strings.TrimSpace(invocation.ProviderItemID),
-				"provider_call_id":     strings.TrimSpace(invocation.ProviderCallID),
-				"exec_id":              strings.TrimSpace(pendingExec.ExecID),
-				"message_id":           pendingExec.MessageID,
-				"command_hash":         commandHash,
-				"args_hash":            argsHash,
-				"cwd_hash":             cwdHash,
-				"simple_command_count": simpleCommandCount,
-				"has_parsing_result":   hasParsingResult,
-			})
-			// #endregion
-		}
 		if strings.TrimSpace(pendingExec.ExecKind) == "subagent" {
 			registerTaskBatchMember(stream, pendingExec)
 			if err := service.recordSubagentRunState(stream, pendingExec, agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_RUNNING, "", ""); err != nil {

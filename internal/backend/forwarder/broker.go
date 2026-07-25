@@ -73,6 +73,9 @@ func (broker *StreamBroker) OpenStream(requestID string, conversationID string, 
 		if existing.PartialToolCallIDs == nil {
 			existing.PartialToolCallIDs = make(map[string]struct{})
 		}
+		if existing.PartialToolCallArgs == nil {
+			existing.PartialToolCallArgs = make(map[string]string)
+		}
 		if existing.PatchEditQueues == nil {
 			existing.PatchEditQueues = make(map[string][]queuedPatchEditOperation)
 		}
@@ -111,6 +114,7 @@ func (broker *StreamBroker) OpenStream(requestID string, conversationID string, 
 		ShellExecTombstones:         make(map[string]shellExecTombstone),
 		PendingInteractions:         make(map[string]runtimecore.PendingInteraction),
 		PartialToolCallIDs:          make(map[string]struct{}),
+		PartialToolCallArgs:         make(map[string]string),
 		PatchEditQueues:             make(map[string][]queuedPatchEditOperation),
 		MCPToolServers:              make(map[string]string),
 		RecentCompletedExecs:        make(map[uint32]time.Time),

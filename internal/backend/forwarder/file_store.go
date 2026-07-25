@@ -309,12 +309,13 @@ func (store *ConversationFileStore) GetConversationSummary(conversationID string
 		return ConversationSummary{}, err
 	}
 	return ConversationSummary{
-		ConversationID: conversation.ConversationID,
-		Mode:           conversation.Mode,
-		EntriesCount:   len(conversation.Entries),
-		NextTurnSeq:    conversation.NextTurnSeq,
-		NextEntrySeq:   conversation.NextEntrySeq,
-		UpdatedAt:      conversation.UpdatedAt,
+		ConversationID:         conversation.ConversationID,
+		Mode:                   conversation.Mode,
+		SelectedModelAdapterID: conversation.SelectedModelAdapterID,
+		EntriesCount:           len(conversation.Entries),
+		NextTurnSeq:            conversation.NextTurnSeq,
+		NextEntrySeq:           conversation.NextEntrySeq,
+		UpdatedAt:              conversation.UpdatedAt,
 	}, nil
 }
 
@@ -668,6 +669,9 @@ func mergeConversationMetadata(target *ConversationFile, source *ConversationFil
 	}
 	if strings.TrimSpace(source.Mode) != "" {
 		target.Mode = strings.TrimSpace(source.Mode)
+	}
+	if strings.TrimSpace(source.SelectedModelAdapterID) != "" {
+		target.SelectedModelAdapterID = strings.TrimSpace(source.SelectedModelAdapterID)
 	}
 	target.TokenDetailsUsedTokens = source.TokenDetailsUsedTokens
 	if source.TokenDetailsMaxTokens > 0 {

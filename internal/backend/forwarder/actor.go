@@ -502,6 +502,15 @@ func (service *Service) reconcileStream(stream *ActiveStream) error {
 
 	if completion != nil {
 		if completion.Disposition == completionDispositionResumeAfterExternal {
+			if singleMultitaskWorkerCompletedSuccessfully(stream) {
+				clearPendingProviderCompletion(stream)
+				service.logParentReconcile(stream, "single_multitask_worker_complete", generation, false)
+				if err := service.completeSuccessfulTurn(stream, *completion); err != nil {
+					return service.failStreamIfNonTerminal(stream, "unknown", err)
+				}
+				service.logParentReconcile(stream, "end_sent", generation, true)
+				return nil
+			}
 			stream.mu.Lock()
 			stream.PendingProviderCompletion = nil
 			if stream.PendingProviderAction != providerActionStart {
@@ -622,10 +631,8 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 		if toolCallID == "" || event.ToolCall == nil {
 			return nil
 		}
-		if taskToolCall := event.ToolCall.GetTaskToolCall(); taskToolCall != nil && taskToolCall.GetArgs() != nil && strings.TrimSpace(taskToolCall.GetArgs().GetModel()) == "" {
-			return nil
-		}
-		displayToolCall := stripTaskPromptForDisplay(service.rewriteTaskToolCallModelForDisplay(stream, event.ToolCall))
+		toolCall := service.resolvePartialTaskToolCallModel(stream, toolCallID, event.ToolCall, event.ArgsTextDelta)
+		displayToolCall := stripTaskPromptForDisplay(service.rewriteTaskToolCallModelForDisplay(stream, toolCall))
 		stream.mu.Lock()
 		if stream.PartialToolCallIDs == nil {
 			stream.PartialToolCallIDs = make(map[string]struct{})
@@ -714,6 +721,41 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 	default:
 		return nil
 	}
+}
+
+func (service *Service) resolvePartialTaskToolCallModel(stream *ActiveStream, toolCallID string, toolCall *agentv1.ToolCall, argsTextDelta string) *agentv1.ToolCall {
+	if service == nil || stream == nil || toolCall == nil {
+		return toolCall
+	}
+	taskToolCall := toolCall.GetTaskToolCall()
+	if taskToolCall == nil || taskToolCall.GetArgs() == nil || strings.TrimSpace(taskToolCall.GetArgs().GetModel()) != "" {
+		return toolCall
+	}
+	stream.mu.Lock()
+	if stream.PartialToolCallArgs == nil {
+		stream.PartialToolCallArgs = make(map[string]string)
+	}
+	stream.PartialToolCallArgs[toolCallID] += argsTextDelta
+	rawArgs := stream.PartialToolCallArgs[toolCallID]
+	stream.mu.Unlock()
+	var args map[string]any
+	if json.Unmarshal([]byte(rawArgs), &args) != nil {
+		return toolCall
+	}
+	role := normalizeSubagentRole(readStringMapValue(args, "task_role", "taskRole"))
+	if role == "" {
+		return toolCall
+	}
+	modelID, err := service.resolveTaskModelID(role, "")
+	if err != nil || strings.TrimSpace(modelID) == "" {
+		return toolCall
+	}
+	cloned, ok := proto.Clone(toolCall).(*agentv1.ToolCall)
+	if !ok || cloned == nil || cloned.GetTaskToolCall() == nil || cloned.GetTaskToolCall().GetArgs() == nil {
+		return toolCall
+	}
+	cloned.GetTaskToolCall().Args.Model = stringPtr(strings.TrimSpace(modelID))
+	return cloned
 }
 
 func (service *Service) rewriteTaskToolCallModelForDisplay(stream *ActiveStream, toolCall *agentv1.ToolCall) *agentv1.ToolCall {

@@ -264,6 +264,9 @@ func applyRunRewindMetadata(conversation *ConversationFile, source *Conversation
 		if strings.TrimSpace(source.Mode) != "" {
 			conversation.Mode = strings.TrimSpace(source.Mode)
 		}
+		if strings.TrimSpace(source.SelectedModelAdapterID) != "" {
+			conversation.SelectedModelAdapterID = strings.TrimSpace(source.SelectedModelAdapterID)
+		}
 		if source.TokenDetailsMaxTokens > 0 {
 			conversation.TokenDetailsMaxTokens = source.TokenDetailsMaxTokens
 		}

@@ -53,12 +53,14 @@
   "4923eeb7bd75cccd": "{0} model ID cannot be empty",
   "497c85690c4cc0fc": "No data",
   "4b8d11bf235e9213": "Current hit rate: {0}",
+  "4c82a12d56c26d4a": "Model Routing",
   "4d8c1c5b42830791": "Unknown",
   "51194c3ad014fb29": "Retest required",
   "5205125c0e91d346": "Maximum tokens an Anthropic model may generate in a single response. Leave blank to use the default.",
   "56627c94a9decee6": "Max Output Tokens",
   "5beb1206c532729f": "Maximum number of tokens allowed in a single response. Leave blank to use the default.",
   "5d1687a4a41883fd": "Stopping...",
+  "61040c69dde14141": "Each card represents a stable channel: the display name identifies the channel, while Model ID is the model sent to the provider. The first item is only the default for new conversations; existing conversations keep their selected channel regardless of configuration order.",
   "6106f0a12583a334": "Refresh failed",
   "62873083fcaed27d": "Session Statistics",
   "6309a3bb5ba4c714": "Save failed",
@@ -173,5 +175,6 @@
   "f61e03f047b786d5": "{0} max output tokens must be a positive integer",
   "fac2a67ad87807c4": "OK",
   "fb7a4c81729ed0ca": "Stopping...",
+  "fd8575d04e32b574": "Subagents match enabled channels by task_role. Configuration order only sets automatic-routing priority when a role has multiple candidates. A Task card shows the worker model; it does not mean the parent conversation changed models.",
   "fec45092945f8790": "User Guide"
 }

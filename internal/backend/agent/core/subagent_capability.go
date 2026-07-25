@@ -17,9 +17,9 @@ type SubagentCapability struct {
 	Readonly bool
 }
 
-// ResolveTaskSubagentCapabilityFromArgs parses current access_mode and legacy readonly arguments.
+// ResolveTaskSubagentCapabilityFromArgs parses the required access_mode authorization.
 func ResolveTaskSubagentCapabilityFromArgs(args map[string]any) (SubagentCapability, error) {
-	var readonly *bool
+	var legacyReadonly *bool
 	for _, key := range []string{"readonly", "readOnly"} {
 		value, found := args[key]
 		if !found {
@@ -29,17 +29,17 @@ func ResolveTaskSubagentCapabilityFromArgs(args map[string]any) (SubagentCapabil
 		if !ok {
 			return SubagentCapability{}, fmt.Errorf("Task readonly must be boolean")
 		}
-		readonly = &parsed
+		legacyReadonly = &parsed
 		break
 	}
 	return ResolveTaskSubagentCapability(
 		ReadStringArg(args, "subagent_type", "subagentType"),
 		ReadStringArg(args, "access_mode", "accessMode"),
-		readonly,
+		legacyReadonly,
 	)
 }
 
-// ResolveTaskSubagentCapability applies access intent while preserving legacy readonly behavior.
+// ResolveTaskSubagentCapability applies the explicit access intent.
 func ResolveTaskSubagentCapability(subagentType string, accessMode string, readonly *bool) (SubagentCapability, error) {
 	typeName := strings.TrimSpace(subagentType)
 	mode := strings.TrimSpace(accessMode)

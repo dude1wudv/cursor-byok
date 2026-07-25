@@ -1540,6 +1540,50 @@ func taskBatchAllowsParentNotification(stream *ActiveStream) (int, bool) {
 	selected.ParentNotified = true
 	return selected.Generation, true
 }
+
+func singleMultitaskWorkerCompletedSuccessfully(stream *ActiveStream) bool {
+	if stream == nil {
+		return false
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if normalizeMode(stream.Mode) != agentv1.AgentMode_AGENT_MODE_MULTITASK {
+		return false
+	}
+	var onlyMember *TaskBatchMember
+	for _, batch := range stream.TaskBatches {
+		if batch == nil {
+			continue
+		}
+		for _, member := range batch.Members {
+			if member == nil || onlyMember != nil {
+				return false
+			}
+			onlyMember = member
+		}
+	}
+	if onlyMember == nil || !onlyMember.Terminal || onlyMember.ParentReleased {
+		return false
+	}
+	for _, state := range stream.SubagentFinalizations {
+		if state == nil || strings.TrimSpace(state.Pending.ToolCallID) != strings.TrimSpace(onlyMember.ToolCallID) {
+			continue
+		}
+		return !state.BackgroundAcknowledged &&
+			!state.ExplicitlyCanceled &&
+			state.ResultReceived &&
+			state.ResultOutcome == "succeeded" &&
+			state.ToolResultPersisted &&
+			state.TodoReconciled &&
+			state.ClosureMetadataPersisted &&
+			state.TaskBatchTerminal &&
+			state.DispatchClosed &&
+			state.ToolCompletedPublished &&
+			state.CheckpointPublished
+	}
+	return false
+}
+
 func taskBatchDebugSnapshot(stream *ActiveStream, generation int) []map[string]any {
 	if stream == nil {
 		return nil
