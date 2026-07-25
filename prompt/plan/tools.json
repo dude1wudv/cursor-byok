@@ -17,6 +17,18 @@
             "description": "Clear, concise description of what this command does in 5-10 words",
             "type": "string"
           },
+          "profile": {
+            "description": "Optional shell interpreter profile. auto preserves Cursor's default shell selection; cmd and wsl are Windows-only; git-bash uses Git for Windows Bash on Windows and system Bash on macOS/Linux; explicit profiles fail if unavailable.",
+            "enum": [
+              "auto",
+              "powershell",
+              "pwsh",
+              "cmd",
+              "git-bash",
+              "wsl"
+            ],
+            "type": "string"
+          },
           "working_directory": {
             "description": "The absolute path to the working directory to execute the command in (defaults to current directory)",
             "type": "string"

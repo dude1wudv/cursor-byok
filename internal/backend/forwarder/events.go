@@ -188,17 +188,37 @@ func buildToolCallCompletedMessage(callID string, modelCallID string, toolCall *
 	}
 }
 
-// buildShellOutputDeltaMessage 把 shell 流输出包装成兼容消息。
-func buildShellOutputDeltaMessage(delta *agentv1.ShellOutputDeltaUpdate) *agentv1.AgentServerMessage {
-	return &agentv1.AgentServerMessage{
-		Message: &agentv1.AgentServerMessage_InteractionUpdate{
-			InteractionUpdate: &agentv1.InteractionUpdate{
-				Message: &agentv1.InteractionUpdate_ShellOutputDelta{
-					ShellOutputDelta: delta,
-				},
-			},
-		},
+// buildKeyedShellOutputDeltaMessage 把 shell stdout/stderr 包装成带调用归属的增量消息。
+func buildKeyedShellOutputDeltaMessage(callID string, modelCallID string, delta *agentv1.ShellOutputDeltaUpdate) *agentv1.AgentServerMessage {
+	if delta == nil {
+		return nil
 	}
+	var shellDelta *agentv1.ShellToolCallDelta
+	switch event := delta.GetEvent().(type) {
+	case *agentv1.ShellOutputDeltaUpdate_Stdout:
+		if event.Stdout == nil {
+			return nil
+		}
+		shellDelta = &agentv1.ShellToolCallDelta{
+			Delta: &agentv1.ShellToolCallDelta_Stdout{
+				Stdout: &agentv1.ShellToolCallStdoutDelta{Content: execbridge.DecodeShellStdout(event.Stdout)},
+			},
+		}
+	case *agentv1.ShellOutputDeltaUpdate_Stderr:
+		if event.Stderr == nil {
+			return nil
+		}
+		shellDelta = &agentv1.ShellToolCallDelta{
+			Delta: &agentv1.ShellToolCallDelta_Stderr{
+				Stderr: &agentv1.ShellToolCallStderrDelta{Content: event.Stderr.GetData()},
+			},
+		}
+	default:
+		return nil
+	}
+	return buildToolCallDeltaMessage(callID, modelCallID, &agentv1.ToolCallDelta{
+		Delta: &agentv1.ToolCallDelta_ShellToolCallDelta{ShellToolCallDelta: shellDelta},
+	})
 }
 
 // buildTurnEndedMessage 构造 turn 结束消息，并携带标准化后的 token 统计。

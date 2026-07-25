@@ -336,6 +336,25 @@ type agentModelMemory interface {
 	SaveLastAgentModelHash(context.Context, string) error
 }
 
+type shellMaxConcurrentProvider interface {
+	ShellMaxConcurrentPerRun() int
+}
+
+func (service *Service) shellMaxConcurrentPerRun() int {
+	if service == nil || service.resolver == nil {
+		return defaultShellMaxConcurrentPerRun
+	}
+	provider, ok := service.resolver.(shellMaxConcurrentProvider)
+	if !ok {
+		return defaultShellMaxConcurrentPerRun
+	}
+	value := provider.ShellMaxConcurrentPerRun()
+	if value < 1 || value > 32 {
+		return defaultShellMaxConcurrentPerRun
+	}
+	return value
+}
+
 type longContextReadChannelProvider interface {
 	LongContextReadChannel() (string, bool)
 }
@@ -1007,8 +1026,12 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.PendingProviderAction = providerActionNone
 	stream.PendingCompaction = nil
 	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
+	stream.ActiveForegroundShells = make(map[string]runtimecore.PendingExec)
 	stream.ActiveForegroundShellExecID = ""
 	stream.QueuedForegroundShells = nil
+	stream.ShellMaxConcurrent = service.shellMaxConcurrentPerRun()
+	stream.ShellRecoveryCandidates = make(map[string]shellRecoveryCandidate)
+	stream.ShellExecTombstones = make(map[string]shellExecTombstone)
 	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
 	stream.PartialToolCallIDs = make(map[string]struct{})
 	stream.RecentCompletedExecs = make(map[uint32]time.Time)
@@ -1263,15 +1286,19 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return err
 	}
 	if result.ShellOutputDelta != nil {
-		if err := service.broker.Publish(intent.RequestID, StreamEvent{
-			Message: buildShellOutputDeltaMessage(result.ShellOutputDelta),
-		}); err != nil {
-			return err
+		if message := buildKeyedShellOutputDeltaMessage(pending.ToolCallID, pending.ModelCallID, result.ShellOutputDelta); message != nil {
+			if err := service.broker.Publish(intent.RequestID, StreamEvent{Message: message}); err != nil {
+				return err
+			}
 		}
 	}
 	if !result.IsTerminal {
+		if strings.TrimSpace(result.ShellRecoveryCandidate) != "" {
+			service.scheduleShellRecoveryCandidate(intent.RequestID, pending, result.ShellRecoveryCandidate)
+		}
 		return nil
 	}
+	clearShellRecoveryCandidate(stream, pending)
 	service.logShellTerminalResult(stream, pending, intent.ExecClientMessage)
 	if err := service.recordShellRejection(stream, pending, intent.ExecClientMessage); err != nil {
 		return err
@@ -1440,7 +1467,7 @@ func (service *Service) recordShellRejection(stream *ActiveStream, pending runti
 		"count":            count,
 	}
 	entries := []HistoryEntry{newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_rejection_fingerprint", values)}
-	openCircuit := shouldOpenShellCircuit(circuit, rejectionClass)
+	openCircuit := false
 	if openCircuit {
 		entries = append(entries, newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_circuit_open", map[string]any{
 			"source":                "shell_terminal",
@@ -2072,6 +2099,10 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 		}
 		if shouldObserveShellStreamClose(intent.ExecClientControlMessage, pending) {
 			service.observeShellStreamClose(stream, pending)
+			return nil
+		}
+		if strings.TrimSpace(result.ShellRecoveryCandidate) != "" {
+			service.scheduleShellRecoveryCandidate(intent.RequestID, pending, result.ShellRecoveryCandidate)
 		}
 		return nil
 	}
@@ -2986,7 +3017,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			return err
 		}
 	}
-	if !bufferExecDispatch && !suppressStartedToolCall {
+	if !bufferExecDispatch && trimmedToolName != "Shell" && !suppressStartedToolCall {
 		if err := ensureLoopActive(); err != nil {
 			return err
 		}
@@ -3081,6 +3112,9 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 				service.rollbackSubagentDispatch(stream, pendingExec, reason)
 				return
 			}
+			if strings.TrimSpace(pendingExec.ExecKind) == "shell" {
+				discardForegroundShellDispatch(stream, pendingExec)
+			}
 			stream.mu.Lock()
 			delete(stream.PendingExecs, pendingExec.ExecID)
 			stream.mu.Unlock()
@@ -3128,6 +3162,16 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			}
 			return nil
 		}
+		if strings.TrimSpace(pendingExec.ExecKind) == "shell" {
+			dispatched, err := service.dispatchOrQueueForegroundShell(stream, serverMessage, startedToolCall, pendingExec)
+			if err != nil {
+				return failExecDispatch(err)
+			}
+			if !dispatched {
+				service.recordExecDispatchMetadata(stream, pendingExec, true, false, "queued_pending_capacity")
+			}
+			return nil
+		}
 		if err := ensureLoopActive(); err != nil {
 			return failExecDispatch(err)
 		}
@@ -3136,14 +3180,6 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		}
 		if err := ensureLoopActive(); err != nil {
 			return failExecDispatch(err)
-		}
-		if strings.TrimSpace(pendingExec.ExecKind) == "shell" {
-			dispatched, err := service.dispatchOrQueueForegroundShell(stream, serverMessage, pendingExec)
-			if err != nil {
-				return failExecDispatch(err)
-			}
-			service.recordExecDispatchMetadata(stream, pendingExec, !dispatched, startedEmitted, "started_then_checkpoint_then_fifo_exec")
-			return nil
 		}
 		if err := service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage}); err != nil {
 			return failExecDispatch(err)
@@ -4731,6 +4767,20 @@ func markExecCompleted(stream *ActiveStream, pending runtimecore.PendingExec) {
 
 	stream.mu.Lock()
 	delete(stream.PendingExecs, pending.ExecID)
+	delete(stream.ShellRecoveryCandidates, pending.ExecID)
+	if strings.TrimSpace(pending.ExecKind) == "shell" {
+		if stream.ShellExecTombstones == nil {
+			stream.ShellExecTombstones = make(map[string]shellExecTombstone)
+		}
+		for execID, tombstone := range stream.ShellExecTombstones {
+			if tombstone.CompletedAt.Before(cutoff) {
+				delete(stream.ShellExecTombstones, execID)
+			}
+		}
+		stream.ShellExecTombstones[pending.ExecID] = shellExecTombstone{
+			MessageID: pending.MessageID, Generation: pending.ProviderPass, CompletedAt: now,
+		}
+	}
 	markTaskBatchTerminalLocked(stream, pending)
 	if pending.MessageID != 0 {
 		if stream.RecentCompletedExecs == nil {

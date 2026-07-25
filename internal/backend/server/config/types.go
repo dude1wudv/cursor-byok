@@ -16,6 +16,9 @@ const (
 	DefaultProxyListenAddr                  = "127.0.0.1:18080"
 	DefaultFrontendBaseURL                  = "http://127.0.0.1"
 	DefaultRoutingMode                      = "local"
+	DefaultShellMaxConcurrentPerRun         = 8
+	MinShellMaxConcurrentPerRun             = 1
+	MaxShellMaxConcurrentPerRun             = 32
 	MinProviderStreamIdleTimeoutSeconds     = 30
 	DefaultProviderStreamIdleTimeoutSeconds = 240
 )
@@ -85,6 +88,7 @@ type HomeMetricsConfig struct {
 type Config struct {
 	Log                       bool                 `json:"log" yaml:"log"`
 	ProviderStreamIdleTimeout int                  `json:"providerStreamIdleTimeout" yaml:"providerStreamIdleTimeout"`
+	ShellMaxConcurrentPerRun  int                  `json:"shellMaxConcurrentPerRun" yaml:"shellMaxConcurrentPerRun"`
 	BackendListenAddr         string               `json:"backendListenAddr" yaml:"backendListenAddr"`
 	ProxyListenAddr           string               `json:"proxyListenAddr" yaml:"proxyListenAddr"`
 	ModelAdapters             []ModelAdapterConfig `json:"modelAdapters" yaml:"modelAdapters"`
@@ -98,6 +102,7 @@ func DefaultConfig() Config {
 	return Config{
 		Log:                       false,
 		ProviderStreamIdleTimeout: DefaultProviderStreamIdleTimeoutSeconds,
+		ShellMaxConcurrentPerRun:  DefaultShellMaxConcurrentPerRun,
 		BackendListenAddr:         DefaultBackendListenAddr,
 		ProxyListenAddr:           DefaultProxyListenAddr,
 		ModelAdapters:             []ModelAdapterConfig{},
@@ -111,6 +116,12 @@ func NormalizeConfig(input Config) (Config, error) {
 	output := DefaultConfig()
 	output.Log = input.Log
 	output.ProviderStreamIdleTimeout = normalizeProviderStreamIdleTimeout(input.ProviderStreamIdleTimeout)
+	if input.ShellMaxConcurrentPerRun != 0 {
+		if input.ShellMaxConcurrentPerRun < MinShellMaxConcurrentPerRun || input.ShellMaxConcurrentPerRun > MaxShellMaxConcurrentPerRun {
+			return Config{}, fmt.Errorf("shellMaxConcurrentPerRun 必须在 %d-%d 之间", MinShellMaxConcurrentPerRun, MaxShellMaxConcurrentPerRun)
+		}
+		output.ShellMaxConcurrentPerRun = input.ShellMaxConcurrentPerRun
+	}
 	backendListenAddr, err := normalizeListenAddr(input.BackendListenAddr, DefaultBackendListenAddr, "backendListenAddr")
 	if err != nil {
 		return Config{}, err

@@ -1362,11 +1362,7 @@ func (service *Service) handleTimerEvent(stream *ActiveStream, payload *streamTi
 	case streamTimerShellForeground:
 		return service.recoverShellWithoutTerminalIfNeeded(stream, payload.ExecID, payload.MessageID, shellRecoveryReasonForegroundDeadline)
 	case streamTimerShellTransportClose:
-		current, status, found := snapshotPendingExecWithStatus(stream, payload.ExecID)
-		if !found || current.MessageID != payload.MessageID || current.StreamState != "transport_closed" || isTerminalStreamStatus(status) {
-			return nil
-		}
-		return service.recoverShellWithoutTerminal(stream, current, shellRecoveryReasonTransportClosed)
+		return service.recoverShellWithoutTerminalIfNeeded(stream, payload.ExecID, payload.MessageID, payload.Reason)
 	case streamTimerSubagentResult:
 		current, ok := snapshotPendingExec(stream, payload.ExecID)
 		if !ok || current.MessageID != payload.MessageID || strings.TrimSpace(current.ExecKind) != "subagent" {

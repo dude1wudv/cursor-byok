@@ -55,6 +55,18 @@ func (broker *StreamBroker) OpenStream(requestID string, conversationID string, 
 		if existing.PendingExecs == nil {
 			existing.PendingExecs = make(map[string]runtimecore.PendingExec)
 		}
+		if existing.ActiveForegroundShells == nil {
+			existing.ActiveForegroundShells = make(map[string]runtimecore.PendingExec)
+		}
+		if existing.ShellMaxConcurrent < 1 {
+			existing.ShellMaxConcurrent = legacyShellMaxConcurrentPerRun
+		}
+		if existing.ShellRecoveryCandidates == nil {
+			existing.ShellRecoveryCandidates = make(map[string]shellRecoveryCandidate)
+		}
+		if existing.ShellExecTombstones == nil {
+			existing.ShellExecTombstones = make(map[string]shellExecTombstone)
+		}
 		if existing.PendingInteractions == nil {
 			existing.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
 		}
@@ -93,6 +105,10 @@ func (broker *StreamBroker) OpenStream(requestID string, conversationID string, 
 		Backlog:                     make([]StreamEvent, 0, 64),
 		Subscribers:                 make(map[string]*StreamSubscriber),
 		PendingExecs:                make(map[string]runtimecore.PendingExec),
+		ActiveForegroundShells:      make(map[string]runtimecore.PendingExec),
+		ShellMaxConcurrent:          legacyShellMaxConcurrentPerRun,
+		ShellRecoveryCandidates:     make(map[string]shellRecoveryCandidate),
+		ShellExecTombstones:         make(map[string]shellExecTombstone),
 		PendingInteractions:         make(map[string]runtimecore.PendingInteraction),
 		PartialToolCallIDs:          make(map[string]struct{}),
 		PatchEditQueues:             make(map[string][]queuedPatchEditOperation),

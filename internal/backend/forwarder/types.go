@@ -149,8 +149,23 @@ type SubagentFinalizationState struct {
 }
 
 type queuedShellDispatch struct {
-	Message *agentv1.AgentServerMessage
-	Pending runtimecore.PendingExec
+	Message         *agentv1.AgentServerMessage
+	StartedToolCall *agentv1.ToolCall
+	Pending         runtimecore.PendingExec
+}
+
+type shellRecoveryCandidate struct {
+	ExecID     string
+	MessageID  uint32
+	Generation int
+	Reason     string
+	ObservedAt time.Time
+}
+
+type shellExecTombstone struct {
+	MessageID   uint32
+	Generation  int
+	CompletedAt time.Time
 }
 
 type ActiveStream struct {
@@ -203,8 +218,12 @@ type ActiveStream struct {
 	Subscribers                 map[string]*StreamSubscriber
 	CheckpointConversation      *ConversationFile
 	PendingExecs                map[string]runtimecore.PendingExec
+	ActiveForegroundShells      map[string]runtimecore.PendingExec
 	ActiveForegroundShellExecID string
 	QueuedForegroundShells      []queuedShellDispatch
+	ShellMaxConcurrent          int
+	ShellRecoveryCandidates     map[string]shellRecoveryCandidate
+	ShellExecTombstones         map[string]shellExecTombstone
 	PendingInteractions         map[string]runtimecore.PendingInteraction
 	PartialToolCallIDs          map[string]struct{}
 	PatchEditQueues             map[string][]queuedPatchEditOperation

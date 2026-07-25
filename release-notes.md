@@ -1,31 +1,38 @@
-# Cursor助手 v0.0.66
+# Cursor助手 v0.0.67
 
-本版本在 v0.0.65 的子代理与 BidiAppend 修复基础上，统一 OpenAI 请求的客户端标识，并同步 Task 工具 schema。
+本版本为 Shell 执行增加按 run 冻结的弹性并发、独立异常恢复与显式解释器 profile。
 
-## Codex Desktop 请求标识
+## 弹性 Agent Terminal
 
-- OpenAI Chat Completions 与 Responses 请求使用 Codex 原生 `Codex Desktop/<版本>` User-Agent 前缀。
-- 启动后从本机已安装的 Codex Desktop 内置 CLI 自动读取版本；读取失败时使用构建时验证的版本回退值。
+- 每个 run 默认最多同时执行 8 个前台 Shell；`shellMaxConcurrentPerRun` 可在用户 YAML 配置为 1–32。
+- 配置在 run 启动时冻结，热更新只影响后续 run。
+- 未达到上限的 Shell 立即获得独立 Agent Terminal/PT​​Y；超过上限后按 FIFO 等待。
+- 等待中的 Shell 在真正 dispatch 前不会发布 started 或执行中 checkpoint；任一 active 完成后会连续补满可用容量。
 
-## Task schema
+## Shell 输出与异常恢复
 
-- 根模式的 Task 工具要求显式填写 `access_mode`，并限制为 `inspect` 或 `act`。
+- 并发 stdout/stderr 通过带 `call_id` 与 `model_call_id` 的 keyed tool delta 发送，不再同时发送旧裸 Shell delta。
+- skipped、transport close 与 Shell control throw 按 exec 独立进入 1.5 秒 grace；迟到的真实 Exit/Backgrounded 优先。
+- grace 到期只收口匹配同一 `exec_id + message_id + generation` 的调用；tombstone 防止迟到事件重复结果。
+- 单个 Shell 的拒绝、权限错误或无终态不会阻断同一 run 的其他 active Shell。
 
-## BidiAppend 跨 run 序号
+## 显式 Shell profile
 
-- append 序号状态按 request ID 与 run epoch 隔离；新 run 可从 `append_seqno=1` 重新开始。
-- 只有通过重复检查并真正建立新 turn 的 run 才切换 epoch；RunSSE 普通重连及同 run 重复请求不会重置序号。
-- 新 epoch 建立后，旧 epoch 的迟到事件会被视为 stale，不会污染当前 run；stale 流量也不会延长旧 epoch 生命周期。
-- BidiAppend 诊断日志增加 `epoch`、`current_next` 与 `disposition`，便于区分同 run 重复与跨 run 换代。
+- Shell 新增可选 `profile`：`auto`、`powershell`、`pwsh`、`cmd`、`git-bash`、`wsl`。
+- `auto` 保持 Cursor 默认解释器兼容行为。
+- 显式 profile 使用固定解释器安全启动器，通过 Base64/标准输入传递原始命令，避免 `$`、引号和多行命令被中间层再次解析。
+- Windows launcher 使用不带路径引号的可执行命令名，兼容 PowerShell、cmd、Git Bash 与 WSL 宿主终端；macOS/Linux 使用原生 POSIX Base64 管道，不依赖 PowerShell。
+- `cmd` 与 `wsl` 仅在 Windows 提供；`git-bash` 在 Windows 使用 Git for Windows Bash，在 macOS/Linux 使用系统 Bash；`powershell`/`pwsh` 仅在对应解释器已安装时可用。
+- 请求的解释器不可用时，在进入 pending/active 调度前返回明确工具错误，不静默降级。
 
-## 子代理父流程唤醒
+## 发布资产
 
-- 同一 request ID 启动后续 run 时，从 1 开始的最终 `SubagentResult` 不再于解码前被 stale 判定丢弃。
-- 匹配的子代理最终结果仍保持幂等：只写入一次 `tool_result`、发布一次 `ToolCallCompleted`，并通知父流程继续。
-
-## Windows 发布资产
-
-- `cursor-byok-0.0.66-windows-amd64.zip`
+- `cursor-byok-0.0.67-windows-amd64.zip`
   - 内含 `cursor-byok-windows-amd64.exe`
-
-适用于 Windows 10/11 amd64。
+  - 适用于 Windows 10/11 amd64。
+- `cursor-byok-0.0.67-macos-arm64.tar.gz`
+  - 内含 arm64 `Cursor助手.app`
+  - 适用于 Apple Silicon Mac。
+- `cursor-byok-0.0.67-macos-amd64.tar.gz`
+  - 内含 x86_64 `Cursor助手.app`
+  - 适用于 Intel Mac。

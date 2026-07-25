@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ const shellTerminalRecoveryGrace = 1500 * time.Millisecond
 const (
 	shellRecoveryReasonForegroundDeadline = "foreground_deadline"
 	shellRecoveryReasonTransportClosed    = "transport_closed"
+	shellRecoveryReasonSkipped            = "skipped"
 )
 
 func initializePendingExecForTracking(pending runtimecore.PendingExec) runtimecore.PendingExec {
@@ -72,7 +74,7 @@ func (service *Service) scheduleShellForegroundRecovery(requestID string, pendin
 	)
 }
 
-func (service *Service) scheduleShellTransportCloseRecovery(requestID string, pending runtimecore.PendingExec) {
+func (service *Service) scheduleShellRecoveryCandidate(requestID string, pending runtimecore.PendingExec, reason string) {
 	if service == nil || strings.TrimSpace(requestID) == "" || strings.TrimSpace(pending.ExecKind) != "shell" || strings.TrimSpace(pending.ExecID) == "" {
 		return
 	}
@@ -80,9 +82,32 @@ func (service *Service) scheduleShellTransportCloseRecovery(requestID string, pe
 	if !ok || stream == nil {
 		return
 	}
-	if _, scheduled := markShellRecoveryScheduled(stream, pending.ExecID); !scheduled {
+	reason = strings.TrimSpace(reason)
+	stream.mu.Lock()
+	current, found := stream.PendingExecs[pending.ExecID]
+	if !found || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass {
+		stream.mu.Unlock()
 		return
 	}
+	if tombstone, completed := stream.ShellExecTombstones[pending.ExecID]; completed && tombstone.MessageID == pending.MessageID && tombstone.Generation == pending.ProviderPass {
+		stream.mu.Unlock()
+		return
+	}
+	if stream.ShellRecoveryCandidates == nil {
+		stream.ShellRecoveryCandidates = make(map[string]shellRecoveryCandidate)
+	}
+	candidate := shellRecoveryCandidate{
+		ExecID:     pending.ExecID,
+		MessageID:  pending.MessageID,
+		Generation: pending.ProviderPass,
+		Reason:     reason,
+		ObservedAt: time.Now().UTC(),
+	}
+	stream.ShellRecoveryCandidates[pending.ExecID] = candidate
+	current.ShellRecoveryScheduled = true
+	stream.PendingExecs[pending.ExecID] = current
+	stream.UpdatedAt = candidate.ObservedAt
+	stream.mu.Unlock()
 	service.scheduleStreamTimer(
 		stream,
 		providerTimerKey(streamTimerShellTransportClose, pending.ExecID),
@@ -90,8 +115,12 @@ func (service *Service) scheduleShellTransportCloseRecovery(requestID string, pe
 		streamTimerShellTransportClose,
 		pending.ExecID,
 		pending.MessageID,
-		shellRecoveryReasonTransportClosed,
+		reason,
 	)
+}
+
+func (service *Service) scheduleShellTransportCloseRecovery(requestID string, pending runtimecore.PendingExec) {
+	service.scheduleShellRecoveryCandidate(requestID, pending, shellRecoveryReasonTransportClosed)
 }
 
 func snapshotPendingExecWithStatus(stream *ActiveStream, execID string) (runtimecore.PendingExec, StreamStatus, bool) {
@@ -107,20 +136,17 @@ func snapshotPendingExecWithStatus(stream *ActiveStream, execID string) (runtime
 	return item, stream.Status, true
 }
 
-func markShellRecoveryScheduled(stream *ActiveStream, execID string) (runtimecore.PendingExec, bool) {
-	if stream == nil || strings.TrimSpace(execID) == "" {
-		return runtimecore.PendingExec{}, false
+func clearShellRecoveryCandidate(stream *ActiveStream, pending runtimecore.PendingExec) {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+		return
 	}
 	stream.mu.Lock()
-	defer stream.mu.Unlock()
-	current, ok := stream.PendingExecs[strings.TrimSpace(execID)]
-	if !ok || strings.TrimSpace(current.ExecKind) != "shell" || current.ShellRecoveryScheduled {
-		return current, false
+	if candidate, ok := stream.ShellRecoveryCandidates[pending.ExecID]; ok && candidate.MessageID == pending.MessageID && candidate.Generation == pending.ProviderPass {
+		delete(stream.ShellRecoveryCandidates, pending.ExecID)
 	}
-	current.ShellRecoveryScheduled = true
-	stream.PendingExecs[strings.TrimSpace(execID)] = current
-	stream.UpdatedAt = time.Now().UTC()
-	return current, true
+	stream.mu.Unlock()
+	clearStreamTimer(stream, providerTimerKey(streamTimerShellForeground, pending.ExecID))
+	clearStreamTimer(stream, providerTimerKey(streamTimerShellTransportClose, pending.ExecID))
 }
 
 func (service *Service) recoverShellWithoutTerminalIfNeeded(stream *ActiveStream, execID string, messageID uint32, reason string) error {
@@ -132,11 +158,22 @@ func (service *Service) recoverShellWithoutTerminalIfNeeded(stream *ActiveStream
 		return nil
 	}
 	switch strings.TrimSpace(current.StreamState) {
-	case "exited", "backgrounded", "rejected", "permission_denied":
+	case "exited", "backgrounded", "permission_denied":
 		return nil
 	}
-	if reason == shellRecoveryReasonForegroundDeadline && !current.ShellForegroundDeadline.IsZero() && time.Now().UTC().Before(current.ShellForegroundDeadline) {
-		return nil
+	if reason == shellRecoveryReasonForegroundDeadline {
+		if !current.ShellForegroundDeadline.IsZero() && time.Now().UTC().Before(current.ShellForegroundDeadline) {
+			return nil
+		}
+		stream.mu.Lock()
+		if stream.ShellRecoveryCandidates == nil {
+			stream.ShellRecoveryCandidates = make(map[string]shellRecoveryCandidate)
+		}
+		stream.ShellRecoveryCandidates[current.ExecID] = shellRecoveryCandidate{
+			ExecID: current.ExecID, MessageID: current.MessageID, Generation: current.ProviderPass,
+			Reason: reason, ObservedAt: time.Now().UTC(),
+		}
+		stream.mu.Unlock()
 	}
 	return service.recoverShellWithoutTerminal(stream, current, reason)
 }
@@ -145,47 +182,56 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 	if stream == nil {
 		return nil
 	}
-	// #region agent log
-	writeGPTToolDebugLog("forwarder/shell_recovery.go:recoverShellWithoutTerminal", "synthetic shell recovery triggered", "H2,H3", map[string]any{
-		"request_id":    stream.RequestID,
-		"provider_pass": pending.ProviderPass,
-		"model_call_id": strings.TrimSpace(pending.ModelCallID),
-		"tool_call_id":  strings.TrimSpace(pending.ToolCallID),
-		"exec_id":       strings.TrimSpace(pending.ExecID),
-		"message_id":    pending.MessageID,
-		"reason":        strings.TrimSpace(reason),
-		"stream_state":  strings.TrimSpace(pending.StreamState),
-		"chunk_count":   pending.ChunkCount,
-		"stdout_bytes":  len(pending.StdoutBuffer),
-		"stderr_bytes":  len(pending.StderrBuffer),
-	})
-	// #endregion
-	pending.ShellRecoveryScheduled = true
 	stream.mu.Lock()
-	if current, ok := stream.PendingExecs[pending.ExecID]; ok && current.MessageID == pending.MessageID {
-		current.ShellRecoveryScheduled = true
-		stream.PendingExecs[pending.ExecID] = current
+	current, found := stream.PendingExecs[pending.ExecID]
+	candidate, candidateFound := stream.ShellRecoveryCandidates[pending.ExecID]
+	if !found || !candidateFound || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass || candidate.MessageID != pending.MessageID || candidate.Generation != pending.ProviderPass || candidate.Reason != strings.TrimSpace(reason) {
+		stream.mu.Unlock()
+		return nil
 	}
+	if tombstone, completed := stream.ShellExecTombstones[pending.ExecID]; completed && tombstone.MessageID == pending.MessageID && tombstone.Generation == pending.ProviderPass {
+		stream.mu.Unlock()
+		return nil
+	}
+	if stream.ShellExecTombstones == nil {
+		stream.ShellExecTombstones = make(map[string]shellExecTombstone)
+	}
+	stream.ShellExecTombstones[pending.ExecID] = shellExecTombstone{MessageID: pending.MessageID, Generation: pending.ProviderPass, CompletedAt: time.Now().UTC()}
+	delete(stream.ShellRecoveryCandidates, pending.ExecID)
 	stream.mu.Unlock()
-	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
-		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_stream_stalled", map[string]any{
-			"tool_call_id":             pending.ToolCallID,
-			"message_id":               pending.MessageID,
-			"exec_id":                  pending.ExecID,
-			"exec_kind":                pending.ExecKind,
-			"reason":                   strings.TrimSpace(reason),
-			"recent_stream_state":      pending.StreamState,
-			"chunk_count":              pending.ChunkCount,
-			"first_chunk_at":           pending.FirstChunkAt,
-			"last_activity_at":         pending.LastShellActivityAt,
-			"last_heartbeat_at":        pending.LastShellHeartbeatAt,
-			"foreground_deadline":      pending.ShellForegroundDeadline,
-			"timeout_ms":               shellForegroundTimeoutMS(pending.ArgsJSON),
-			"stdout_buffer_bytes":      len(pending.StdoutBuffer),
-			"stderr_buffer_bytes":      len(pending.StderrBuffer),
-			"shell_recovery_scheduled": pending.ShellRecoveryScheduled,
-			"terminal":                 false,
+
+	pending = current
+	markExecCompleted(stream, pending)
+	result := fmt.Sprintf("Shell did not provide a terminal result (%s). The execution was closed locally after a per-command grace period.", candidate.Reason)
+	if err := service.appendToolResult(stream, pending.ToolCallID, "Shell", pending.ArgsJSON, result, pending.ReasoningContent, nil); err != nil {
+		return err
+	}
+	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_stream_recovered", map[string]any{
+			"tool_call_id":        pending.ToolCallID,
+			"message_id":          pending.MessageID,
+			"exec_id":             pending.ExecID,
+			"generation":          pending.ProviderPass,
+			"reason":              candidate.Reason,
+			"chunk_count":         pending.ChunkCount,
+			"stdout_buffer_bytes": len(pending.StdoutBuffer),
+			"stderr_buffer_bytes": len(pending.StderrBuffer),
+			"terminal":            true,
 		}),
-	})
-	return err
+	}); err != nil {
+		return err
+	}
+	if err := service.publishToolCallCompleted(stream.RequestID, pending.ToolCallID, pending.ModelCallID, nil); err != nil {
+		return err
+	}
+	if err := service.advanceForegroundShellQueue(stream, pending); err != nil {
+		return err
+	}
+	if err := service.syncSummaryCarryForward(stream.ConversationID, stream.RequestID, pending.ModelCallID); err != nil {
+		return err
+	}
+	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
+		return err
+	}
+	return service.reconcileStream(stream)
 }

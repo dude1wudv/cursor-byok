@@ -145,6 +145,18 @@ func (manager *Manager) SaveLastAgentModelHash(ctx context.Context, value string
 	return err
 }
 
+func (manager *Manager) ShellMaxConcurrentPerRun() int {
+	if manager == nil {
+		return DefaultShellMaxConcurrentPerRun
+	}
+	manager.reloadIfChanged(context.Background())
+	value := manager.currentConfig().ShellMaxConcurrentPerRun
+	if value < MinShellMaxConcurrentPerRun || value > MaxShellMaxConcurrentPerRun {
+		return DefaultShellMaxConcurrentPerRun
+	}
+	return value
+}
+
 func (manager *Manager) ProviderStreamIdleTimeout(ctx context.Context) time.Duration {
 	if manager == nil {
 		return time.Duration(DefaultProviderStreamIdleTimeoutSeconds) * time.Second

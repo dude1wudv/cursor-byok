@@ -2,11 +2,18 @@
 package execbridge
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"os"
+	osexec "os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -27,6 +34,8 @@ type ExecApplyResult struct {
 	IsTerminal bool
 	// ShellOutputDelta 保存 shell 流输出的增量事件。
 	ShellOutputDelta *agentv1.ShellOutputDeltaUpdate
+	// ShellRecoveryCandidate 表示 shell 的非权威终态候选，需由 forwarder 的 per-exec grace 收口。
+	ShellRecoveryCandidate string
 	// ToolResultPayload 保存可回写给模型的工具结果摘要。
 	ToolResultPayload string
 	// ToolCall 保存可用于发 ToolCallCompletedUpdate 的工具调用对象；当前仅对支持 ToolCall 的执行型工具可用。
@@ -297,6 +306,8 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 				return result, nil
 			}
 			if strings.Contains(strings.ToLower(strings.TrimSpace(event.Rejected.GetReason())), "skip") {
+				result.ShellRecoveryCandidate = "skipped"
+				result.ToolResultPayload = fmt.Sprintf("shell skipped: %s", strings.TrimSpace(event.Rejected.GetReason()))
 				return result, nil
 			}
 			result.ToolResultPayload = fmt.Sprintf("shell rejected: %s", strings.TrimSpace(event.Rejected.GetReason()))
@@ -341,6 +352,7 @@ func (bridge *Bridge) ApplyExecClientControl(msg *agentv1.ExecClientControlMessa
 	case *agentv1.ExecClientControlMessage_StreamClose:
 		if isStreamingExecKind(pending.ExecKind) {
 			result.IsTerminal = false
+			result.ShellRecoveryCandidate = "transport_closed"
 			result.ToolResultPayload = fmt.Sprintf("exec stream closed: id=%d", message.StreamClose.GetId())
 			return result, nil
 		}
@@ -353,6 +365,8 @@ func (bridge *Bridge) ApplyExecClientControl(msg *agentv1.ExecClientControlMessa
 		return result, nil
 	case *agentv1.ExecClientControlMessage_Throw:
 		if strings.TrimSpace(pending.ExecKind) == "shell" {
+			result.ShellRecoveryCandidate = "control_throw"
+			result.ToolResultPayload = fmt.Sprintf("exec throw: %s", strings.TrimSpace(message.Throw.GetError()))
 			return result, nil
 		}
 		result.IsTerminal = true
@@ -572,6 +586,15 @@ func decodeShellArgs(raw []byte) (shellResultArgs, error) {
 		Command:          strings.TrimSpace(readStringArg(args, "command")),
 		Description:      strings.TrimSpace(readStringArg(args, "description")),
 		WorkingDirectory: strings.TrimSpace(readStringArg(args, "working_directory", "workingDirectory")),
+		Profile:          strings.ToLower(strings.TrimSpace(readStringArg(args, "profile"))),
+	}
+	if result.Profile == "" {
+		result.Profile = "auto"
+	}
+	switch result.Profile {
+	case "auto", "powershell", "pwsh", "cmd", "git-bash", "wsl":
+	default:
+		return result, fmt.Errorf("Shell profile must be one of auto, powershell, pwsh, cmd, git-bash, wsl")
 	}
 	if result.Command == "" {
 		return result, fmt.Errorf("Shell command is required")
@@ -646,6 +669,102 @@ func buildShellOutputNotificationConfig(input *shellOutputNotificationArgs) *age
 	}
 }
 
+func resolveShellProfileExecutable(profile string) (string, []string, error) {
+	lookPath := func(names ...string) string {
+		for _, name := range names {
+			if path, err := osexec.LookPath(name); err == nil {
+				return path
+			}
+		}
+		return ""
+	}
+	switch profile {
+	case "powershell":
+		if path := lookPath("powershell.exe", "powershell"); path != "" {
+			return path, []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"}, nil
+		}
+	case "pwsh":
+		if path := lookPath("pwsh.exe", "pwsh"); path != "" {
+			return path, []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"}, nil
+		}
+	case "cmd":
+		if runtime.GOOS == "windows" {
+			if path := lookPath("cmd.exe"); path != "" {
+				return path, []string{"/d", "/q"}, nil
+			}
+		}
+	case "git-bash":
+		if runtime.GOOS == "windows" {
+			if gitPath := lookPath("git.exe"); gitPath != "" {
+				for _, candidate := range []string{
+					filepath.Join(filepath.Dir(gitPath), "bash.exe"),
+					filepath.Join(filepath.Dir(gitPath), "..", "bin", "bash.exe"),
+				} {
+					candidate = filepath.Clean(candidate)
+					if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+						return candidate, []string{"--noprofile", "--norc", "-s"}, nil
+					}
+				}
+			}
+			for _, root := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)"), os.Getenv("LOCALAPPDATA")} {
+				for _, relative := range []string{filepath.Join("Git", "bin", "bash.exe"), filepath.Join("Programs", "Git", "bin", "bash.exe")} {
+					candidate := filepath.Join(root, relative)
+					if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+						return candidate, []string{"--noprofile", "--norc", "-s"}, nil
+					}
+				}
+			}
+		} else if path := lookPath("bash"); path != "" {
+			return path, []string{"--noprofile", "--norc", "-s"}, nil
+		}
+	case "wsl":
+		if runtime.GOOS == "windows" {
+			if path := lookPath("wsl.exe"); path != "" {
+				return path, []string{"sh", "-s"}, nil
+			}
+		}
+	}
+	return "", nil, fmt.Errorf("Shell profile %q is unavailable on this machine", profile)
+}
+
+func encodePowerShellCommand(command string) string {
+	units := utf16.Encode([]rune(command))
+	data := make([]byte, len(units)*2)
+	for index, unit := range units {
+		binary.LittleEndian.PutUint16(data[index*2:], unit)
+	}
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+func buildExplicitShellProfileCommand(profile string, command string) (string, error) {
+	target, targetArgs, err := resolveShellProfileExecutable(profile)
+	if err != nil {
+		return "", err
+	}
+	payloadCommand := command
+	if runtime.GOOS == "windows" && profile == "cmd" && !strings.HasSuffix(payloadCommand, "\n") {
+		payloadCommand += "\r\n"
+	}
+	payload := base64.StdEncoding.EncodeToString([]byte(payloadCommand))
+	if runtime.GOOS != "windows" {
+		return fmt.Sprintf("printf '%%s' '%s' | base64 -d | %s", payload, strings.Join(append([]string{shellQuotePOSIX(target)}, targetArgs...), " ")), nil
+	}
+	launcherName := "powershell.exe"
+	if _, err := osexec.LookPath(launcherName); err != nil {
+		launcherName = "pwsh.exe"
+		if _, err := osexec.LookPath(launcherName); err != nil {
+			return "", fmt.Errorf("Shell profile %q requires powershell or pwsh as the safe Windows launcher", profile)
+		}
+	}
+	escape := func(value string) string { return strings.ReplaceAll(value, "'", "''") }
+	launcherScript := fmt.Sprintf("$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'));$i=[Diagnostics.ProcessStartInfo]::new();$i.FileName='%s';$i.Arguments='%s';$i.UseShellExecute=$false;$i.RedirectStandardInput=$true;$p=[Diagnostics.Process]::new();$p.StartInfo=$i;[void]$p.Start();$p.StandardInput.Write($c);$p.StandardInput.Close();$p.WaitForExit();exit $p.ExitCode", payload, escape(target), escape(strings.Join(targetArgs, " ")))
+	return launcherName + " -NoLogo -NoProfile -NonInteractive -EncodedCommand " + encodePowerShellCommand(launcherScript), nil
+}
+
+func shellQuotePOSIX(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
 // openShell 构造 Shell 对应的流式执行桥请求。
 func (bridge *Bridge) openShell(openContext OpenExecContext, toolCall runtimecore.ToolInvocation) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error) {
 	args, err := decodeShellArgs(toolCall.ArgsJSON)
@@ -653,7 +772,14 @@ func (bridge *Bridge) openShell(openContext OpenExecContext, toolCall runtimecor
 		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode Shell args failed: %w", err)
 	}
 	timeout := shellTimeoutFromArgs(args)
-	simpleCommands, parsingResult := buildShellParsingMetadata(args.Command)
+	effectiveCommand := args.Command
+	if args.Profile != "auto" {
+		effectiveCommand, err = buildExplicitShellProfileCommand(args.Profile, args.Command)
+		if err != nil {
+			return nil, runtimecore.PendingExec{}, err
+		}
+	}
+	simpleCommands, parsingResult := buildShellParsingMetadata(effectiveCommand)
 	messageID := bridge.nextID()
 	execID := fmt.Sprintf("exec-shell-%d", time.Now().UnixNano())
 	serverMessage := &agentv1.AgentServerMessage{
@@ -663,7 +789,7 @@ func (bridge *Bridge) openShell(openContext OpenExecContext, toolCall runtimecor
 				ExecId: execID,
 				Message: &agentv1.ExecServerMessage_ShellStreamArgs{
 					ShellStreamArgs: &agentv1.ShellArgs{
-						Command:                  args.Command,
+						Command:                  effectiveCommand,
 						WorkingDirectory:         args.WorkingDirectory,
 						Timeout:                  timeout,
 						ToolCallId:               toolCall.CallID,
@@ -2265,6 +2391,7 @@ type shellResultArgs struct {
 	Command          string                       `json:"command"`
 	Description      string                       `json:"description,omitempty"`
 	WorkingDirectory string                       `json:"working_directory,omitempty"`
+	Profile          string                       `json:"profile,omitempty"`
 	BlockUntilMS     float64                      `json:"block_until_ms,omitempty"`
 	BlockUntilMSSet  bool                         `json:"-"`
 	NotifyOnOutput   *shellOutputNotificationArgs `json:"notify_on_output,omitempty"`
