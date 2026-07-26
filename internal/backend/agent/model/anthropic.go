@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -263,7 +264,8 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 		body["system"] = anthropicProviderSystemBlocks(systemParts)
 		if thinkingConfig != nil {
 			body["thinking"] = thinkingConfig
-			if normalizeRuntimeThinkingEffort(req.ThinkingEffort) != "disabled" {
+			// output_config 只属于 adaptive 形态；legacy budget_tokens 上游不认识该字段。
+			if thinkingType, _ := thinkingConfig["type"].(string); thinkingType == "adaptive" {
 				body["output_config"] = buildAnthropicOutputConfig(req)
 			}
 		}
@@ -278,6 +280,7 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "anthropic", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 		return err
 	}
+	stripAnthropicThinkingIncompatibleParams(body)
 	recordLLMRequestArtifact(req, "anthropic", modelID, "POST", requestURL, body)
 
 	payload, err := json.Marshal(body)
@@ -305,24 +308,38 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 		return httpReq, nil
 	}
 
-	resp, err := doProviderRequestWithRetry(streamCtx, adapter.client, "anthropic", req.RequestID, req.ModelCallID, buildHTTPRequest)
-	if err != nil {
-		if idleErr := streamIdle.Err(); idleErr != nil {
-			err = idleErr
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		resp, err = doProviderRequestWithRetry(streamCtx, adapter.client, "anthropic", req.RequestID, req.ModelCallID, buildHTTPRequest)
+		if err != nil {
+			if idleErr := streamIdle.Err(); idleErr != nil {
+				err = idleErr
+			}
+			finishedAt = time.Now().UTC()
+			recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "anthropic", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
+			return err
+		}
+		streamIdle.AttachBody(resp.Body)
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			break
+		}
+		err = buildHTTPStatusError("anthropic adapter", resp)
+		_ = resp.Body.Close()
+		// 部分 BYOK 中转/旧版 Claude API 不认 adaptive thinking / output_config：
+		// 相应 400 时降级为 legacy budget_tokens 形态原地重试一次。
+		if attempt == 0 && shouldRetryWithLegacyAnthropicThinking(err, body) {
+			applyLegacyAnthropicThinkingDowngrade(body, req)
+			if newPayload, marshalErr := json.Marshal(body); marshalErr == nil {
+				payload = newPayload
+				recordLLMRequestArtifact(req, "anthropic", modelID, "POST", requestURL, body)
+				continue
+			}
 		}
 		finishedAt = time.Now().UTC()
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "anthropic", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 		return err
 	}
-	streamIdle.AttachBody(resp.Body)
 	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err = buildHTTPStatusError("anthropic adapter", resp)
-		finishedAt = time.Now().UTC()
-		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "anthropic", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
-		return err
-	}
 
 	type anthropicUsage struct {
 		InputTokens              *int64 `json:"input_tokens,omitempty"`
@@ -336,6 +353,7 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 		ID    string `json:"id"`
 		Name  string `json:"name"`
 		Text  string `json:"text"`
+		Data  string `json:"data"`
 		Input any    `json:"input"`
 	}
 	type anthropicEvent struct {
@@ -488,10 +506,13 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 	}
 	errorFromEvent := func(event anthropicEvent) error {
 		finishReason = "error"
+		errorType := ""
+		message := "anthropic provider error"
 		if event.Error != nil {
+			errorType = strings.TrimSpace(event.Error.Type)
 			parts := make([]string, 0, 4)
-			if value := strings.TrimSpace(event.Error.Type); value != "" {
-				parts = append(parts, "type="+value)
+			if errorType != "" {
+				parts = append(parts, "type="+errorType)
 			}
 			if value := strings.TrimSpace(event.Error.Code); value != "" {
 				parts = append(parts, "code="+value)
@@ -499,20 +520,24 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 			if value := strings.TrimSpace(event.RequestID); value != "" {
 				parts = append(parts, "request_id="+value)
 			}
-			if message := strings.TrimSpace(event.Error.Message); message != "" {
-				if len(parts) > 0 {
-					return fmt.Errorf("anthropic provider error %s: %s", strings.Join(parts, " "), message)
-				}
-				return fmt.Errorf("anthropic provider error: %s", message)
-			}
-			if len(parts) > 0 {
-				return fmt.Errorf("anthropic provider error %s", strings.Join(parts, " "))
+			detail := strings.TrimSpace(event.Error.Message)
+			switch {
+			case detail != "" && len(parts) > 0:
+				message = fmt.Sprintf("anthropic provider error %s: %s", strings.Join(parts, " "), detail)
+			case detail != "":
+				message = fmt.Sprintf("anthropic provider error: %s", detail)
+			case len(parts) > 0:
+				message = fmt.Sprintf("anthropic provider error %s", strings.Join(parts, " "))
 			}
 		}
-		return fmt.Errorf("anthropic provider error")
+		// 流内 error 事件按类型映射 HTTP 状态码，使上层重试分类能识别可恢复错误。
+		if status := anthropicStreamErrorStatusCode(errorType); status > 0 {
+			return &HTTPStatusError{StatusCode: status, Message: message}
+		}
+		return fmt.Errorf("%s", message)
 	}
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 	currentEvent := ""
 	dataLines := make([]string, 0, 2)
 	flush := func() error {
@@ -541,6 +566,21 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 			}
 			applyUsage(event.Message.Usage)
 		case "content_block_start":
+			if strings.TrimSpace(event.ContentBlock.Type) == "redacted_thinking" {
+				// redacted_thinking 的 data 必须原样回放，否则多轮 tool_use 会话会被 Anthropic 400 拒绝。
+				if data := strings.TrimSpace(event.ContentBlock.Data); data != "" {
+					if err := sink(ModelEvent{
+						Kind:                    ModelEventKindThinkingCompleted,
+						OccurredAt:              time.Now().UTC(),
+						Provider:                "anthropic",
+						Model:                   currentModel,
+						ThinkingSignature:       data,
+						ThinkingSignatureSource: ReasoningSignatureSourceAnthropicRedacted,
+					}); err != nil {
+						return err
+					}
+				}
+			}
 			if strings.TrimSpace(event.ContentBlock.Type) == "tool_use" {
 				if err := flushTaggedTextTail(); err != nil {
 					return err
@@ -550,7 +590,7 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 				}
 				accumulator := &anthropicToolAccumulator{
 					CallID: namespaceToolCallID(req.ModelCallID, event.ContentBlock.ID),
-					Name:   strings.TrimSpace(event.ContentBlock.Name),
+					Name:   normalizeAnthropicToolName(event.ContentBlock.Name),
 				}
 				if !isEmptyAnthropicToolInput(event.ContentBlock.Input) {
 					if encoded, err := json.Marshal(event.ContentBlock.Input); err == nil && string(encoded) != "null" {
@@ -649,6 +689,7 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 				CacheReadPresent:  cacheReadPresent,
 				CacheWritePresent: cacheWritePresent,
 				FinishReason:      finishReason,
+				Incomplete:        anthropicStopReasonIncomplete(finishReason),
 			}); err != nil {
 				return err
 			}
@@ -667,6 +708,9 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 			currentEvent = ""
 			continue
 		}
+		// 任意 SSE 流量（含 ping/message_start）都说明连接活着；
+		// 长 thinking 可能数分钟无 delta，仅靠有效内容刷新会被 idle watchdog 误杀。
+		streamIdle.MarkStreamActivity()
 		if firstEventAt.IsZero() {
 			firstEventAt = time.Now().UTC()
 		}
@@ -1131,15 +1175,22 @@ func normalizeAnthropicProviderMessages(input []Message, thinkingEnabled bool) (
 	systemParts := make([]string, 0, len(input))
 	messages := make([]anthropicMessage, 0, len(input))
 	pendingToolResults := make([]map[string]any, 0, 2)
+	pendingOrphanTexts := make([]map[string]any, 0, 2)
+	seenToolUseIDs := make(map[string]struct{}, 8)
 	flushToolResults := func() {
-		if len(pendingToolResults) == 0 {
+		if len(pendingToolResults) == 0 && len(pendingOrphanTexts) == 0 {
 			return
 		}
+		// tool_result 必须位于 user 消息内容最前，孤儿降级文本排在其后。
+		content := make([]map[string]any, 0, len(pendingToolResults)+len(pendingOrphanTexts))
+		content = append(content, pendingToolResults...)
+		content = append(content, pendingOrphanTexts...)
 		messages = append(messages, anthropicMessage{
 			Role:    "user",
-			Content: append([]map[string]any(nil), pendingToolResults...),
+			Content: content,
 		})
 		pendingToolResults = pendingToolResults[:0]
+		pendingOrphanTexts = pendingOrphanTexts[:0]
 	}
 
 	for _, message := range input {
@@ -1161,6 +1212,14 @@ func normalizeAnthropicProviderMessages(input []Message, thinkingEnabled bool) (
 			if toolUseID == "" {
 				return nil, nil, fmt.Errorf("anthropic tool message requires tool_call_id")
 			}
+			if _, ok := seenToolUseIDs[toolUseID]; !ok {
+				// 孤儿 tool_result（compaction/rewind 后失配）直接发会被 Anthropic 400 拒绝，降级为普通文本。
+				pendingOrphanTexts = append(pendingOrphanTexts, map[string]any{
+					"type": "text",
+					"text": fmt.Sprintf("[historical tool result %s]\n%s", strings.TrimSpace(message.Name), message.Content),
+				})
+				continue
+			}
 			pendingToolResults = append(pendingToolResults, map[string]any{
 				"type":        "tool_result",
 				"tool_use_id": toolUseID,
@@ -1180,9 +1239,11 @@ func normalizeAnthropicProviderMessages(input []Message, thinkingEnabled bool) (
 					if err != nil {
 						return nil, nil, err
 					}
+					toolUseID := providerToolCallID(toolCall.ID)
+					seenToolUseIDs[toolUseID] = struct{}{}
 					blocks = append(blocks, map[string]any{
 						"type":  "tool_use",
-						"id":    providerToolCallID(toolCall.ID),
+						"id":    toolUseID,
 						"name":  strings.TrimSpace(toolCall.Function.Name),
 						"input": inputJSON,
 					})
@@ -1192,6 +1253,12 @@ func normalizeAnthropicProviderMessages(input []Message, thinkingEnabled bool) (
 				continue
 			}
 			if role == "assistant" && mergeAnthropicAssistantToolUseWithPrevious(&messages, message, blocks) {
+				continue
+			}
+			// Anthropic 要求 user/assistant 角色交替，相邻同角色消息必须合并为一条。
+			if len(messages) > 0 && strings.TrimSpace(messages[len(messages)-1].Role) == role {
+				last := &messages[len(messages)-1]
+				last.Content = appendAnthropicMergedBlocks(last.Content, blocks)
 				continue
 			}
 			messages = append(messages, anthropicMessage{
@@ -1225,14 +1292,55 @@ func anthropicProviderContentBlocks(message Message, thinkingEnabled bool) ([]ma
 		return blocks, nil
 	}
 
-	thinkingBlock := map[string]any{
-		"type":     "thinking",
-		"thinking": message.ReasoningContent,
+	if strings.TrimSpace(message.ReasoningSignatureSource) == ReasoningSignatureSourceAnthropicRedacted {
+		data := strings.TrimSpace(message.ReasoningSignature)
+		if data == "" {
+			return blocks, nil
+		}
+		redactedBlock := map[string]any{
+			"type": "redacted_thinking",
+			"data": data,
+		}
+		return append([]map[string]any{redactedBlock}, blocks...), nil
 	}
-	if signature := anthropicThinkingSignature(message); signature != "" {
-		thinkingBlock["signature"] = signature
+
+	signature := anthropicThinkingSignature(message)
+	if signature == "" {
+		// Anthropic 校验回放 thinking 块的 signature；无签名回放（如跨 provider 历史）会被 400 拒绝，直接跳过。
+		return blocks, nil
+	}
+	thinkingBlock := map[string]any{
+		"type":      "thinking",
+		"thinking":  message.ReasoningContent,
+		"signature": signature,
 	}
 	return append([]map[string]any{thinkingBlock}, blocks...), nil
+}
+
+// appendAnthropicMergedBlocks 把后一条同角色消息的内容块并入前一条，跳过完全相同的重复 thinking 块。
+func appendAnthropicMergedBlocks(existing []map[string]any, incoming []map[string]any) []map[string]any {
+	for _, block := range incoming {
+		blockType := strings.TrimSpace(anthropicStringField(block, "type"))
+		if blockType == "thinking" || blockType == "redacted_thinking" {
+			duplicate := false
+			for _, prior := range existing {
+				if strings.TrimSpace(anthropicStringField(prior, "type")) != blockType {
+					continue
+				}
+				if anthropicStringField(prior, "thinking") == anthropicStringField(block, "thinking") &&
+					anthropicStringField(prior, "signature") == anthropicStringField(block, "signature") &&
+					anthropicStringField(prior, "data") == anthropicStringField(block, "data") {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+		}
+		existing = append(existing, block)
+	}
+	return existing
 }
 
 func mergeAnthropicAssistantToolUseWithPrevious(messages *[]anthropicMessage, message Message, blocks []map[string]any) bool {
@@ -1313,6 +1421,9 @@ func shouldIncludeAnthropicThinkingBlock(message Message, thinkingEnabled bool) 
 	if strings.TrimSpace(message.Role) != "assistant" {
 		return false
 	}
+	if strings.TrimSpace(message.ReasoningSignatureSource) == ReasoningSignatureSourceAnthropicRedacted {
+		return strings.TrimSpace(message.ReasoningSignature) != ""
+	}
 	if strings.TrimSpace(message.ReasoningContent) == "" {
 		return false
 	}
@@ -1366,10 +1477,65 @@ func buildAnthropicThinkingConfig(req StreamRequest) map[string]any {
 	if strings.TrimSpace(req.AnthropicThinkingEffort) == "" {
 		return nil
 	}
+	// 渠道显式配置 thinkingBudgetTokens 时直接走 legacy budget_tokens 形态，
+	// 兼容不认 adaptive 的 BYOK 中转/旧版 Claude API。
+	if req.ThinkingBudgetTokens > 0 {
+		return legacyAnthropicThinkingConfig(req)
+	}
 	return map[string]any{
 		"type":    "adaptive",
 		"display": "summarized",
 	}
+}
+
+// legacyAnthropicThinkingConfig 构造旧版 {type:"enabled", budget_tokens:N} thinking 参数。
+// Anthropic 要求 budget_tokens 小于 max_tokens，超限时按 max_tokens 重新推导。
+func legacyAnthropicThinkingConfig(req StreamRequest) map[string]any {
+	budget := maxThinkingBudget(req)
+	if limit := maxAnthropicTokens(req); budget >= limit {
+		budget = anthropicThinkingBudget(limit)
+	}
+	return map[string]any{
+		"type":          "enabled",
+		"budget_tokens": budget,
+	}
+}
+
+// stripAnthropicThinkingIncompatibleParams 在 thinking 开启时从最终请求体（含 extra params
+// 合并结果）剔除与 thinking 互斥的采样参数，避免上游 400。
+func stripAnthropicThinkingIncompatibleParams(body map[string]any) {
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok {
+		return
+	}
+	if thinkingType, _ := thinking["type"].(string); thinkingType == "disabled" || thinkingType == "" {
+		return
+	}
+	delete(body, "temperature")
+	delete(body, "top_p")
+}
+
+// shouldRetryWithLegacyAnthropicThinking 判断 400 是否疑似「上游不认 adaptive thinking /
+// output_config」的兼容失败，允许降级为 legacy 形态原地重试一次。
+func shouldRetryWithLegacyAnthropicThinking(err error, body map[string]any) bool {
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != 400 {
+		return false
+	}
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if thinkingType, _ := thinking["type"].(string); thinkingType != "adaptive" {
+		return false
+	}
+	message := strings.ToLower(statusErr.Message)
+	return strings.Contains(message, "thinking") || strings.Contains(message, "output_config") || strings.Contains(message, "adaptive")
+}
+
+func applyLegacyAnthropicThinkingDowngrade(body map[string]any, req StreamRequest) {
+	body["thinking"] = legacyAnthropicThinkingConfig(req)
+	delete(body, "output_config")
 }
 
 func buildAnthropicOutputConfig(req StreamRequest) map[string]any {
@@ -1385,6 +1551,17 @@ func anthropicThinkingEffort(req StreamRequest) string {
 	default:
 		return "xhigh"
 	}
+}
+
+// normalizeAnthropicToolName 把 Claude 偶发的工具名变体归一为注册名。
+// progress 快照与 interaction 分类都依赖精确匹配，`create_plan`/`createPlan` 变体
+// 若不归一会导致 plan 卡片链路整体失效。
+func normalizeAnthropicToolName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if strings.EqualFold(strings.ReplaceAll(strings.ReplaceAll(trimmed, "_", ""), "-", ""), "createplan") {
+		return "CreatePlan"
+	}
+	return trimmed
 }
 
 func emitAnthropicToolProgress(
@@ -1652,4 +1829,32 @@ func anthropicThinkingBudget(maxTokens int) int {
 		budget = 1024
 	}
 	return budget
+}
+
+// anthropicStopReasonIncomplete 判断 stop_reason 是否表示回合以受控未完成结束、需要续写。
+// pause_turn 表示 provider 主动暂停长回合，按 Anthropic 语义应带原历史直接续跑。
+func anthropicStopReasonIncomplete(stopReason string) bool {
+	switch strings.ToLower(strings.TrimSpace(stopReason)) {
+	case "max_tokens", "pause_turn":
+		return true
+	default:
+		return false
+	}
+}
+
+// anthropicStreamErrorStatusCode 把 SSE error 事件的错误类型映射为等价 HTTP 状态码，
+// 使 forwarder 的重试分类（429/5xx 可重试）对流内错误同样生效。
+func anthropicStreamErrorStatusCode(errorType string) int {
+	switch strings.ToLower(strings.TrimSpace(errorType)) {
+	case "overloaded_error":
+		return 529
+	case "rate_limit_error":
+		return 429
+	case "api_error", "internal_server_error":
+		return 500
+	case "timeout_error":
+		return 408
+	default:
+		return 0
+	}
 }

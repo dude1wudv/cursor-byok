@@ -11,6 +11,14 @@ func hasReplayableReasoningPayload(reasoningContent string, reasoningSignature s
 	if strings.TrimSpace(reasoningContent) != "" {
 		return true
 	}
-	return strings.TrimSpace(reasoningSignature) != "" &&
-		strings.TrimSpace(reasoningSignatureSource) == modeladapter.ReasoningSignatureSourceOpenAIResponses
+	if strings.TrimSpace(reasoningSignature) == "" {
+		return false
+	}
+	switch strings.TrimSpace(reasoningSignatureSource) {
+	case modeladapter.ReasoningSignatureSourceOpenAIResponses,
+		modeladapter.ReasoningSignatureSourceAnthropicRedacted:
+		return true
+	default:
+		return false
+	}
 }

@@ -13,6 +13,8 @@ import (
 const (
 	// ReasoningSignatureSourceAnthropic 表示 signature 来自 Anthropic thinking signature。
 	ReasoningSignatureSourceAnthropic = "anthropic"
+	// ReasoningSignatureSourceAnthropicRedacted 表示 signature 字段承载 Anthropic redacted_thinking 的 data payload。
+	ReasoningSignatureSourceAnthropicRedacted = "anthropic_redacted"
 	// ReasoningSignatureSourceOpenAIResponses 表示 signature 来自 OpenAI Responses encrypted reasoning content。
 	ReasoningSignatureSourceOpenAIResponses = "openai_responses"
 )

@@ -3213,6 +3213,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		scheduleExecRecovery := func() {
 			service.scheduleShellForegroundRecovery(stream.RequestID, pendingExec)
 			service.scheduleSubagentLeaseTimeout(stream.RequestID, pendingExec)
+			service.scheduleExecResultTimeout(stream.RequestID, pendingExec)
 		}
 		removePendingExec := func(reason string) {
 			if strings.TrimSpace(pendingExec.ExecKind) == "subagent" {
@@ -3267,15 +3268,17 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			}
 			execPublished = true
 			scheduleExecRecovery()
-			if err := ensureLoopActive(); err != nil {
-				return failExecDispatch(err)
+			if !suppressStartedToolCall {
+				if err := ensureLoopActive(); err != nil {
+					return failExecDispatch(err)
+				}
+				if err := service.broker.Publish(stream.RequestID, StreamEvent{
+					Message: buildToolCallStartedMessage(invocation.CallID, invocation.ModelCallID, startedToolCall),
+				}); err != nil {
+					return failExecDispatch(err)
+				}
+				startedEmitted = true
 			}
-			if err := service.broker.Publish(stream.RequestID, StreamEvent{
-				Message: buildToolCallStartedMessage(invocation.CallID, invocation.ModelCallID, startedToolCall),
-			}); err != nil {
-				return failExecDispatch(err)
-			}
-			startedEmitted = true
 			service.recordExecDispatchMetadata(stream, pendingExec, true, startedEmitted, "exec_then_started_then_checkpoint")
 			if err := ensureLoopActive(); err != nil {
 				return failExecDispatch(err)
@@ -3320,6 +3323,8 @@ func shouldSuppressStartedToolCallAfterPartial(stream *ActiveStream, toolName st
 	}
 	switch strings.TrimSpace(toolName) {
 	case "CreatePlan", "GenerateImage":
+	// 缓冲派发的只读工具：partial tool call 已渲染一行，再发 ToolCallStarted 会在 UI 出现重复行。
+	case "Read", "Grep", "Glob":
 	default:
 		return false
 	}
@@ -4923,6 +4928,7 @@ func markExecCompleted(stream *ActiveStream, pending runtimecore.PendingExec) {
 	}
 	stream.UpdatedAt = now
 	stream.mu.Unlock()
+	clearStreamTimer(stream, providerTimerKey(streamTimerExecResult, pending.ExecID))
 }
 
 func recentlyCompletedExecExists(stream *ActiveStream, messageID uint32) bool {

@@ -192,7 +192,11 @@ func (service *Service) startHiddenPatchEditRead(stream *ActiveStream, toolCallI
 	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
 		return err
 	}
-	return service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage})
+	if err := service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage}); err != nil {
+		return err
+	}
+	service.scheduleExecResultTimeout(stream.RequestID, pendingExec)
+	return nil
 }
 
 func (service *Service) startHiddenPatchEditWrite(stream *ActiveStream, toolCallID string, modelCallID string, providerPass int, reasoningContent string, reasoningSignature string, reasoningSignatureSource string, payload pendingPatchEditPayload, beforeContent string) error {
@@ -245,7 +249,11 @@ func (service *Service) startHiddenPatchEditWrite(stream *ActiveStream, toolCall
 	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
 		return err
 	}
-	return service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage})
+	if err := service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage}); err != nil {
+		return err
+	}
+	service.scheduleExecResultTimeout(stream.RequestID, pendingExec)
+	return nil
 }
 
 func (service *Service) startHiddenPatchEditPostRead(stream *ActiveStream, toolCallID string, modelCallID string, providerPass int, reasoningContent string, reasoningSignature string, reasoningSignatureSource string, payload pendingPatchEditPayload) error {
@@ -282,7 +290,11 @@ func (service *Service) startHiddenPatchEditPostRead(stream *ActiveStream, toolC
 	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
 		return err
 	}
-	return service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage})
+	if err := service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage}); err != nil {
+		return err
+	}
+	service.scheduleExecResultTimeout(stream.RequestID, pendingExec)
+	return nil
 }
 
 func (service *Service) handleHiddenPatchEditExecResult(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {

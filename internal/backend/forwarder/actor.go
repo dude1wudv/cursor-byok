@@ -71,6 +71,8 @@ const (
 	streamTimerShellForeground      streamTimerKind = "shell_foreground"
 	streamTimerShellTransportClose  streamTimerKind = "shell_transport_close"
 	streamTimerSubagentResult       streamTimerKind = "subagent_result"
+	streamTimerExecResult           streamTimerKind = "exec_result"
+	streamTimerInteractionResult    streamTimerKind = "interaction_result"
 	streamTimerOrphanCancel         streamTimerKind = "orphan_cancel"
 )
 
@@ -877,6 +879,9 @@ func isOutputLimitIncomplete(reason string) bool {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
 	case "max_output_tokens", "max_tokens", "length":
 		return true
+	// pause_turn 是 Anthropic 长回合的受控暂停，按同一续写通道自动继续。
+	case "pause_turn":
+		return true
 	default:
 		return false
 	}
@@ -1405,6 +1410,10 @@ func (service *Service) handleTimerEvent(stream *ActiveStream, payload *streamTi
 		return service.recoverShellWithoutTerminalIfNeeded(stream, payload.ExecID, payload.MessageID, shellRecoveryReasonForegroundDeadline)
 	case streamTimerShellTransportClose:
 		return service.recoverShellWithoutTerminalIfNeeded(stream, payload.ExecID, payload.MessageID, payload.Reason)
+	case streamTimerExecResult:
+		return service.recoverExecAfterResultTimeout(stream, payload.ExecID, payload.MessageID)
+	case streamTimerInteractionResult:
+		return service.cancelInteractionAfterResultTimeout(stream, payload.ExecID)
 	case streamTimerSubagentResult:
 		current, ok := snapshotPendingExec(stream, payload.ExecID)
 		if !ok || current.MessageID != payload.MessageID || strings.TrimSpace(current.ExecKind) != "subagent" {

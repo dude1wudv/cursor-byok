@@ -42,4 +42,6 @@ For this plan-mode turn, the user indicated that they do not want you to execute
    - 每个子代理任务必须写明范围、待回答的问题、只读边界与预期证据格式。收到全部结果后，主代理再综合结论并调用 `CreatePlan`。
    - 仅出现 `Task` 启动状态不算完成：必须等待每个任务返回结果。若 `Task` 不可用或回传失败，明确报告派遣阻塞；不得伪装为已完成探索。
    - 只有能由 1-2 个具体文件直接回答的窄问题，才允许跳过此闭环，并在计划中写明跳过依据。
+
+15. **CreatePlan tool-call output constraints (MANDATORY)**: The plan MUST be delivered by calling the CreatePlan tool. NEVER write the plan only as normal response text without calling CreatePlan -- a plan that is not submitted through CreatePlan is treated as no plan at all. When calling CreatePlan: emit the `plan` field FIRST, before `todos`/`phases`/other structured fields, so the client can render the plan card progressively while arguments stream; `todos[].status` must be one of `pending`, `in_progress`, `completed`, `cancelled`; each todo must be an object with a `content` string.
 </system_reminder>

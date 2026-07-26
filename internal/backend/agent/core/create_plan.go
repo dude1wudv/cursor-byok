@@ -47,6 +47,95 @@ func DecodeCreatePlanArgsJSON(raw []byte) (*agentv1.CreatePlanArgs, error) {
 	}, nil
 }
 
+// DecodeCreatePlanArgsJSONLenient 在严格解析失败时容错清洗：字符串 todo 降级为 content-only、
+// 未知 status 归一为 UNSPECIFIED、非法 todo/phase 条目丢弃，而不是整卡失败。
+// 仅当输入整体不是合法 JSON 对象时才返回错误。
+func DecodeCreatePlanArgsJSONLenient(raw []byte) (*agentv1.CreatePlanArgs, error) {
+	if args, err := DecodeCreatePlanArgsJSON(raw); err == nil {
+		return args, nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	if payload == nil {
+		return &agentv1.CreatePlanArgs{}, nil
+	}
+	return &agentv1.CreatePlanArgs{
+		Plan:      createPlanStringValue(createPlanValueByAlias(payload, "plan")),
+		Overview:  createPlanStringValue(createPlanValueByAlias(payload, "overview")),
+		Name:      strings.TrimSpace(createPlanStringValue(createPlanValueByAlias(payload, "name"))),
+		IsProject: createPlanBoolValue(createPlanValueByAlias(payload, "is_project", "isProject")),
+		Todos:     LenientCreatePlanTodoItems(createPlanValueByAlias(payload, "todos")),
+		Phases:    lenientCreatePlanPhases(createPlanValueByAlias(payload, "phases")),
+	}, nil
+}
+
+func lenientCreatePlanPhases(value any) []*agentv1.Phase {
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		return nil
+	}
+	phases := make([]*agentv1.Phase, 0, len(items))
+	for _, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		phase := &agentv1.Phase{
+			Name:  strings.TrimSpace(createPlanStringValue(createPlanValueByAlias(object, "name"))),
+			Todos: LenientCreatePlanTodoItems(createPlanValueByAlias(object, "todos")),
+		}
+		if phase.Name == "" && len(phase.Todos) == 0 {
+			continue
+		}
+		phases = append(phases, phase)
+	}
+	if len(phases) == 0 {
+		return nil
+	}
+	return phases
+}
+
+// LenientCreatePlanTodoItems 容错解析 todos 数组：对象条目按字段提取（status 解析失败归一为
+// UNSPECIFIED），字符串条目降级为 content-only todo，其余非法条目丢弃。
+func LenientCreatePlanTodoItems(value any) []*agentv1.TodoItem {
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		return nil
+	}
+	todos := make([]*agentv1.TodoItem, 0, len(items))
+	for _, item := range items {
+		switch object := item.(type) {
+		case map[string]any:
+			status, err := decodeCreatePlanTodoStatus(createPlanValueByAlias(object, "status"))
+			if err != nil {
+				status = agentv1.TodoStatus_TODO_STATUS_UNSPECIFIED
+			}
+			todo := &agentv1.TodoItem{
+				Id:           strings.TrimSpace(createPlanStringValue(createPlanValueByAlias(object, "id"))),
+				Content:      strings.TrimSpace(createPlanStringValue(createPlanValueByAlias(object, "content"))),
+				Status:       status,
+				CreatedAt:    createPlanInt64Value(createPlanValueByAlias(object, "created_at", "createdAt")),
+				UpdatedAt:    createPlanInt64Value(createPlanValueByAlias(object, "updated_at", "updatedAt")),
+				Dependencies: createPlanStringSliceValue(createPlanValueByAlias(object, "dependencies")),
+			}
+			if todo.Content == "" && todo.Id == "" {
+				continue
+			}
+			todos = append(todos, todo)
+		case string:
+			if trimmed := strings.TrimSpace(object); trimmed != "" {
+				todos = append(todos, &agentv1.TodoItem{Content: trimmed})
+			}
+		}
+	}
+	if len(todos) == 0 {
+		return nil
+	}
+	return todos
+}
+
 func decodeCreatePlanPhases(value any) ([]*agentv1.Phase, error) {
 	if value == nil {
 		return nil, nil
@@ -139,13 +228,13 @@ func decodeCreatePlanTodoStatusString(raw string) (agentv1.TodoStatus, error) {
 		return agentv1.TodoStatus(numeric), nil
 	}
 	switch normalized {
-	case "pending", "todo_status_pending":
+	case "pending", "todo_status_pending", "not_started", "not-started", "notstarted", "queued", "open":
 		return agentv1.TodoStatus_TODO_STATUS_PENDING, nil
-	case "in_progress", "in-progress", "inprogress", "todo_status_in_progress":
+	case "in_progress", "in-progress", "inprogress", "in progress", "todo_status_in_progress", "doing", "active", "started", "wip":
 		return agentv1.TodoStatus_TODO_STATUS_IN_PROGRESS, nil
-	case "completed", "complete", "todo_status_completed":
+	case "completed", "complete", "todo_status_completed", "done", "finished":
 		return agentv1.TodoStatus_TODO_STATUS_COMPLETED, nil
-	case "cancelled", "canceled", "todo_status_cancelled":
+	case "cancelled", "canceled", "todo_status_cancelled", "skipped":
 		return agentv1.TodoStatus_TODO_STATUS_CANCELLED, nil
 	default:
 		return agentv1.TodoStatus_TODO_STATUS_UNSPECIFIED, fmt.Errorf("unsupported todo status %q", raw)

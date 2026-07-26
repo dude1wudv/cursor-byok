@@ -11,13 +11,16 @@ import (
 const (
 	defaultProviderStreamIdleTimeout = 4 * time.Minute
 	minProviderStreamIdleTimeout     = 30 * time.Second
+	// providerStreamHardCapMultiplier 约束仅有心跳流量但始终不产出内容的病态流总时长。
+	providerStreamHardCapMultiplier = 10
 )
 
 type providerStreamIdleWatchdog struct {
-	ctx     context.Context
-	cancel  context.CancelCauseFunc
-	timeout time.Duration
-	timer   *time.Timer
+	ctx       context.Context
+	cancel    context.CancelCauseFunc
+	timeout   time.Duration
+	timer     *time.Timer
+	hardTimer *time.Timer
 
 	mu       sync.Mutex
 	body     io.Closer
@@ -40,6 +43,23 @@ func newProviderStreamIdleWatchdog(parent context.Context, timeout time.Duration
 	}
 	watchdog.timer = time.AfterFunc(watchdog.timeout, watchdog.expire)
 	return ctx, watchdog
+}
+
+// MarkStreamActivity 表示收到任意 provider 流量（含 ping 等心跳事件）。
+// 心跳只能证明连接活着，因此仅重置 idle 计时；总时长由 hard cap 兜底。
+func (watchdog *providerStreamIdleWatchdog) MarkStreamActivity() {
+	if watchdog == nil {
+		return
+	}
+	watchdog.mu.Lock()
+	defer watchdog.mu.Unlock()
+	if watchdog.stopped || watchdog.timedOut || watchdog.timer == nil {
+		return
+	}
+	if watchdog.hardTimer == nil {
+		watchdog.hardTimer = time.AfterFunc(watchdog.timeout*providerStreamHardCapMultiplier, watchdog.expire)
+	}
+	watchdog.timer.Reset(watchdog.timeout)
 }
 
 func (watchdog *providerStreamIdleWatchdog) AttachBody(body io.Closer) {
@@ -65,6 +85,9 @@ func (watchdog *providerStreamIdleWatchdog) MarkEffectiveContent() {
 		return
 	}
 	watchdog.timer.Reset(watchdog.timeout)
+	if watchdog.hardTimer != nil {
+		watchdog.hardTimer.Reset(watchdog.timeout * providerStreamHardCapMultiplier)
+	}
 }
 
 func (watchdog *providerStreamIdleWatchdog) Stop() {
@@ -80,6 +103,9 @@ func (watchdog *providerStreamIdleWatchdog) Stop() {
 	watchdog.body = nil
 	if watchdog.timer != nil {
 		watchdog.timer.Stop()
+	}
+	if watchdog.hardTimer != nil {
+		watchdog.hardTimer.Stop()
 	}
 	watchdog.mu.Unlock()
 	watchdog.cancel(nil)

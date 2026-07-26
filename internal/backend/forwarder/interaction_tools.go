@@ -50,6 +50,7 @@ func (service *Service) handleInteractionToolInvocation(stream *ActiveStream, in
 		removePending()
 		return err
 	}
+	service.scheduleInteractionResultTimeout(stream.RequestID, pendingInteraction)
 	return nil
 }
 
@@ -178,6 +179,7 @@ func markInteractionCompleted(stream *ActiveStream, pending runtimecore.PendingI
 	delete(stream.PendingInteractions, pending.InteractionID)
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
+	clearStreamTimer(stream, providerTimerKey(streamTimerInteractionResult, pending.InteractionID))
 }
 
 func deriveToolNameFromPendingInteraction(pending runtimecore.PendingInteraction) string {

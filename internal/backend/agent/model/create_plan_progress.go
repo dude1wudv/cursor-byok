@@ -1,6 +1,7 @@
 package modeladapter
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -28,7 +29,12 @@ func emitCreatePlanToolProgress(
 	}
 	args, ok := createPlanArgsProgressSnapshot(rawArgs)
 	if !ok {
-		return nil
+		// 参数尚不可解析（如 content_block_start 阶段为空、或 Claude 先输出暂不支持前缀
+		// 提取的字段）：先发一次空占位 partial，让客户端立即弹出 plan 卡片，后续快照渐进填充。
+		if *lastSnapshot != "" {
+			return nil
+		}
+		args = &agentv1.CreatePlanArgs{}
 	}
 	signatureBytes, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(args)
 	if err != nil {
@@ -78,10 +84,95 @@ func createPlanArgsProgressSnapshot(rawArgs string) (*agentv1.CreatePlanArgs, bo
 	if value, found, complete := extractJSONStringFieldPrefix(trimmed, "name"); found && complete {
 		args.Name = strings.TrimSpace(value)
 	}
+	if todos := extractCreatePlanTodosPrefix(trimmed); len(todos) > 0 {
+		args.Todos = todos
+	}
 	if !hasCreatePlanArgsProgress(args) {
 		return nil, false
 	}
 	return args, true
+}
+
+// extractCreatePlanTodosPrefix 从不完整的 CreatePlan 参数 JSON 中提取已完整闭合的 todo 对象，
+// 供渐进渲染使用——Claude 可能先输出 todos、后输出 plan/name。
+func extractCreatePlanTodosPrefix(input string) []*agentv1.TodoItem {
+	keyToken := `"todos"`
+	start := strings.Index(input, keyToken)
+	if start < 0 {
+		return nil
+	}
+	index := start + len(keyToken)
+	for index < len(input) && isJSONWhitespace(input[index]) {
+		index++
+	}
+	if index >= len(input) || input[index] != ':' {
+		return nil
+	}
+	index++
+	for index < len(input) && isJSONWhitespace(input[index]) {
+		index++
+	}
+	if index >= len(input) || input[index] != '[' {
+		return nil
+	}
+	index++
+	items := make([]any, 0, 8)
+	for index < len(input) {
+		for index < len(input) && (isJSONWhitespace(input[index]) || input[index] == ',') {
+			index++
+		}
+		if index >= len(input) || input[index] == ']' {
+			break
+		}
+		if input[index] != '{' {
+			break
+		}
+		object, next, complete := scanBalancedJSONObject(input, index)
+		if !complete {
+			break
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(object), &payload); err != nil {
+			break
+		}
+		items = append(items, payload)
+		index = next
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	return runtimecore.LenientCreatePlanTodoItems(items)
+}
+
+// scanBalancedJSONObject 从 start（须为 '{'）扫描到配对的 '}'，正确跳过字符串与转义。
+func scanBalancedJSONObject(input string, start int) (string, int, bool) {
+	depth := 0
+	inString := false
+	for i := start; i < len(input); i++ {
+		character := input[i]
+		if inString {
+			if character == '\\' {
+				i++
+				continue
+			}
+			if character == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch character {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return input[start : i+1], i + 1, true
+			}
+		}
+	}
+	return "", start, false
 }
 
 func hasCreatePlanArgsProgress(args *agentv1.CreatePlanArgs) bool {

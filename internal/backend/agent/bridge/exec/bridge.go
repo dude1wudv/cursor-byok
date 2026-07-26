@@ -2860,11 +2860,19 @@ func truncateGrepContentResultForReplay(content *agentv1.GrepContentResult, budg
 		}
 		nextFile := &agentv1.GrepFileMatch{File: fileMatch.GetFile()}
 		perFile := 0
+		keptLines := 0
 		for _, match := range fileMatch.GetMatches() {
 			if match == nil {
 				continue
 			}
-			if perFile >= grepReplayMatchesPerFile || budget.remainingMatches <= 0 || budget.remainingContentBytes <= 0 {
+			if budget.remainingContentBytes <= 0 {
+				truncated = true
+				break
+			}
+			isContextLine := match.GetIsContextLine()
+			// 匹配数预算只对真实匹配行计数；context 行（-A/-B/-C）只消耗内容字节预算。
+			// 否则 context 模式会以数倍速度耗尽 match 预算，殃及同一次 Grep 的后续小结果。
+			if !isContextLine && (perFile >= grepReplayMatchesPerFile || budget.remainingMatches <= 0) {
 				truncated = true
 				break
 			}
@@ -2885,14 +2893,17 @@ func truncateGrepContentResultForReplay(content *agentv1.GrepContentResult, budg
 				break
 			}
 			budget.remainingContentBytes -= len(nextMatch.Content)
-			budget.remainingMatches--
-			perFile++
+			if !isContextLine {
+				budget.remainingMatches--
+				perFile++
+			}
+			keptLines++
 			nextFile.Matches = append(nextFile.Matches, nextMatch)
 		}
 		if len(nextFile.Matches) > 0 {
 			newFiles = append(newFiles, nextFile)
 		}
-		if len(fileMatch.GetMatches()) > perFile {
+		if len(fileMatch.GetMatches()) > keptLines {
 			truncated = true
 		}
 	}
@@ -2908,7 +2919,12 @@ func truncateGrepContentResultForReplay(content *agentv1.GrepContentResult, budg
 
 func addGrepContentTruncationNotice(files []*agentv1.GrepFileMatch, originalBytes int) []*agentv1.GrepFileMatch {
 	used := grepContentBytes(files)
-	notice := replayTruncationNotice("Grep", grepReplayContentLimit, used, originalBytes)
+	// 内容/匹配数预算是整次 Grep 调用共享的；notice 必须陈述本结果实际保留量与共享预算语义，
+	// 不能打印全局常量冒充本结果的上限（曾导致「总量 646 却报 exceeded 32768」的矛盾）。
+	notice := fmt.Sprintf(
+		"[truncated: Grep replay kept %d of %d bytes for this result; budgets are shared across the whole Grep call (%d bytes / %d matches total)]",
+		used, originalBytes, grepReplayContentLimit, grepReplayTotalMatches,
+	)
 	match := &agentv1.GrepContentMatch{
 		LineNumber:       0,
 		Content:          notice,
