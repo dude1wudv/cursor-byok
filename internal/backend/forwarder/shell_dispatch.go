@@ -1,6 +1,8 @@
 package forwarder
 
 import (
+	"context"
+	"log"
 	"strings"
 	"time"
 
@@ -49,6 +51,23 @@ func shellDispatchLimitLocked(stream *ActiveStream) int {
 		return legacyShellMaxConcurrentPerRun
 	}
 	return stream.ShellMaxConcurrent
+}
+
+// nextShellDispatchSequenceLocked 返回本 stream 内下一个单调 queue/dispatch 事件序号。
+func nextShellDispatchSequenceLocked(stream *ActiveStream) int64 {
+	stream.ShellDispatchSequence++
+	return stream.ShellDispatchSequence
+}
+
+// shellDispatchObservationLocked 汇总当前 FIFO 状态供事件记录，不改变调度。
+func shellDispatchObservationLocked(stream *ActiveStream, queuePosition int) shellDispatchObservation {
+	return shellDispatchObservation{
+		Sequence:      nextShellDispatchSequenceLocked(stream),
+		QueuePosition: queuePosition,
+		QueueDepth:    len(stream.QueuedForegroundShells),
+		Active:        len(stream.ActiveForegroundShells),
+		Limit:         shellDispatchLimitLocked(stream),
+	}
 }
 
 func syncLegacyForegroundShellLocked(stream *ActiveStream) {
@@ -141,6 +160,7 @@ func takeNextForegroundShellDispatchLocked(stream *ActiveStream) (queuedShellDis
 	ready := stream.QueuedForegroundShells[0]
 	stream.QueuedForegroundShells = append([]queuedShellDispatch(nil), stream.QueuedForegroundShells[1:]...)
 	ready.Pending = activateForegroundShellLocked(stream, ready.Pending)
+	ready.Observation = shellDispatchObservationLocked(stream, 0)
 	return ready, true
 }
 
@@ -186,8 +206,40 @@ func (service *Service) publishForegroundShellDispatch(stream *ActiveStream, ite
 		}
 	}
 	service.scheduleShellForegroundRecovery(stream.RequestID, item.Pending)
+	service.recordShellDispatchTransition(stream, item.Pending, "shell_dispatch_activated", item.Observation)
 	service.recordExecDispatchMetadata(stream, item.Pending, false, true, "exec_then_started_then_checkpoint")
 	return service.publishCheckpoint(stream.RequestID, stream.ConversationID)
+}
+
+// recordShellDispatchTransition 落一条 FIFO 状态迁移证据：单调序号、队列深度与位置、
+// exec ID 与本次迁移时的 command/cwd hash，用于还原入队→出队→开始→完成顺序，
+// 并定位 cwd 漂移发生在服务端还是客户端。
+func (service *Service) recordShellDispatchTransition(stream *ActiveStream, pending runtimecore.PendingExec, event string, observation shellDispatchObservation) {
+	if service == nil || stream == nil {
+		return
+	}
+	commandHash, _, cwdHash := shellInvocationHashes(pending.ArgsJSON)
+	values := map[string]any{
+		"tool_call_id":      pending.ToolCallID,
+		"exec_id":           pending.ExecID,
+		"message_id":        pending.MessageID,
+		"provider_pass":     pending.ProviderPass,
+		"dispatch_sequence": observation.Sequence,
+		"queue_position":    observation.QueuePosition,
+		"queue_depth":       observation.QueueDepth,
+		"active":            observation.Active,
+		"limit":             observation.Limit,
+		"command_hash":      commandHash,
+		"cwd_hash":          cwdHash,
+	}
+	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, event, values),
+	}); err != nil {
+		log.Printf("forwarder shell dispatch transition metadata failed request_id=%s exec_id=%s event=%s err=%v", strings.TrimSpace(stream.RequestID), strings.TrimSpace(pending.ExecID), event, err)
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, event, values)
+	}
 }
 
 func releaseShellStartAllocation(stream *ActiveStream, pending runtimecore.PendingExec) (queuedShellDispatch, bool) {
@@ -216,24 +268,28 @@ func (service *Service) dispatchOrQueueForegroundShell(stream *ActiveStream, mes
 	if reserveForegroundShellDispatch(stream, message, pending, startedToolCall) {
 		stream.mu.Lock()
 		pending = stream.ActiveForegroundShells[pending.ExecID]
+		observation := shellDispatchObservationLocked(stream, 0)
 		stream.mu.Unlock()
 		return true, service.publishForegroundShellDispatch(stream, queuedShellDispatch{
 			Message:         message,
 			StartedToolCall: startedToolCall,
 			Pending:         pending,
+			Observation:     observation,
 		})
 	}
-	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
-		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_dispatch_queued", map[string]any{
-			"tool_call_id":  pending.ToolCallID,
-			"exec_id":       pending.ExecID,
-			"message_id":    pending.MessageID,
-			"provider_pass": pending.ProviderPass,
-			"active":        len(stream.ActiveForegroundShells),
-			"limit":         stream.ShellMaxConcurrent,
-		}),
-	})
-	return false, err
+	stream.mu.Lock()
+	queuePosition := 0
+	for index := range stream.QueuedForegroundShells {
+		queued := stream.QueuedForegroundShells[index].Pending
+		if queued.ExecID == pending.ExecID && queued.MessageID == pending.MessageID && queued.ProviderPass == pending.ProviderPass {
+			queuePosition = index + 1
+			break
+		}
+	}
+	observation := shellDispatchObservationLocked(stream, queuePosition)
+	stream.mu.Unlock()
+	service.recordShellDispatchTransition(stream, pending, "shell_dispatch_queued", observation)
+	return false, nil
 }
 
 func (service *Service) advanceForegroundShellQueue(stream *ActiveStream, completed runtimecore.PendingExec) error {

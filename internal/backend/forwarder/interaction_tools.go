@@ -33,6 +33,7 @@ func (service *Service) handleInteractionToolInvocation(stream *ActiveStream, in
 	}
 	pendingInteraction.ProviderPass = stream.ProviderPassCount
 	stream.PendingInteractions[pendingInteraction.InteractionID] = pendingInteraction
+	stream.ProviderPassMetrics.noteParallelDispatch(pendingInteraction.ProviderPass, pendingInteraction.ToolCallID)
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 

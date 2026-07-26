@@ -156,6 +156,22 @@ type queuedShellDispatch struct {
 	Message         *agentv1.AgentServerMessage
 	StartedToolCall *agentv1.ToolCall
 	Pending         runtimecore.PendingExec
+	Observation     shellDispatchObservation
+}
+
+// shellDispatchObservation 是 shell FIFO 状态迁移的可观测性快照，
+// 只作事件排序与队列证据，不参与调度决策。
+type shellDispatchObservation struct {
+	// Sequence 是本 stream 内单调递增的 queue/dispatch 事件序号。
+	Sequence int64
+	// QueuePosition 是入队时的 1-based 队列位置；立即派发或出队派发为 0。
+	QueuePosition int
+	// QueueDepth 是本次状态迁移后的队列长度。
+	QueueDepth int
+	// Active 是本次状态迁移后的活跃前台 shell 数。
+	Active int
+	// Limit 是当前前台并发上限。
+	Limit int
 }
 
 // providerPassMetrics 收集单个 provider pass 的低敏结构化性能指标；
@@ -172,6 +188,31 @@ type providerPassMetrics struct {
 	ExternalWaitMillis   int64
 	ExpectedCacheRead    bool
 	FrontierHintPresent  bool
+	// DispatchedToolCallIDs 记录本 provider pass 成功接受并派发的唯一外部工具
+	// tool_call_id；len 即真实 parallel_width。在有效派发点累计、pass 结束冻结，
+	// 不得用 provider 结束瞬间的 pending 数量推算，预派发拒绝不计入。
+	DispatchedToolCallIDs map[string]struct{}
+}
+
+// noteParallelDispatch 在有效派发点把外部工具计入当前 pass 的唯一批次宽度。
+// providerPass 与当前 pass 不一致（例如 Write 隐藏子阶段在下一 pass 前补发）时不计入。
+func (metrics *providerPassMetrics) noteParallelDispatch(providerPass int, toolCallID string) {
+	toolCallID = strings.TrimSpace(toolCallID)
+	if metrics == nil || toolCallID == "" || metrics.Pass != providerPass {
+		return
+	}
+	if metrics.DispatchedToolCallIDs == nil {
+		metrics.DispatchedToolCallIDs = make(map[string]struct{})
+	}
+	metrics.DispatchedToolCallIDs[toolCallID] = struct{}{}
+}
+
+// ParallelWidth 返回冻结的真实派发批次宽度。
+func (metrics *providerPassMetrics) ParallelWidth() int {
+	if metrics == nil {
+		return 0
+	}
+	return len(metrics.DispatchedToolCallIDs)
 }
 
 type shellExecTombstone struct {
@@ -237,6 +278,9 @@ type ActiveStream struct {
 	ShellAwaitingStartExecID    string
 	QueuedForegroundShells      []queuedShellDispatch
 	ShellMaxConcurrent          int
+	// ShellDispatchSequence 是本 stream 内 shell 入队/派发事件的单调序号，
+	// 只用于事件排序证据，不参与 FIFO 调度决策。
+	ShellDispatchSequence       int64
 	ShellExecTombstones         map[string]shellExecTombstone
 	PendingInteractions         map[string]runtimecore.PendingInteraction
 	PartialToolCallIDs          map[string]struct{}

@@ -152,10 +152,10 @@ func TestCompactionSoftThresholdHysteresis(t *testing.T) {
 		baseline int64
 		want     bool
 	}{
-		{name: "below soft threshold", tokens: 100000, want: false},
-		{name: "above threshold no baseline", tokens: 120000, want: true},
-		{name: "above threshold but under rearm growth", tokens: 120000, baseline: 111000, want: false},
-		{name: "above threshold with rearm growth", tokens: 155000, baseline: 111000, want: true},
+		{name: "below soft threshold", tokens: 140000, want: false},
+		{name: "above threshold no baseline", tokens: 140001, want: true},
+		{name: "above threshold but under rearm growth", tokens: 150000, baseline: 141000, want: false},
+		{name: "above threshold with rearm growth", tokens: 181000, baseline: 141000, want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

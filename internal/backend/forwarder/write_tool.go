@@ -116,6 +116,7 @@ func (service *Service) startHiddenWriteRead(stream *ActiveStream, toolCallID st
 	pendingExec.ArgsJSON = pendingArgsJSON
 	stream.mu.Lock()
 	stream.PendingExecs[pendingExec.ExecID] = pendingExec
+	stream.ProviderPassMetrics.noteParallelDispatch(pendingExec.ProviderPass, pendingExec.ToolCallID)
 	stream.mu.Unlock()
 	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
 		return err
@@ -159,6 +160,7 @@ func (service *Service) startHiddenWriteExec(stream *ActiveStream, toolCallID st
 	pendingExec.ArgsJSON = pendingArgsJSON
 	stream.mu.Lock()
 	stream.PendingExecs[pendingExec.ExecID] = pendingExec
+	stream.ProviderPassMetrics.noteParallelDispatch(pendingExec.ProviderPass, pendingExec.ToolCallID)
 	stream.mu.Unlock()
 	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
 		return err
@@ -198,6 +200,7 @@ func (service *Service) startHiddenWritePostRead(stream *ActiveStream, toolCallI
 	pendingExec.ArgsJSON = pendingArgsJSON
 	stream.mu.Lock()
 	stream.PendingExecs[pendingExec.ExecID] = pendingExec
+	stream.ProviderPassMetrics.noteParallelDispatch(pendingExec.ProviderPass, pendingExec.ToolCallID)
 	stream.mu.Unlock()
 	if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
 		return err

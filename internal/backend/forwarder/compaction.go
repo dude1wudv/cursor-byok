@@ -24,10 +24,11 @@ import (
 const (
 	compactionAutoReserveTokens      = 10000
 	compactionTriggerRemainingTokens = 8192
-	// compactionSoftUsageFraction 是性能软阈值：上下文超过窗口 55% 即触发压缩，
-	// 不必等到接近硬上限。软压缩后需再增长 compactionSoftRearmFraction 窗口才允许再次触发。
-	compactionSoftUsageFraction = 0.55
-	compactionSoftRearmFraction = 0.20
+	// compactionSoftUsageFraction 是性能软阈值：上下文超过窗口 70% 即触发压缩，
+	// 不必等到接近硬上限（200k 窗口下 140000 不触发、140001 才触发）。
+	// 软压缩后需再增长 compactionSoftRearmFraction 窗口才允许再次触发。
+	compactionSoftUsageFraction      = 0.70
+	compactionSoftRearmFraction      = 0.20
 	compactionPreferredTailTurns     = 4
 	compactionMinimumTailTurns       = 1
 	compactionReserveFloorTokens     = 8192
@@ -205,7 +206,7 @@ func (service *Service) buildAutoCompactionPlan(stream *ActiveStream, conversati
 	return plan, nil
 }
 
-// compactionSoftThresholdExceeded 判定 55% 性能软阈值是否触发。
+// compactionSoftThresholdExceeded 判定 70% 性能软阈值是否触发。
 // 迟滞：上次（软）压缩后的基线之上还需新增至少 20% 窗口，防止同回合反复触发。
 func compactionSoftThresholdExceeded(conversation *ConversationFile, contextTokens int64, contextWindowSize int64) bool {
 	if conversation == nil || contextTokens <= 0 || contextWindowSize <= 0 {

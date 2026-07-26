@@ -43,8 +43,12 @@ const (
 	defaultSummaryCompletedThought = "Chat context summarized"
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
-	shellCircuitLocalBlockLimit    = 2
-	// shellCircuitFingerprintOpenLimit 表示同一 command/cwd/class 指纹累计多少次 terminal 稳定拒绝后开路。
+	// shellCircuitLocalBlockLimit：开路后第一次本地拦截即终止 provider loop。
+	// 时间线固定为：第一次拒绝记账、第二次同指纹开路（附纠正指引）、第三次本地终止；
+	// 后两次都不得派发 Shell exec。
+	shellCircuitLocalBlockLimit = 1
+	// shellCircuitFingerprintOpenLimit 表示同一 tool_name+canonical_args+validation_error_class
+	// 指纹累计多少次确定性拒绝（pre-dispatch 或 terminal）后开路。
 	shellCircuitFingerprintOpenLimit = 2
 	shellCircuitPromptSource         = "shell_circuit"
 	shellCircuitPromptText           = "Shell is unavailable for the rest of this turn after Cursor rejected it. Do not issue Shell again; use Read, Grep, Glob, or another non-Shell tool, or explain the blocker and finish the turn."
@@ -1513,6 +1517,14 @@ type shellCircuitState struct {
 	FingerprintHits map[string]int
 }
 
+// shellCircuitFingerprint 是确定性拒绝熔断的唯一指纹定义：
+// tool_name + canonical_args（规范化 command + 规范化 cwd）+ validation_error_class。
+// pre-dispatch 校验拒绝、terminal 拒绝、reset 清零和账本重放都必须经过本函数，
+// 保证同一确定性错误在两条路径上落在同一指纹、按同一阈值开路。
+func shellCircuitFingerprint(commandHash string, cwdHash string, errorClass string) string {
+	return planContentHash(strings.Join([]string{"Shell", commandHash, cwdHash, strings.TrimSpace(errorClass)}, "\x00"))
+}
+
 func (service *Service) recordShellRejection(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
 	if service == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
 		return nil
@@ -1523,7 +1535,7 @@ func (service *Service) recordShellRejection(stream *ActiveStream, pending runti
 	}
 	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
 	providerItemID, providerCallID, providerStatus := providerToolCorrelation(stream, pending.ToolCallID)
-	fingerprint := planContentHash(strings.Join([]string{"Shell", commandHash, cwdHash, rejectionClass}, "\x00"))
+	fingerprint := shellCircuitFingerprint(commandHash, cwdHash, rejectionClass)
 	circuit := currentTurnShellCircuit(stream)
 	count := circuit.FingerprintHits[fingerprint] + 1
 	values := map[string]any{
@@ -1595,7 +1607,7 @@ func (service *Service) recordPreDispatchShellRejection(stream *ActiveStream, in
 	reason := cause.Error()
 	rejectionClass := classifyShellRejection(reason)
 	commandHash, argsHash, cwdHash := shellInvocationHashes(invocation.ArgsJSON)
-	fingerprint := planContentHash(strings.Join([]string{"Shell", commandHash, cwdHash, rejectionClass}, "\x00"))
+	fingerprint := shellCircuitFingerprint(commandHash, cwdHash, rejectionClass)
 	circuit := currentTurnShellCircuit(stream)
 	count := circuit.FingerprintHits[fingerprint] + 1
 	values := map[string]any{
@@ -1653,7 +1665,7 @@ func shellCircuitFingerprintResetEntry(stream *ActiveStream, pending runtimecore
 	commandHash, _, cwdHash := shellInvocationHashes(pending.ArgsJSON)
 	hits := 0
 	for _, class := range shellCircuitFingerprintClasses {
-		hits += circuit.FingerprintHits[planContentHash(strings.Join([]string{"Shell", commandHash, cwdHash, class}, "\x00"))]
+		hits += circuit.FingerprintHits[shellCircuitFingerprint(commandHash, cwdHash, class)]
 	}
 	if hits == 0 {
 		return HistoryEntry{}, false
@@ -1911,7 +1923,7 @@ func currentTurnShellCircuit(stream *ActiveStream) shellCircuitState {
 			commandHash := strings.TrimSpace(fmt.Sprint(payload.Value["command_hash"]))
 			cwdHash := strings.TrimSpace(fmt.Sprint(payload.Value["cwd_hash"]))
 			for _, class := range shellCircuitFingerprintClasses {
-				delete(state.FingerprintHits, planContentHash(strings.Join([]string{"Shell", commandHash, cwdHash, class}, "\x00")))
+				delete(state.FingerprintHits, shellCircuitFingerprint(commandHash, cwdHash, class))
 			}
 		case "shell_circuit_open":
 			state.Open = true
@@ -3450,10 +3462,21 @@ func (service *Service) logTaskDispatchPayloads(stream *ActiveStream, invocation
 	})
 }
 
+// notePassParallelDispatch 在有效派发点把外部工具计入当前 pass 的真实批次宽度。
+func notePassParallelDispatch(stream *ActiveStream, providerPass int, toolCallID string) {
+	if stream == nil {
+		return
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	stream.ProviderPassMetrics.noteParallelDispatch(providerPass, toolCallID)
+}
+
 func (service *Service) recordExecDispatchMetadata(stream *ActiveStream, pending runtimecore.PendingExec, buffered bool, startedEmitted bool, dispatchOrder string) {
 	if service == nil || stream == nil {
 		return
 	}
+	notePassParallelDispatch(stream, pending.ProviderPass, pending.ToolCallID)
 	toolName := strings.TrimSpace(deriveToolNameFromPendingExec(pending))
 	commandHash, argsHash, cwdHash := "", planContentHash(strings.TrimSpace(string(pending.ArgsJSON))), ""
 	if toolName == "Shell" {
@@ -3776,6 +3799,22 @@ func (service *Service) failStreamIfNonTerminal(stream *ActiveStream, terminalCo
 	return service.failStream(stream, terminalCode, cause)
 }
 
+// rewriteCheckpointSubagentStatusForClient 只改发给 Cursor 的 checkpoint 副本：
+// 未终态 RUNNING 投影为 BACKGROUNDED。Cursor 3.12.17 会清理等待外部结果的普通
+// loading 卡片，只有 BACKGROUNDED checkpoint 能保持运行中的 Task 展示。
+// 历史与内部投影仍保存真实 RUNNING；ProjectLegacyCheckpoint 每次从 history
+// 重建 SubagentRunsByParentToolCallId，本转换不落盘、不影响真实状态语义。
+func rewriteCheckpointSubagentStatusForClient(state *agentv1.ConversationStateStructure) {
+	if state == nil {
+		return
+	}
+	for _, run := range state.SubagentRunsByParentToolCallId {
+		if run.GetStatus() == agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_RUNNING {
+			run.Status = agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_BACKGROUNDED
+		}
+	}
+}
+
 func (service *Service) rewriteCheckpointTaskModelsForDisplay(state *agentv1.ConversationStateStructure) {
 	if service == nil || state == nil {
 		return
@@ -3848,6 +3887,7 @@ func (service *Service) publishCheckpoint(requestID string, _ string) error {
 		return err
 	}
 	service.rewriteCheckpointTaskModelsForDisplay(state)
+	rewriteCheckpointSubagentStatusForClient(state)
 	state.PendingToolCalls = buildPendingToolCalls(pendingExecs, pendingInteractions)
 	service.rewriteCheckpointTokenDetailsForClient(stream, conversation, state)
 	message := buildCheckpointMessage(state)

@@ -192,7 +192,7 @@
             "type": "string"
           },
           "head_limit": {
-            "description": "Limit output size. For \"content\" mode: limits total matches shown. For \"files_with_matches\" and \"count\" modes: limits number of files.",
+            "description": "Limit output size. For \"content\" mode: limits total matches shown (context lines do not count). For \"files_with_matches\" and \"count\" modes: limits number of files. Pagination depends on client capability: check offset_applied/head_limit_applied in the result and any [pagination_contract] warning before computing the next page.",
             "minimum": 0,
             "type": "integer"
           },
@@ -201,7 +201,7 @@
             "type": "boolean"
           },
           "offset": {
-            "description": "Skip first N entries. For \"content\" mode: skips first N matches. For \"files_with_matches\" and \"count\" modes: skips first N files. Use with head_limit for pagination.",
+            "description": "Skip first N entries. For \"content\" mode: skips first N matches (context lines do not count). For \"files_with_matches\" and \"count\" modes: skips first N files. Pagination depends on client capability: the result echoes offset_applied/head_limit_applied per workspace; if a [pagination_contract] warning appears or the applied values are missing/differ, the request did NOT take effect - compute the next page only from the applied values, never assume the request was honored.",
             "minimum": 0,
             "type": "integer"
           },

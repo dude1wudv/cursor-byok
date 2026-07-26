@@ -10,6 +10,7 @@ import (
 	osexec "os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -176,7 +177,12 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 		return result, nil
 	case "grep":
 		truncatedResult := truncateGrepResultForReplay(msg.GetGrepResult())
+		paginationViolations := injectGrepPaginationContractWarnings(pending.ArgsJSON, pending.ToolCallID, truncatedResult)
 		result.ToolResultPayload = summarizeGrepResult(truncatedResult)
+		if paginationViolations > 0 {
+			// 低敏诊断：只带违约计数，不带模式或内容正文。
+			result.ToolResultPayload = fmt.Sprintf("%s pagination_contract_violations=%d", result.ToolResultPayload, paginationViolations)
+		}
 		result.ToolCall = buildGrepCompletedToolCall(pending.ToolCallID, pending.ArgsJSON, truncatedResult)
 		result.IsTerminal = true
 		return result, nil
@@ -2781,6 +2787,17 @@ func truncateGlobResultForReplay(result *agentv1.GrepResult) *agentv1.GrepResult
 	return cloned
 }
 
+// sortedGrepWorkspaceKeys 返回按 workspace 路径排序的 key 列表。
+// Go map 遍历顺序随机会让共享预算的分配顺序漂移，导致相同输入的截断结果不稳定。
+func sortedGrepWorkspaceKeys(success *agentv1.GrepSuccess) []string {
+	keys := make([]string, 0, len(success.GetWorkspaceResults()))
+	for key := range success.GetWorkspaceResults() {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func truncateGrepResultForReplay(result *agentv1.GrepResult) *agentv1.GrepResult {
 	if result == nil {
 		return nil
@@ -2794,11 +2811,121 @@ func truncateGrepResultForReplay(result *agentv1.GrepResult) *agentv1.GrepResult
 		remainingMatches:      grepReplayTotalMatches,
 	}
 	success := cloned.GetSuccess()
-	for _, union := range success.GetWorkspaceResults() {
-		truncateGrepUnionResultForReplay(union, budget)
+	// 先按 workspace 路径排序分配共享预算，再固定最后处理 active editor，
+	// 保证相同多 workspace 输入重复执行时保留的 workspace/文件/匹配与提示逐字一致。
+	for _, workspace := range sortedGrepWorkspaceKeys(success) {
+		truncateGrepUnionResultForReplay(success.GetWorkspaceResults()[workspace], budget)
 	}
 	truncateGrepUnionResultForReplay(success.GetActiveEditorResult(), budget)
 	return cloned
+}
+
+// injectGrepPaginationContractWarnings 闭合“请求参数—客户端 applied 回报”的分页契约：
+// 仅当请求显式传入 offset/head_limit 时才要求对应 applied 回报；applied 字段缺失或与
+// 请求值不一致时不静默返回首页，而是向对应 workspace 的结果注入结构化
+// pagination_contract 警告（含请求值、实际值/缺失状态、output mode 与 workspace）。
+// 单位语义：content 模式的 offset/head_limit 以匹配项计（context 行不计入）；
+// count/files 模式以文件计。旧客户端不支持 applied 字段时只告警，不终止会话。
+// 返回违约条数供低敏诊断使用。
+func injectGrepPaginationContractWarnings(argsJSON []byte, toolCallID string, result *agentv1.GrepResult) int {
+	args, err := DecodeGrepToolArgs(argsJSON, toolCallID)
+	if (err != nil && args == nil) || result == nil || result.GetSuccess() == nil {
+		return 0
+	}
+	if args.Offset == nil && args.HeadLimit == nil {
+		return 0
+	}
+	success := result.GetSuccess()
+	violations := 0
+	inject := func(workspace string, union *agentv1.GrepUnionResult) {
+		warning := grepPaginationContractWarning(workspace, success.GetOutputMode(), args.Offset, args.HeadLimit, union)
+		if warning == "" {
+			return
+		}
+		violations++
+		injectGrepUnionResultWarning(union, warning)
+	}
+	for _, workspace := range sortedGrepWorkspaceKeys(success) {
+		inject(workspace, success.GetWorkspaceResults()[workspace])
+	}
+	if active := success.GetActiveEditorResult(); active != nil {
+		inject("active_editor", active)
+	}
+	return violations
+}
+
+// grepPaginationContractWarning 比对单个 union 结果的 applied 回报；无违约时返回空串。
+func grepPaginationContractWarning(workspace string, outputMode string, requestedOffset *int32, requestedHeadLimit *int32, union *agentv1.GrepUnionResult) string {
+	if union == nil {
+		return ""
+	}
+	var offsetApplied, headLimitApplied *int32
+	unit := ""
+	switch {
+	case union.GetContent() != nil:
+		offsetApplied = union.GetContent().OffsetApplied
+		headLimitApplied = union.GetContent().HeadLimitApplied
+		unit = "matches"
+	case union.GetFiles() != nil:
+		offsetApplied = union.GetFiles().OffsetApplied
+		headLimitApplied = union.GetFiles().HeadLimitApplied
+		unit = "files"
+	case union.GetCount() != nil:
+		offsetApplied = union.GetCount().OffsetApplied
+		headLimitApplied = union.GetCount().HeadLimitApplied
+		unit = "files"
+	default:
+		return ""
+	}
+	problems := []string(nil)
+	compare := func(name string, requested *int32, applied *int32) {
+		if requested == nil {
+			return
+		}
+		switch {
+		case applied == nil:
+			problems = append(problems, fmt.Sprintf("%s requested=%d applied=missing", name, *requested))
+		case *applied != *requested:
+			problems = append(problems, fmt.Sprintf("%s requested=%d applied=%d", name, *requested, *applied))
+		}
+	}
+	compare("offset", requestedOffset, offsetApplied)
+	compare("head_limit", requestedHeadLimit, headLimitApplied)
+	if len(problems) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"[pagination_contract] workspace=%s output_mode=%s unit=%s %s — the client did not confirm the requested pagination; do NOT assume offset/head_limit took effect, compute the next page only from the applied values echoed above",
+		workspace, firstNonEmptyText(outputMode, "content"), unit, strings.Join(problems, "; "),
+	)
+}
+
+// injectGrepUnionResultWarning 把契约警告以各结果类型自身的条目形式注入，保证经
+// protojson 回放后模型可见。
+func injectGrepUnionResultWarning(union *agentv1.GrepUnionResult, warning string) {
+	if content := union.GetContent(); content != nil {
+		content.Matches = append(content.Matches, &agentv1.GrepFileMatch{
+			File:    "[pagination_contract]",
+			Matches: []*agentv1.GrepContentMatch{{Content: warning, IsContextLine: true}},
+		})
+		return
+	}
+	if files := union.GetFiles(); files != nil {
+		files.Files = append(files.Files, warning)
+		return
+	}
+	if counts := union.GetCount(); counts != nil {
+		counts.Counts = append(counts.Counts, &agentv1.GrepFileCount{File: warning})
+	}
+}
+
+func firstNonEmptyText(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 type grepReplayBudget struct {
@@ -2820,7 +2947,9 @@ func truncateGrepUnionResultForReplay(union *agentv1.GrepUnionResult, budget *gr
 			total = len(files.GetFiles())
 		}
 		if len(files.Files) > grepReplayListLimit {
+			clientTruncated, ripgrepTruncated := files.GetClientTruncated(), files.GetRipgrepTruncated()
 			files.Files = append([]string(nil), files.Files[:grepReplayListLimit]...)
+			files.Files = append(files.Files, grepListTruncationNotice("file entries", grepReplayListLimit, total, clientTruncated, ripgrepTruncated))
 			files.ClientTruncated = true
 		}
 		if files.GetTotalFiles() <= 0 {
@@ -2834,7 +2963,11 @@ func truncateGrepUnionResultForReplay(union *agentv1.GrepUnionResult, budget *gr
 			totalFiles = len(counts.GetCounts())
 		}
 		if len(counts.Counts) > grepReplayListLimit {
+			clientTruncated, ripgrepTruncated := counts.GetClientTruncated(), counts.GetRipgrepTruncated()
 			counts.Counts = append([]*agentv1.GrepFileCount(nil), counts.Counts[:grepReplayListLimit]...)
+			counts.Counts = append(counts.Counts, &agentv1.GrepFileCount{
+				File: grepListTruncationNotice("file count entries", grepReplayListLimit, totalFiles, clientTruncated, ripgrepTruncated),
+			})
 			counts.ClientTruncated = true
 		}
 		if counts.GetTotalFiles() <= 0 {
@@ -2843,10 +2976,25 @@ func truncateGrepUnionResultForReplay(union *agentv1.GrepUnionResult, budget *gr
 	}
 }
 
+// grepListTruncationNotice 报告 files/count 模式的保留数、总数、原因与截断来源，
+// 便于区分 bridge 语义截断与客户端/ripgrep 侧已发生的截断。
+func grepListTruncationNotice(kind string, kept int, total int, clientTruncated bool, ripgrepTruncated bool) string {
+	return fmt.Sprintf(
+		"[truncated: source=bridge_replay kept %d of %d %s (per-call replay list cap %d); upstream flags before bridge truncation: client_truncated=%t ripgrep_truncated=%t]",
+		kept, total, kind, grepReplayListLimit, clientTruncated, ripgrepTruncated,
+	)
+}
+
 func truncateGrepContentResultForReplay(content *agentv1.GrepContentResult, budget *grepReplayBudget) {
 	if content == nil || budget == nil {
 		return
 	}
+	// 记录本结果进入前的共享预算余量，供截断提示报告“进入前已消耗/当前剩余”，
+	// 消除“单结果小于 32 KiB 却被截断”的矛盾表象。
+	entryRemainingBytes := budget.remainingContentBytes
+	entryRemainingMatches := budget.remainingMatches
+	upstreamClientTruncated := content.GetClientTruncated()
+	upstreamRipgrepTruncated := content.GetRipgrepTruncated()
 	originalBytes := grepContentBytes(content.GetMatches())
 	truncated := false
 	newFiles := make([]*agentv1.GrepFileMatch, 0, len(content.GetMatches()))
@@ -2912,18 +3060,25 @@ func truncateGrepContentResultForReplay(content *agentv1.GrepContentResult, budg
 	}
 	if truncated {
 		content.ClientTruncated = true
-		newFiles = addGrepContentTruncationNotice(newFiles, originalBytes)
+		newFiles = addGrepContentTruncationNotice(newFiles, originalBytes, entryRemainingBytes, entryRemainingMatches, budget, upstreamClientTruncated, upstreamRipgrepTruncated)
 	}
 	content.Matches = newFiles
 }
 
-func addGrepContentTruncationNotice(files []*agentv1.GrepFileMatch, originalBytes int) []*agentv1.GrepFileMatch {
+func addGrepContentTruncationNotice(files []*agentv1.GrepFileMatch, originalBytes int, entryRemainingBytes int, entryRemainingMatches int, budget *grepReplayBudget, upstreamClientTruncated bool, upstreamRipgrepTruncated bool) []*agentv1.GrepFileMatch {
 	used := grepContentBytes(files)
-	// 内容/匹配数预算是整次 Grep 调用共享的；notice 必须陈述本结果实际保留量与共享预算语义，
-	// 不能打印全局常量冒充本结果的上限（曾导致「总量 646 却报 exceeded 32768」的矛盾）。
+	// 内容/匹配数预算是整次 Grep 调用共享的；notice 必须陈述本结果实际保留量、进入前
+	// 已消耗额度、当前剩余额度与全部四层上限（单条 2 KiB、每文件 100、全调用 300、
+	// 共享 32 KiB），不能打印全局常量冒充本结果的上限（曾导致「总量 646 却报
+	// exceeded 32768」的矛盾）；同时标注 bridge 来源与上游截断旗标以区分截断层。
 	notice := fmt.Sprintf(
-		"[truncated: Grep replay kept %d of %d bytes for this result; budgets are shared across the whole Grep call (%d bytes / %d matches total)]",
-		used, originalBytes, grepReplayContentLimit, grepReplayTotalMatches,
+		"[truncated: source=bridge_replay kept %d of %d bytes for this result; shared per-call budget %d bytes / %d real matches, before this result %d bytes / %d matches remained, after it %d bytes / %d matches remain; per-match cap %d bytes, per-file cap %d real matches; upstream flags before bridge truncation: client_truncated=%t ripgrep_truncated=%t]",
+		used, originalBytes,
+		grepReplayContentLimit, grepReplayTotalMatches,
+		entryRemainingBytes, entryRemainingMatches,
+		budget.remainingContentBytes, budget.remainingMatches,
+		grepReplayMatchLimit, grepReplayMatchesPerFile,
+		upstreamClientTruncated, upstreamRipgrepTruncated,
 	)
 	match := &agentv1.GrepContentMatch{
 		LineNumber:       0,
@@ -2949,11 +3104,13 @@ func grepContentBytes(files []*agentv1.GrepFileMatch) int {
 }
 
 // firstGrepFilesResult 取 workspaceResults 中首个 files 结果。
+// 按 workspace 路径排序后选取，再回退 active editor，保证多 workspace 下选择确定。
 func firstGrepFilesResult(success *agentv1.GrepSuccess) *agentv1.GrepFilesResult {
 	if success == nil {
 		return nil
 	}
-	for _, item := range success.GetWorkspaceResults() {
+	for _, workspace := range sortedGrepWorkspaceKeys(success) {
+		item := success.GetWorkspaceResults()[workspace]
 		if item == nil {
 			continue
 		}

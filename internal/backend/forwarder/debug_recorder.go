@@ -2,6 +2,8 @@ package forwarder
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	"cursor/gen/agentv1"
@@ -145,6 +146,77 @@ func (recorder *debugRecorder) baseEvent(layer string, requestID string, convers
 	}
 }
 
+// sensitiveDebugFieldKeys 是统一脱敏边界的字段黑名单：这些键的值可能携带
+// 提示词、文件内容、工具正文或可还原的原始载荷（request body、raw chunk、
+// hex 编码 protobuf、latest_user_text 等），落盘前一律替换为长度 + SHA-256。
+var sensitiveDebugFieldKeys = map[string]struct{}{
+	"body":             {},
+	"raw_chunk":        {},
+	"latest_user_text": {},
+	"content_preview":  {},
+	"prompt":           {},
+	"data_hex":         {},
+	"instructions":     {},
+	"contents":         {},
+	"text":             {},
+	"input":            {},
+	"messages":         {},
+}
+
+// redactedDebugValue 把敏感值替换为不可还原摘要：长度 + SHA-256。
+func redactedDebugValue(value any) map[string]any {
+	var payload []byte
+	switch typed := value.(type) {
+	case string:
+		payload = []byte(typed)
+	case []byte:
+		payload = typed
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return map[string]any{"redacted": true}
+		}
+		payload = encoded
+	}
+	digest := sha256.Sum256(payload)
+	return map[string]any{
+		"redacted":   true,
+		"utf8_bytes": len(payload),
+		"sha256":     hex.EncodeToString(digest[:]),
+	}
+}
+
+// sanitizeDebugEventValue 递归遍历事件载荷，按键名黑名单脱敏。
+// 这是所有 debug/*.jsonl 的唯一落盘边界，调用方无需各自处理。
+func sanitizeDebugEventValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, item := range typed {
+			if _, sensitive := sensitiveDebugFieldKeys[key]; sensitive && item != nil {
+				result[key] = redactedDebugValue(item)
+				continue
+			}
+			result[key] = sanitizeDebugEventValue(item)
+		}
+		return result
+	case []any:
+		result := make([]any, len(typed))
+		for index, item := range typed {
+			result[index] = sanitizeDebugEventValue(item)
+		}
+		return result
+	case []map[string]any:
+		result := make([]any, len(typed))
+		for index, item := range typed {
+			result[index] = sanitizeDebugEventValue(item)
+		}
+		return result
+	default:
+		return value
+	}
+}
+
 func (recorder *debugRecorder) appendJSONL(ctx context.Context, requestID string, conversationID string, filename string, event map[string]any) {
 	if !recorder.enabled(ctx) || len(event) == 0 {
 		return
@@ -153,6 +225,11 @@ func (recorder *debugRecorder) appendJSONL(ctx context.Context, requestID string
 	if strings.TrimSpace(dir) == "" {
 		return
 	}
+	sanitized, _ := sanitizeDebugEventValue(event).(map[string]any)
+	if len(sanitized) == 0 {
+		return
+	}
+	event = sanitized
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return
@@ -293,22 +370,22 @@ func requestedModelPayload(model *agentv1.RequestedModel) map[string]any {
 	}
 }
 
+// protoJSONDebugPayload 只保留可关联、不可还原的载荷摘要（字节数 + SHA-256）。
+// debug 文件不得保存可还原提示词或工具正文的 protobuf/JSON/hex 载荷。
 func protoJSONDebugPayload(message proto.Message) any {
 	if message == nil {
 		return nil
 	}
-	payload, err := protojson.MarshalOptions{
-		UseProtoNames:   true,
-		EmitUnpopulated: false,
-	}.Marshal(message)
+	payload, err := proto.Marshal(message)
 	if err != nil {
 		return map[string]any{"marshal_error": err.Error()}
 	}
-	var decoded any
-	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return string(payload)
+	digest := sha256.Sum256(payload)
+	return map[string]any{
+		"redacted":    true,
+		"proto_bytes": len(payload),
+		"sha256":      hex.EncodeToString(digest[:]),
 	}
-	return decoded
 }
 
 func inboundIntentDebugPayload(intent InboundIntent) map[string]any {

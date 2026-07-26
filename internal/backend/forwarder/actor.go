@@ -1058,9 +1058,19 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 
-	if passMetrics != nil && service.debug != nil {
+	// provider_pass_metrics 的单一收口入口：每个 pass 在其终态分支恰好发出一条
+	// 字段齐全的低敏指标事件；terminal_state 覆盖 completed/failed/interrupted/
+	// retry_scheduled/cancelled。
+	emitPassMetrics := func(terminalState string) {
+		if passMetrics == nil || service.debug == nil {
+			return
+		}
 		now := time.Now().UTC()
-		values := map[string]any{
+		ttftMillis := int64(0)
+		if !passMetrics.FirstOutputAt.IsZero() {
+			ttftMillis = passMetrics.FirstOutputAt.Sub(passMetrics.StartedAt).Milliseconds()
+		}
+		service.debug.LogRuntime(context.Background(), requestID, conversationID, "provider_pass_metrics", map[string]any{
 			"provider_pass":          passMetrics.Pass,
 			"model_call_id":          strings.TrimSpace(modelCallID),
 			"compile_ms":             passMetrics.CompileMillis,
@@ -1070,8 +1080,9 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 			"tool_result_bytes":      passMetrics.ToolResultBytes,
 			"external_wait_ms":       passMetrics.ExternalWaitMillis,
 			"pass_duration_ms":       now.Sub(passMetrics.StartedAt).Milliseconds(),
+			"ttft_ms":                ttftMillis,
 			"tool_invocations":       toolInvocationCount,
-			"parallel_width":         pendingToolSideEffectCount,
+			"parallel_width":         passMetrics.ParallelWidth(),
 			"finish_reason":          strings.TrimSpace(finishReason),
 			"incomplete":             providerIncomplete,
 			"usage_present":          usage.UsagePresent,
@@ -1082,14 +1093,16 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 			"expected_cache_read":    passMetrics.ExpectedCacheRead,
 			"frontier_hint_present":  passMetrics.FrontierHintPresent,
 			"provider_error_present": payload.Err != nil,
-		}
-		if !passMetrics.FirstOutputAt.IsZero() {
-			values["ttft_ms"] = passMetrics.FirstOutputAt.Sub(passMetrics.StartedAt).Milliseconds()
-		}
-		service.debug.LogRuntime(context.Background(), requestID, conversationID, "provider_pass_metrics", values)
+			"terminal_state":         strings.TrimSpace(terminalState),
+		})
 	}
 
 	if errors.Is(payload.Err, errProviderLoopInterrupted) || isTerminalStreamStatus(status) {
+		if status == StreamStatusCanceled {
+			emitPassMetrics("cancelled")
+		} else {
+			emitPassMetrics("interrupted")
+		}
 		return nil
 	}
 	if payload.Err != nil {
@@ -1103,9 +1116,11 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 			effectiveToolSideEffects := hasToolSideEffects || effectivePartialToolCount > 0
 			retried, retryErr := service.scheduleProviderRetry(stream, providerErr, accumulatedText, accumulatedReasoning, accumulatedReasoningSignature, accumulatedReasoningSignatureSource, accumulatedReasoningItemID, accumulatedReasoningStatus, accumulatedReasoningSummary, effectiveToolSideEffects, effectivePartialToolCount)
 			if retryErr != nil {
+				emitPassMetrics("failed")
 				return service.failStreamIfNonTerminal(stream, "provider_retry_error", retryErr)
 			}
 			if retried {
+				emitPassMetrics("retry_scheduled")
 				return nil
 			}
 			if retryClass, retryable := providerRetryClassification(providerErr); retryable && effectiveToolSideEffects {
@@ -1122,12 +1137,15 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 					return service.failStreamIfNonTerminal(stream, "provider_retry_error", err)
 				}
 			}
+			emitPassMetrics("failed")
 			service.setTurnPhase(stream, TurnPhaseFailed)
 			return service.closeStreamWithProviderError(stream, conversationID, turnSeq, requestID, accumulatedText, accumulatedReasoning, accumulatedReasoningSignature, accumulatedReasoningSignatureSource, accumulatedReasoningItemID, accumulatedReasoningStatus, accumulatedReasoningSummary, usage, providerErr, !hadToolInvocation)
 		}
+		emitPassMetrics("failed")
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", payload.Err)
 	}
+	emitPassMetrics("completed")
 	stream.mu.Lock()
 	stream.ProviderRetryCount = 0
 	stream.ProviderLastRetryError = ""

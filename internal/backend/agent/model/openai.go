@@ -320,21 +320,29 @@ func applyOpenAIFastMode(body map[string]any, enabled bool) {
 }
 
 // openAIModelSupportsParallelToolCalls 判断该模型是否已知支持 Responses parallel_tool_calls。
-// 仅对已验证的 gpt-5.6 系列开启；未知兼容端点保持原行为（不发送该字段）。
+// 仅对已验证的 gpt-5.6 系列开启。
 func openAIModelSupportsParallelToolCalls(modelID string) bool {
 	return strings.Contains(strings.ToLower(strings.TrimSpace(modelID)), "gpt-5.6")
 }
 
+// openAIEndpointSupportsParallelToolCalls 是端点能力判断：只有官方已知的
+// Responses 预设端点（/v1/responses，含 baseURL 自带 /responses 后缀被归一的情况）
+// 自动具备该能力；/custom 兼容端点能力未知，默认不发送。
+func openAIEndpointSupportsParallelToolCalls(endpoint string) bool {
+	return strings.TrimSpace(endpoint) == modelchannel.OpenAIEndpointResponses
+}
+
 // applyOpenAIParallelToolCalls 在 Responses 请求（含 input 且 tools 非空）上开启并行工具调用。
-// 不覆盖用户通过 extra params 显式设置的值。
-func applyOpenAIParallelToolCalls(body map[string]any, modelID string) {
-	if !openAIModelSupportsParallelToolCalls(modelID) {
+// 决策顺序：extra params 显式设置的 parallel_tool_calls 始终优先（可在兼容端点强开、
+// 在官方端点强关）；否则仅当端点能力与模型能力都已知支持时自动开启；兼容端点默认不发送。
+func applyOpenAIParallelToolCalls(body map[string]any, modelID string, endpoint string) {
+	if _, explicit := body["parallel_tool_calls"]; explicit {
+		return
+	}
+	if !openAIEndpointSupportsParallelToolCalls(endpoint) || !openAIModelSupportsParallelToolCalls(modelID) {
 		return
 	}
 	if _, isResponsesRequest := body["input"]; !isResponsesRequest {
-		return
-	}
-	if _, explicit := body["parallel_tool_calls"]; explicit {
 		return
 	}
 	switch tools := body["tools"].(type) {
@@ -1093,7 +1101,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	}
 	applyOpenAIResponsesReasoningSummary(bodyMap)
 	applyOpenAIFastMode(bodyMap, req.FastMode)
-	applyOpenAIParallelToolCalls(bodyMap, modelID)
+	applyOpenAIParallelToolCalls(bodyMap, modelID, req.OpenAIEndpoint)
 	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 && shouldSendOpenAIMaxOutputTokens(modelID) {
 		bodyMap["max_output_tokens"] = req.MaxTokens
 	}
