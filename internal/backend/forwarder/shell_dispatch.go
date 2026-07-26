@@ -13,6 +13,35 @@ const (
 	defaultShellMaxConcurrentPerRun = 8
 )
 
+func shellExecutionBegan(message *agentv1.ExecClientMessage) bool {
+	if message == nil || message.GetShellStream() == nil {
+		return false
+	}
+	switch message.GetShellStream().GetEvent().(type) {
+	case *agentv1.ShellStream_Start, *agentv1.ShellStream_Stdout, *agentv1.ShellStream_Stderr:
+		return true
+	default:
+		return false
+	}
+}
+
+func shellDispatchSnapshot(stream *ActiveStream, execID string) (active int, queued int, limit int, awaitingStart bool, started bool, retryCount int) {
+	if stream == nil {
+		return
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	active = len(stream.ActiveForegroundShells)
+	queued = len(stream.QueuedForegroundShells)
+	limit = shellDispatchLimitLocked(stream)
+	awaitingStart = stream.ShellAwaitingStartExecID == strings.TrimSpace(execID)
+	_, started = stream.ShellStartedExecs[strings.TrimSpace(execID)]
+	if pending, ok := stream.PendingExecs[strings.TrimSpace(execID)]; ok {
+		retryCount = stream.ShellRetryCountByToolCall[strings.TrimSpace(pending.ToolCallID)]
+	}
+	return
+}
+
 func shellDispatchLimitLocked(stream *ActiveStream) int {
 	if stream.ShellMaxConcurrent < 1 {
 		return legacyShellMaxConcurrentPerRun
@@ -48,6 +77,7 @@ func activateForegroundShellLocked(stream *ActiveStream, pending runtimecore.Pen
 	}
 	stream.PendingExecs[pending.ExecID] = pending
 	stream.ActiveForegroundShells[pending.ExecID] = pending
+	stream.ShellAwaitingStartExecID = pending.ExecID
 	syncLegacyForegroundShellLocked(stream)
 	stream.UpdatedAt = now
 	return pending
@@ -63,7 +93,7 @@ func reserveForegroundShellDispatch(stream *ActiveStream, message *agentv1.Agent
 	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	if len(stream.ActiveForegroundShells) < shellDispatchLimitLocked(stream) {
+	if stream.ShellAwaitingStartExecID == "" && len(stream.ActiveForegroundShells) < shellDispatchLimitLocked(stream) {
 		activateForegroundShellLocked(stream, pending)
 		return true
 	}
@@ -89,6 +119,9 @@ func discardForegroundShellDispatch(stream *ActiveStream, pending runtimecore.Pe
 	defer stream.mu.Unlock()
 	if active, ok := stream.ActiveForegroundShells[pending.ExecID]; ok && active.MessageID == pending.MessageID && active.ProviderPass == pending.ProviderPass {
 		delete(stream.ActiveForegroundShells, pending.ExecID)
+		if stream.ShellAwaitingStartExecID == pending.ExecID {
+			stream.ShellAwaitingStartExecID = ""
+		}
 		syncLegacyForegroundShellLocked(stream)
 	}
 	for index := range stream.QueuedForegroundShells {
@@ -99,6 +132,16 @@ func discardForegroundShellDispatch(stream *ActiveStream, pending runtimecore.Pe
 		}
 	}
 	stream.UpdatedAt = time.Now().UTC()
+}
+
+func takeNextForegroundShellDispatchLocked(stream *ActiveStream) (queuedShellDispatch, bool) {
+	if stream.ShellAwaitingStartExecID != "" || len(stream.ActiveForegroundShells) >= shellDispatchLimitLocked(stream) || len(stream.QueuedForegroundShells) == 0 {
+		return queuedShellDispatch{}, false
+	}
+	ready := stream.QueuedForegroundShells[0]
+	stream.QueuedForegroundShells = append([]queuedShellDispatch(nil), stream.QueuedForegroundShells[1:]...)
+	ready.Pending = activateForegroundShellLocked(stream, ready.Pending)
+	return ready, true
 }
 
 func releaseForegroundShellDispatches(stream *ActiveStream, completed runtimecore.PendingExec) []queuedShellDispatch {
@@ -112,22 +155,16 @@ func releaseForegroundShellDispatches(stream *ActiveStream, completed runtimecor
 		return nil
 	}
 	delete(stream.ActiveForegroundShells, completed.ExecID)
+	delete(stream.ShellStartedExecs, completed.ExecID)
+	if stream.ShellAwaitingStartExecID == completed.ExecID {
+		stream.ShellAwaitingStartExecID = ""
+	}
 	syncLegacyForegroundShellLocked(stream)
-	capacity := shellDispatchLimitLocked(stream) - len(stream.ActiveForegroundShells)
-	if capacity <= 0 || len(stream.QueuedForegroundShells) == 0 {
-		stream.UpdatedAt = time.Now().UTC()
-		return nil
-	}
-	if capacity > len(stream.QueuedForegroundShells) {
-		capacity = len(stream.QueuedForegroundShells)
-	}
-	ready := append([]queuedShellDispatch(nil), stream.QueuedForegroundShells[:capacity]...)
-	stream.QueuedForegroundShells = append([]queuedShellDispatch(nil), stream.QueuedForegroundShells[capacity:]...)
-	for index := range ready {
-		ready[index].Pending = activateForegroundShellLocked(stream, ready[index].Pending)
-	}
 	stream.UpdatedAt = time.Now().UTC()
-	return ready
+	if ready, ok := takeNextForegroundShellDispatchLocked(stream); ok {
+		return []queuedShellDispatch{ready}
+	}
+	return nil
 }
 
 func releaseForegroundShellDispatch(stream *ActiveStream, completed runtimecore.PendingExec) (queuedShellDispatch, bool) {
@@ -142,14 +179,38 @@ func (service *Service) publishForegroundShellDispatch(stream *ActiveStream, ite
 	if err := service.broker.Publish(stream.RequestID, StreamEvent{Message: item.Message}); err != nil {
 		return err
 	}
-	if err := service.broker.Publish(stream.RequestID, StreamEvent{
-		Message: buildToolCallStartedMessage(item.Pending.ToolCallID, item.Pending.ModelCallID, item.StartedToolCall),
-	}); err != nil {
-		return err
+	if item.StartedToolCall != nil {
+		if err := service.broker.Publish(stream.RequestID, StreamEvent{
+			Message: buildToolCallStartedMessage(item.Pending.ToolCallID, item.Pending.ModelCallID, item.StartedToolCall),
+		}); err != nil {
+			return err
+		}
 	}
 	service.scheduleShellForegroundRecovery(stream.RequestID, item.Pending)
 	service.recordExecDispatchMetadata(stream, item.Pending, false, true, "exec_then_started_then_checkpoint")
 	return service.publishCheckpoint(stream.RequestID, stream.ConversationID)
+}
+
+func releaseShellStartAllocation(stream *ActiveStream, pending runtimecore.PendingExec) (queuedShellDispatch, bool) {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+		return queuedShellDispatch{}, false
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if stream.ShellAwaitingStartExecID != pending.ExecID {
+		return queuedShellDispatch{}, false
+	}
+	stream.ShellAwaitingStartExecID = ""
+	stream.UpdatedAt = time.Now().UTC()
+	return takeNextForegroundShellDispatchLocked(stream)
+}
+
+func (service *Service) advanceForegroundShellStartQueue(stream *ActiveStream, pending runtimecore.PendingExec) error {
+	ready, ok := releaseShellStartAllocation(stream, pending)
+	if !ok {
+		return nil
+	}
+	return service.publishForegroundShellDispatch(stream, ready)
 }
 
 func (service *Service) dispatchOrQueueForegroundShell(stream *ActiveStream, message *agentv1.AgentServerMessage, startedToolCall *agentv1.ToolCall, pending runtimecore.PendingExec) (bool, error) {

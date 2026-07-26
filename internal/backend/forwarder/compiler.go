@@ -54,15 +54,15 @@ func (compiler *DefaultPromptCompiler) Compile(conversation *ConversationFile, m
 	if err != nil {
 		return CompiledConversation{}, err
 	}
-	tools, toolNames, err := loadToolCatalogForConversation(compiler.catalog, normalizedMode, conversation)
+	tools, _, err := loadToolCatalogForConversation(compiler.catalog, normalizedMode, conversation)
 	if err != nil {
 		return CompiledConversation{}, err
 	}
-	tools, toolNames, err = filterTaskToolAtMaximumSubagentDepth(conversation, tools, toolNames)
+	tools, _, err = filterTaskToolAtMaximumSubagentDepth(conversation, tools, nil)
 	if err != nil {
 		return CompiledConversation{}, err
 	}
-	tools, toolNames, err = filterTaskToolForSubagentRole(conversation, tools)
+	tools, _, err = filterTaskToolForSubagentRole(conversation, tools)
 	if err != nil {
 		return CompiledConversation{}, err
 	}
@@ -96,11 +96,6 @@ func (compiler *DefaultPromptCompiler) Compile(conversation *ConversationFile, m
 		return CompiledConversation{}, err
 	}
 	messages = append(messages, replayMessages...)
-	latestOnlyMessages, err := compiler.latestOnlyMessages(conversation, normalizedMode, replayMessages, latestUserText, toolNames)
-	if err != nil {
-		return CompiledConversation{}, err
-	}
-	messages = append(messages, latestOnlyMessages...)
 	return CompiledConversation{
 		Mode:               normalizedMode,
 		Messages:           messages,
@@ -139,41 +134,16 @@ func (compiler *DefaultPromptCompiler) DerivePromptContexts(conversation *Conver
 	candidates := make([]PromptContextMessage, 0, len(structuredStatePromptContexts)+len(structuredStateTailMessages)+len(promptReminders.PromptContexts)+len(promptReminders.TailMessages))
 	candidates = append(candidates, structuredStatePromptContexts...)
 	for _, message := range structuredStateTailMessages {
-		candidates = append(candidates, newPromptContextMessage(promptContextSourceStructuredTodoReminder, message, false))
+		candidates = append(candidates, newPromptContextMessage(promptContextSourceStructuredTodoReminder, message, true))
 	}
 	candidates = append(candidates, promptReminders.PromptContexts...)
 	for index, message := range promptReminders.TailMessages {
-		candidates = append(candidates, newPromptContextMessage(fmt.Sprintf("tail_reminder/%d", index), message, false))
+		candidates = append(candidates, newPromptContextMessage(fmt.Sprintf("tail_reminder/%d", index), message, true))
 	}
-	persisted := make([]PromptContextMessage, 0, len(candidates))
-	for _, candidate := range filterCurrentTurnPromptContexts(conversation, candidates) {
-		if candidate.Persist {
-			persisted = append(persisted, candidate)
-		}
+	for index := range candidates {
+		candidates[index].Persist = true
 	}
-	return persisted, nil
-}
-
-func (compiler *DefaultPromptCompiler) latestOnlyMessages(conversation *ConversationFile, mode agentv1.AgentMode, replayMessages []modeladapter.Message, latestUserText string, toolNames []string) ([]modeladapter.Message, error) {
-	structuredContexts, structuredTail, err := buildStructuredStatePromptContexts(conversation)
-	if err != nil {
-		return nil, err
-	}
-	promptReminders := compiler.reminders.Inject(mode, conversation, replayMessages, latestUserText, toolNames)
-	messages := make([]modeladapter.Message, 0, len(structuredContexts)+len(structuredTail)+len(promptReminders.PromptContexts)+len(promptReminders.TailMessages))
-	for _, context := range structuredContexts {
-		if !context.Persist {
-			messages = append(messages, context.Message)
-		}
-	}
-	messages = append(messages, structuredTail...)
-	for _, context := range promptReminders.PromptContexts {
-		if !context.Persist {
-			messages = append(messages, context.Message)
-		}
-	}
-	messages = append(messages, promptReminders.TailMessages...)
-	return messages, nil
+	return filterCurrentTurnPromptContexts(conversation, candidates), nil
 }
 
 func loadToolCatalogForConversation(catalog ToolCatalog, mode agentv1.AgentMode, conversation *ConversationFile) ([]json.RawMessage, []string, error) {

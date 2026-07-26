@@ -1,10 +1,12 @@
 package forwarder
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
+	execbridge "cursor/internal/backend/agent/bridge/exec"
 	runtimecore "cursor/internal/backend/agent/core"
 )
 
@@ -182,6 +184,12 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 	if stream == nil {
 		return nil
 	}
+	if strings.TrimSpace(reason) == shellRecoveryReasonSkipped {
+		retried, err := service.retrySkippedShell(stream, pending)
+		if retried || err != nil {
+			return err
+		}
+	}
 	stream.mu.Lock()
 	current, found := stream.PendingExecs[pending.ExecID]
 	candidate, candidateFound := stream.ShellRecoveryCandidates[pending.ExecID]
@@ -196,6 +204,9 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 	if stream.ShellExecTombstones == nil {
 		stream.ShellExecTombstones = make(map[string]shellExecTombstone)
 	}
+	if stream.RecentCompletedExecs == nil {
+		stream.RecentCompletedExecs = make(map[uint32]time.Time)
+	}
 	stream.ShellExecTombstones[pending.ExecID] = shellExecTombstone{MessageID: pending.MessageID, Generation: pending.ProviderPass, CompletedAt: time.Now().UTC()}
 	delete(stream.ShellRecoveryCandidates, pending.ExecID)
 	stream.mu.Unlock()
@@ -203,6 +214,9 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 	pending = current
 	markExecCompleted(stream, pending)
 	result := fmt.Sprintf("Shell did not provide a terminal result (%s). The execution was closed locally after a per-command grace period.", candidate.Reason)
+	if candidate.Reason == shellRecoveryReasonSkipped {
+		result = "shell skipped: Cursor rejected the execution before it started"
+	}
 	if err := service.appendToolResult(stream, pending.ToolCallID, "Shell", pending.ArgsJSON, result, pending.ReasoningContent, nil); err != nil {
 		return err
 	}
@@ -234,4 +248,116 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 		return err
 	}
 	return service.reconcileStream(stream)
+}
+
+func shellSkippedRetryEligibleLocked(stream *ActiveStream, pending runtimecore.PendingExec) bool {
+	if stream == nil || !pending.FirstChunkAt.IsZero() || stream.ShellRetryCountByToolCall[strings.TrimSpace(pending.ToolCallID)] > 0 {
+		return false
+	}
+	if _, started := stream.ShellStartedExecs[pending.ExecID]; started {
+		return false
+	}
+	for execID := range stream.ActiveForegroundShells {
+		if execID != pending.ExecID {
+			return true
+		}
+	}
+	return false
+}
+
+func (service *Service) retrySkippedShell(stream *ActiveStream, pending runtimecore.PendingExec) (bool, error) {
+	if service == nil || service.execBridge == nil || stream == nil {
+		return false, nil
+	}
+	stream.mu.Lock()
+	current, found := stream.PendingExecs[pending.ExecID]
+	candidate, candidateFound := stream.ShellRecoveryCandidates[pending.ExecID]
+	eligible := found && candidateFound && candidate.Reason == shellRecoveryReasonSkipped &&
+		current.MessageID == pending.MessageID && current.ProviderPass == pending.ProviderPass && shellSkippedRetryEligibleLocked(stream, current)
+	stream.mu.Unlock()
+	if !eligible {
+		return false, nil
+	}
+
+	message, replacement, err := service.execBridge.OpenExec(execbridge.OpenExecContext{
+		ConversationID: stream.ConversationID,
+		ModelID:        stream.ModelID,
+	}, runtimecore.ToolInvocation{
+		CallID:   current.ToolCallID,
+		ToolName: "Shell",
+		ArgsJSON: append([]byte(nil), current.ArgsJSON...),
+	})
+	if err != nil {
+		return false, err
+	}
+	replacement.ModelCallID = current.ModelCallID
+	replacement.ProviderPass = current.ProviderPass
+	replacement.ReasoningContent = current.ReasoningContent
+	replacement.ReasoningSignature = current.ReasoningSignature
+	replacement.ReasoningSignatureSource = current.ReasoningSignatureSource
+	replacement.OpenedAt = time.Time{}
+	replacement.LastShellActivityAt = time.Time{}
+	replacement.ShellForegroundDeadline = time.Time{}
+	replacement.ShellRecoveryScheduled = false
+
+	stream.mu.Lock()
+	current, found = stream.PendingExecs[pending.ExecID]
+	candidate, candidateFound = stream.ShellRecoveryCandidates[pending.ExecID]
+	if !found || !candidateFound || candidate.Reason != shellRecoveryReasonSkipped || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass || !shellSkippedRetryEligibleLocked(stream, current) {
+		stream.mu.Unlock()
+		return false, nil
+	}
+	now := time.Now().UTC()
+	if stream.ShellExecTombstones == nil {
+		stream.ShellExecTombstones = make(map[string]shellExecTombstone)
+	}
+	if stream.RecentCompletedExecs == nil {
+		stream.RecentCompletedExecs = make(map[uint32]time.Time)
+	}
+	stream.ShellExecTombstones[current.ExecID] = shellExecTombstone{MessageID: current.MessageID, Generation: current.ProviderPass, CompletedAt: now}
+	stream.RecentCompletedExecs[current.MessageID] = now
+	delete(stream.PendingExecs, current.ExecID)
+	delete(stream.ActiveForegroundShells, current.ExecID)
+	delete(stream.ShellStartedExecs, current.ExecID)
+	delete(stream.ShellRecoveryCandidates, current.ExecID)
+	if stream.ShellAwaitingStartExecID == current.ExecID {
+		stream.ShellAwaitingStartExecID = ""
+	}
+	if stream.ShellRetryCountByToolCall == nil {
+		stream.ShellRetryCountByToolCall = make(map[string]int)
+	}
+	stream.ShellRetryCountByToolCall[current.ToolCallID]++
+	stream.PendingExecs[replacement.ExecID] = replacement
+	stream.QueuedForegroundShells = append([]queuedShellDispatch{{Message: message, Pending: replacement}}, stream.QueuedForegroundShells...)
+	syncLegacyForegroundShellLocked(stream)
+	ready, dispatch := takeNextForegroundShellDispatchLocked(stream)
+	active := len(stream.ActiveForegroundShells)
+	queued := len(stream.QueuedForegroundShells)
+	limit := shellDispatchLimitLocked(stream)
+	stream.UpdatedAt = now
+	stream.mu.Unlock()
+
+	clearStreamTimer(stream, providerTimerKey(streamTimerShellForeground, current.ExecID))
+	clearStreamTimer(stream, providerTimerKey(streamTimerShellTransportClose, current.ExecID))
+	commandHash, argsHash, cwdHash := shellInvocationHashes(current.ArgsJSON)
+	values := map[string]any{
+		"tool_call_id": current.ToolCallID, "old_exec_id": current.ExecID, "old_message_id": current.MessageID,
+		"exec_id": replacement.ExecID, "message_id": replacement.MessageID, "retry_count": 1,
+		"active": active, "queued": queued, "limit": limit, "recovery": "retried",
+		"command_hash": commandHash, "args_hash": argsHash, "cwd_hash": cwdHash,
+	}
+	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_retry", values),
+	}); err != nil {
+		return false, err
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_retry", values)
+	}
+	if dispatch {
+		if err := service.publishForegroundShellDispatch(stream, ready); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }

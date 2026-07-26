@@ -1068,8 +1068,11 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
 	stream.ActiveForegroundShells = make(map[string]runtimecore.PendingExec)
 	stream.ActiveForegroundShellExecID = ""
+	stream.ShellAwaitingStartExecID = ""
 	stream.QueuedForegroundShells = nil
 	stream.ShellMaxConcurrent = service.shellMaxConcurrentPerRun()
+	stream.ShellStartedExecs = make(map[string]struct{})
+	stream.ShellRetryCountByToolCall = make(map[string]int)
 	stream.ShellRecoveryCandidates = make(map[string]shellRecoveryCandidate)
 	stream.ShellExecTombstones = make(map[string]shellExecTombstone)
 	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
@@ -1323,8 +1326,19 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 			}
 		}
 	}
+	if shellExecutionBegan(intent.ExecClientMessage) {
+		if _, ok := intent.ExecClientMessage.GetShellStream().GetEvent().(*agentv1.ShellStream_Start); ok {
+			service.recordShellHandshakeEvent(stream, pending)
+		}
+		if err := service.advanceForegroundShellStartQueue(stream, pending); err != nil {
+			return err
+		}
+	}
 	if !result.IsTerminal {
 		if strings.TrimSpace(result.ShellRecoveryCandidate) != "" {
+			if result.ShellRecoveryCandidate == shellRecoveryReasonSkipped {
+				service.recordShellSkippedEvent(stream, pending, intent.ExecClientMessage)
+			}
 			service.scheduleShellRecoveryCandidate(intent.RequestID, pending, result.ShellRecoveryCandidate)
 		}
 		return nil
@@ -1380,6 +1394,56 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return err
 	}
 	return service.reconcileStream(stream)
+}
+
+func (service *Service) recordShellHandshakeEvent(stream *ActiveStream, pending runtimecore.PendingExec) {
+	if service == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+		return
+	}
+	active, queued, limit, awaiting, started, retryCount := shellDispatchSnapshot(stream, pending.ExecID)
+	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
+	values := map[string]any{
+		"tool_call_id": pending.ToolCallID, "exec_id": pending.ExecID, "message_id": pending.MessageID,
+		"stream_state": pending.StreamState, "start_seen": started, "awaiting_start": awaiting,
+		"active": active, "queued": queued, "limit": limit, "retry_count": retryCount,
+		"command_hash": commandHash, "args_hash": argsHash, "cwd_hash": cwdHash,
+	}
+	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_start", values),
+	}); err != nil {
+		log.Printf("forwarder shell start metadata failed request_id=%s exec_id=%s err=%v", stream.RequestID, pending.ExecID, err)
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_start", values)
+	}
+}
+
+func (service *Service) recordShellSkippedEvent(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) {
+	if service == nil || stream == nil {
+		return
+	}
+	active, queued, limit, awaiting, started, retryCount := shellDispatchSnapshot(stream, pending.ExecID)
+	reason, rejectionClass := shellTerminalRejection(message)
+	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
+	recovery := "rejected"
+	if pending.FirstChunkAt.IsZero() && active > 1 && retryCount == 0 {
+		recovery = "retry_scheduled"
+	}
+	values := map[string]any{
+		"tool_call_id": pending.ToolCallID, "exec_id": pending.ExecID, "message_id": pending.MessageID,
+		"stream_state": pending.StreamState, "start_seen": started, "awaiting_start": awaiting,
+		"active": active, "queued": queued, "limit": limit, "retry_count": retryCount,
+		"rejection_class": rejectionClass, "rejected_reason": sanitizeShellRejectedReason(reason), "recovery": recovery,
+		"command_hash": commandHash, "args_hash": argsHash, "cwd_hash": cwdHash,
+	}
+	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_skipped", values),
+	}); err != nil {
+		log.Printf("forwarder shell skipped metadata failed request_id=%s exec_id=%s err=%v", stream.RequestID, pending.ExecID, err)
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_skipped", values)
+	}
 }
 
 func (service *Service) recordShellApprovalEvidence(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
@@ -3334,6 +3398,10 @@ func (service *Service) applyExecProgress(stream *ActiveStream, pending runtimec
 		if current.FirstChunkAt.IsZero() {
 			current.FirstChunkAt = now
 		}
+		if stream.ShellStartedExecs == nil {
+			stream.ShellStartedExecs = make(map[string]struct{})
+		}
+		stream.ShellStartedExecs[current.ExecID] = struct{}{}
 		current.StreamState = "started"
 		current.LastShellActivityAt = now
 	case *agentv1.ShellStream_Backgrounded:

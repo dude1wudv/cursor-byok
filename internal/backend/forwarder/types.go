@@ -223,8 +223,11 @@ type ActiveStream struct {
 	PendingExecs                map[string]runtimecore.PendingExec
 	ActiveForegroundShells      map[string]runtimecore.PendingExec
 	ActiveForegroundShellExecID string
+	ShellAwaitingStartExecID    string
 	QueuedForegroundShells      []queuedShellDispatch
 	ShellMaxConcurrent          int
+	ShellStartedExecs           map[string]struct{}
+	ShellRetryCountByToolCall   map[string]int
 	ShellRecoveryCandidates     map[string]shellRecoveryCandidate
 	ShellExecTombstones         map[string]shellExecTombstone
 	PendingInteractions         map[string]runtimecore.PendingInteraction
