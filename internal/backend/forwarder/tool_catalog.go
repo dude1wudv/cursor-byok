@@ -72,6 +72,12 @@ func (catalog *DefaultToolCatalog) load(mode agentv1.AgentMode, subagentTypeName
 				continue
 			}
 		}
+		if name == "Shell" && isChildConversationSubagentTypeName(subagentTypeName) && normalizeMode(mode) == agentv1.AgentMode_AGENT_MODE_PLAN {
+			item, err = rewriteReadonlyShellTool(item)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
 		filtered = append(filtered, item)
 		names = append(names, name)
 	}
@@ -162,6 +168,20 @@ func rewriteMediumExploreTaskTool(item json.RawMessage) (json.RawMessage, error)
 	accessMode["enum"] = []string{runtimecore.TaskAccessModeInspect}
 	accessMode["description"] = "Must be inspect. Nested medium_explore delegation is read-only."
 	parameters["required"] = appendRequiredSchemaFields(parameters["required"], "task_role", "access_mode")
+	return json.Marshal(tool)
+}
+
+// rewriteReadonlyShellTool 把 inspect child 的 Shell 描述改写为受控白名单语义，与服务端校验保持一致。
+func rewriteReadonlyShellTool(item json.RawMessage) (json.RawMessage, error) {
+	var tool map[string]any
+	if err := json.Unmarshal(item, &tool); err != nil {
+		return nil, fmt.Errorf("decode Shell tool descriptor: %w", err)
+	}
+	function, _ := tool["function"].(map[string]any)
+	if function == nil {
+		return nil, fmt.Errorf("Shell tool descriptor function is missing")
+	}
+	function["description"] = "Restricted read-only Shell for inspect subagents. Server-enforced whitelist: a single simple command only (no pipes, redirection, quoting, variables, or command substitution), working_directory must stay inside the workspace, and only a short foreground window is allowed (no backgrounding). Allowed commands: read-only git evidence (status/diff/log/show/blame/rev-parse/merge-base/ls-tree/ls-files, plus flag-only tag/branch/remote listings; --no-pager --no-optional-locks are injected automatically), process/port queries (tasklist, netstat, ps, ss, lsof), and file hashing (sha256sum/sha1sum/md5sum/shasum, certutil -hashfile). Anything else is rejected before dispatch; do not attempt network access, builds, tests, script interpreters, or writes."
 	return json.Marshal(tool)
 }
 
@@ -295,6 +315,7 @@ var readonlySubagentToolNames = map[string]struct{}{
 	"Ls":               {},
 	"Read":             {},
 	"ReadLints":        {},
+	"Shell":            {},
 	"WebFetch":         {},
 	"WebSearch":        {},
 }

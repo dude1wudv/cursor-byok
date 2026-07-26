@@ -27,8 +27,8 @@
 | 执行者 | 适用范围 | 约束 |
 |---|---|---|
 | `main` | 单一短链路、共享文件、集成与收口 | 父代理直接完成 |
-| `subagent:explore` | 跨模块阅读、未知调用链、兼容性和方案调查 | 只读；调用 `Task` 时使用 `subagent_type="explore"`、`readonly=true`，不修改文件 |
-| `subagent:generalPurpose` | 独立模块实现或独立验证 | 调用 `Task` 时使用 `subagent_type="generalPurpose"`、`readonly=false`；普通实现选 Terra，高难度任务可选 Sol，并按需要设置 `thinking_effort`；必须声明 `owned_paths`、实际落盘并完成验收 |
+| `subagent:explore` | 跨模块阅读、未知调用链、兼容性和方案调查 | 只读；调用 `Task` 时使用 `subagent_type="explore"`、`access_mode="inspect"`，不修改文件 |
+| `subagent:generalPurpose` | 独立模块实现或独立验证 | 调用 `Task` 时使用 `subagent_type="generalPurpose"`、`access_mode="act"`；普通实现选 Terra，高难度任务可选 Sol，并按需要设置 `thinking_effort`；必须声明 `owned_paths`、实际落盘并完成验收 |
 
 ## 4. Wave 生命周期
 

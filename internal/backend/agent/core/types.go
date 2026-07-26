@@ -252,6 +252,12 @@ type PendingExec struct {
 	ChunkCount int64
 	// LastShellActivityAt 记录最近一次 shell 相关上行事件时间，包括输出、start、heartbeat 和 close。
 	LastShellActivityAt time.Time
+	// ShellActivityGeneration 在每次收到 Start/stdout/stderr 真实活动时递增，用于失效旧的恢复候选与定时器。
+	ShellActivityGeneration int
+	// ShellRecoveryPhase 记录 foreground 恢复阶段：空表示未进入恢复，abort_requested 表示已向客户端请求中止。
+	ShellRecoveryPhase string
+	// ShellAbortRequestedAt 记录 foreground 恢复第一阶段发出 abort 控制消息的时间。
+	ShellAbortRequestedAt time.Time
 	// LastShellHeartbeatAt 记录最近一次 shell heartbeat 到达时间。
 	LastShellHeartbeatAt time.Time
 	// ShellForegroundDeadline 表示前台 shell 预计最晚应收到终态的时间点。

@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"cursor/gen/agentv1"
+	"cursor/internal/buildinfo"
 )
 
 type debugLogConfig interface {
@@ -139,6 +140,8 @@ func (recorder *debugRecorder) baseEvent(layer string, requestID string, convers
 		"layer":           strings.TrimSpace(layer),
 		"request_id":      strings.TrimSpace(requestID),
 		"conversation_id": resolvedConversationID,
+		"build_version":   buildinfo.CurrentVersion(),
+		"build_commit":    buildinfo.CurrentCommit(),
 	}
 }
 

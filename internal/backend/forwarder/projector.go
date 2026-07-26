@@ -526,6 +526,20 @@ func (projector *HistoryProjector) ProjectLegacyCheckpoint(conversation *Convers
 		steps := make([][]byte, 0, len(entries))
 		seenToolCalls := make(map[string]struct{})
 		openToolCalls := make(map[string]struct{})
+		// 既有已完成记录的 tool_result.arguments 用于回填 Task 卡片 Mode。
+		resultArgumentsByToolCall := make(map[string]string)
+		for _, entry := range entries {
+			if strings.TrimSpace(entry.Kind) != "tool_result" {
+				continue
+			}
+			var payload toolResultEntryPayload
+			if json.Unmarshal(entry.Payload, &payload) != nil {
+				continue
+			}
+			if toolCallID, arguments := strings.TrimSpace(payload.ToolCallID), strings.TrimSpace(payload.Arguments); toolCallID != "" && arguments != "" {
+				resultArgumentsByToolCall[toolCallID] = arguments
+			}
+		}
 		for _, entry := range entries {
 			if turnRequestID == "" {
 				turnRequestID = strings.TrimSpace(entry.RequestID)
@@ -580,6 +594,9 @@ func (projector *HistoryProjector) ProjectLegacyCheckpoint(conversation *Convers
 				if !shouldPersistToolResultName(firstNonEmpty(strings.TrimSpace(payload.ToolName), inferToolName(toolCall))) {
 					continue
 				}
+				// 优先用本条原始 arguments，其次用同 ID tool_result 的 arguments 回填 Task Mode；
+				// 两者都缺失时保持原值，不猜测权限。
+				normalizeTaskToolCallMode(toolCall, firstNonEmpty(strings.TrimSpace(payload.Arguments), resultArgumentsByToolCall[strings.TrimSpace(payload.ToolCallID)]))
 				if strings.TrimSpace(payload.ReasoningContent) != "" {
 					stepPayload, err := marshalThinkingStep(payload.ReasoningContent)
 					if err != nil {
@@ -631,6 +648,7 @@ func (projector *HistoryProjector) ProjectLegacyCheckpoint(conversation *Convers
 				if !shouldPersistToolResultName(firstNonEmpty(strings.TrimSpace(payload.ToolName), inferToolName(toolCall))) {
 					continue
 				}
+				normalizeTaskToolCallMode(toolCall, payload.Arguments)
 				if strings.TrimSpace(payload.ReasoningContent) != "" {
 					stepPayload, err := marshalThinkingStep(payload.ReasoningContent)
 					if err != nil {

@@ -44,8 +44,10 @@ const (
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
 	shellCircuitLocalBlockLimit    = 2
-	shellCircuitPromptSource       = "shell_circuit"
-	shellCircuitPromptText         = "Shell is unavailable for the rest of this turn after Cursor rejected it. Do not issue Shell again; use Read, Grep, Glob, or another non-Shell tool, or explain the blocker and finish the turn."
+	// shellCircuitFingerprintOpenLimit 表示同一 command/cwd/class 指纹累计多少次 terminal 稳定拒绝后开路。
+	shellCircuitFingerprintOpenLimit = 2
+	shellCircuitPromptSource         = "shell_circuit"
+	shellCircuitPromptText           = "Shell is unavailable for the rest of this turn after Cursor rejected it. Do not issue Shell again; use Read, Grep, Glob, or another non-Shell tool, or explain the blocker and finish the turn."
 
 	runtimeThinkingEffortParameterID = "thinking_effort"
 )
@@ -1327,6 +1329,7 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		}
 	}
 	if shellExecutionBegan(intent.ExecClientMessage) {
+		pending = service.refreshShellForegroundActivity(stream, pending)
 		if _, ok := intent.ExecClientMessage.GetShellStream().GetEvent().(*agentv1.ShellStream_Start); ok {
 			service.recordShellHandshakeEvent(stream, pending)
 		}
@@ -1412,6 +1415,11 @@ func (service *Service) recordShellHandshakeEvent(stream *ActiveStream, pending 
 		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_start", values),
 	}); err != nil {
 		log.Printf("forwarder shell start metadata failed request_id=%s exec_id=%s err=%v", stream.RequestID, pending.ExecID, err)
+	}
+	if entry, ok := shellCircuitFingerprintResetEntry(stream, pending, "shell_start"); ok {
+		if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{entry}); err != nil {
+			log.Printf("forwarder shell circuit reset metadata failed request_id=%s exec_id=%s err=%v", stream.RequestID, pending.ExecID, err)
+		}
 	}
 	if service.debug != nil {
 		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_start", values)
@@ -1544,7 +1552,9 @@ func (service *Service) recordShellRejection(stream *ActiveStream, pending runti
 		"count":            count,
 	}
 	entries := []HistoryEntry{newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_rejection_fingerprint", values)}
-	openCircuit := false
+	// 只有稳定、可归因的 terminal 拒绝（permission/policy/capability）在同一指纹上达到阈值才开路；
+	// Skipped 与 transport 不会以 terminal 拒绝进入此路径，command_parse 由 shouldOpenShellCircuit 排除。
+	openCircuit := shouldOpenShellCircuit(circuit, rejectionClass) && count >= shellCircuitFingerprintOpenLimit
 	if openCircuit {
 		entries = append(entries, newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_circuit_open", map[string]any{
 			"source":                "shell_terminal",
@@ -1579,24 +1589,61 @@ func shouldOpenShellCircuit(circuit shellCircuitState, rejectionClass string) bo
 	return !circuit.Open && strings.TrimSpace(rejectionClass) != "" && rejectionClass != "command_parse"
 }
 
+// shellCircuitFingerprintClasses 是允许触发开路、也允许被 reset 清零的稳定拒绝类别。
+var shellCircuitFingerprintClasses = []string{"permission", "policy", "capability"}
+
+// shellCircuitFingerprintResetEntry 在同一 command/cwd 指纹存在稳定拒绝计数时构造 reset 元数据。
+func shellCircuitFingerprintResetEntry(stream *ActiveStream, pending runtimecore.PendingExec, source string) (HistoryEntry, bool) {
+	circuit := currentTurnShellCircuit(stream)
+	if circuit.Open {
+		return HistoryEntry{}, false
+	}
+	commandHash, _, cwdHash := shellInvocationHashes(pending.ArgsJSON)
+	hits := 0
+	for _, class := range shellCircuitFingerprintClasses {
+		hits += circuit.FingerprintHits[planContentHash(strings.Join([]string{"Shell", commandHash, cwdHash, class}, "\x00"))]
+	}
+	if hits == 0 {
+		return HistoryEntry{}, false
+	}
+	return newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_circuit_fingerprint_reset", map[string]any{
+		"source":                    source,
+		"provider_pass":             pending.ProviderPass,
+		"model_call_id":             strings.TrimSpace(pending.ModelCallID),
+		"tool_call_id":              strings.TrimSpace(pending.ToolCallID),
+		"exec_id":                   strings.TrimSpace(pending.ExecID),
+		"command_hash":              commandHash,
+		"cwd_hash":                  cwdHash,
+		"previous_fingerprint_hits": hits,
+	}), true
+}
+
 func (service *Service) recordShellCircuitSuccess(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) error {
 	if !shellTerminalSucceeded(message) {
 		return nil
 	}
 	circuit := currentTurnShellCircuit(stream)
-	if circuit.Open || circuit.ParseRejections == 0 {
+	if circuit.Open {
 		return nil
 	}
-	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
-		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_circuit_parse_reset", map[string]any{
+	entries := []HistoryEntry(nil)
+	if entry, ok := shellCircuitFingerprintResetEntry(stream, pending, "shell_success"); ok {
+		entries = append(entries, entry)
+	}
+	if circuit.ParseRejections > 0 {
+		entries = append(entries, newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_circuit_parse_reset", map[string]any{
 			"source":               "shell_success",
 			"provider_pass":        pending.ProviderPass,
 			"model_call_id":        strings.TrimSpace(pending.ModelCallID),
 			"tool_call_id":         strings.TrimSpace(pending.ToolCallID),
 			"exec_id":              strings.TrimSpace(pending.ExecID),
 			"previous_parse_count": circuit.ParseRejections,
-		}),
-	})
+		}))
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, entries)
 	return err
 }
 
@@ -1808,6 +1855,12 @@ func currentTurnShellCircuit(stream *ActiveStream) shellCircuitState {
 			}
 		case "shell_circuit_parse_reset":
 			state.ParseRejections = 0
+		case "shell_circuit_fingerprint_reset":
+			commandHash := strings.TrimSpace(fmt.Sprint(payload.Value["command_hash"]))
+			cwdHash := strings.TrimSpace(fmt.Sprint(payload.Value["cwd_hash"]))
+			for _, class := range shellCircuitFingerprintClasses {
+				delete(state.FingerprintHits, planContentHash(strings.Join([]string{"Shell", commandHash, cwdHash, class}, "\x00")))
+			}
 		case "shell_circuit_open":
 			state.Open = true
 			state.RejectionClass = strings.TrimSpace(fmt.Sprint(payload.Value["rejection_class"]))
@@ -2978,6 +3031,13 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	if err := validateSubagentToolInvocationForConversation(mode, subagentTypeName, subagentRole, trimmedToolName, invocation.ArgsJSON); err != nil {
 		return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
 	}
+	if trimmedToolName == "Shell" && isChildConversationSubagentTypeName(subagentTypeName) && normalizeMode(mode) == agentv1.AgentMode_AGENT_MODE_PLAN {
+		rewritten, err := service.enforceReadonlyShellPolicy(stream, invocation)
+		if err != nil {
+			return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
+		}
+		invocation = rewritten
+	}
 	if trimmedToolName == "Task" {
 		if err := validateTaskSubagentCapability(invocation.ArgsJSON); err != nil {
 			return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
@@ -3085,7 +3145,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			return err
 		}
 		_, err = service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
-			newToolCallEntryWithProviderMetadata(stream.TurnSeq, stream.RequestID, invocation.CallID, invocation.ToolName, invocation.ReasoningContent, invocation.ReasoningSignature, invocation.ReasoningSignatureSource, invocation.ReasoningProviderItemID, invocation.ReasoningProviderStatus, invocation.ReasoningProviderSummary, invocation.ProviderItemID, invocation.ProviderCallID, invocation.ProviderStatus, toolCallPayload),
+			newToolCallEntryWithProviderMetadata(stream.TurnSeq, stream.RequestID, invocation.CallID, invocation.ToolName, string(invocation.ArgsJSON), invocation.ReasoningContent, invocation.ReasoningSignature, invocation.ReasoningSignatureSource, invocation.ReasoningProviderItemID, invocation.ReasoningProviderStatus, invocation.ReasoningProviderSummary, invocation.ProviderItemID, invocation.ProviderCallID, invocation.ProviderStatus, toolCallPayload),
 		})
 		if err != nil {
 			return err
@@ -3166,11 +3226,26 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			delete(stream.PendingExecs, pendingExec.ExecID)
 			stream.mu.Unlock()
 		}
+		// execPublished 标记 exec 消息是否已成功发布给客户端；发布后 worker 可能已启动，
+		// 失败语义从「确定未启动」变为「状态不确定」。
+		execPublished := false
 		failExecDispatch := func(cause error) error {
-			removePendingExec("dispatch_failed")
 			if strings.TrimSpace(pendingExec.ExecKind) != "subagent" {
+				removePendingExec("dispatch_failed")
 				return cause
 			}
+			if execPublished {
+				// worker 可能已在运行：保留 pending/lease 等待真实结果或 abort 确认，
+				// 不制造失联 worker，也不为清 UI 合成终态。
+				service.recordSubagentDispatchUncertain(stream, pendingExec, cause)
+				return cause
+			}
+			// exec 尚未发布：child 确定未启动，这是确定性 dispatch failure。
+			// RUNNING 已持久化，先补 ERROR 终态，再由同一链路回收 reservation 并收口工具调用。
+			if err := service.recordSubagentRunState(stream, pendingExec, agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_ERROR, "", fmt.Sprintf("dispatch failed: %v", cause)); err != nil {
+				log.Printf("forwarder subagent dispatch failure run state failed request_id=%s tool_call_id=%s err=%v", strings.TrimSpace(stream.RequestID), strings.TrimSpace(pendingExec.ToolCallID), err)
+			}
+			removePendingExec("dispatch_failed")
 			return service.completePreDispatchToolError(
 				stream,
 				invocation,
@@ -3190,6 +3265,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			if err := service.broker.Publish(stream.RequestID, StreamEvent{Message: serverMessage}); err != nil {
 				return failExecDispatch(err)
 			}
+			execPublished = true
 			scheduleExecRecovery()
 			if err := ensureLoopActive(); err != nil {
 				return failExecDispatch(err)
@@ -3972,13 +4048,14 @@ func newAssistantTextEntryWithProviderMetadata(turnSeq int64, requestID string, 
 
 // newToolCallEntry 构造 tool_call entry。
 func newToolCallEntry(turnSeq int64, requestID string, toolCallID string, toolName string, reasoningContent string, reasoningSignature string, toolCall json.RawMessage) HistoryEntry {
-	return newToolCallEntryWithProviderMetadata(turnSeq, requestID, toolCallID, toolName, reasoningContent, reasoningSignature, "", "", "", nil, "", "", "", toolCall)
+	return newToolCallEntryWithProviderMetadata(turnSeq, requestID, toolCallID, toolName, "", reasoningContent, reasoningSignature, "", "", "", nil, "", "", "", toolCall)
 }
 
-func newToolCallEntryWithProviderMetadata(turnSeq int64, requestID string, toolCallID string, toolName string, reasoningContent string, reasoningSignature string, reasoningSignatureSource string, reasoningItemID string, reasoningStatus string, reasoningSummary json.RawMessage, providerItemID string, providerCallID string, providerStatus string, toolCall json.RawMessage) HistoryEntry {
+func newToolCallEntryWithProviderMetadata(turnSeq int64, requestID string, toolCallID string, toolName string, arguments string, reasoningContent string, reasoningSignature string, reasoningSignatureSource string, reasoningItemID string, reasoningStatus string, reasoningSummary json.RawMessage, providerItemID string, providerCallID string, providerStatus string, toolCall json.RawMessage) HistoryEntry {
 	payload, _ := json.Marshal(toolCallEntryPayload{
 		ToolCallID:               strings.TrimSpace(toolCallID),
 		ToolName:                 strings.TrimSpace(toolName),
+		Arguments:                strings.TrimSpace(arguments),
 		ReasoningContent:         reasoningContent,
 		ReasoningSignature:       strings.TrimSpace(reasoningSignature),
 		ReasoningSignatureSource: strings.TrimSpace(reasoningSignatureSource),

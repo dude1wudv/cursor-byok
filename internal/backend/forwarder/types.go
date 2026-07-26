@@ -161,8 +161,10 @@ type shellRecoveryCandidate struct {
 	ExecID     string
 	MessageID  uint32
 	Generation int
-	Reason     string
-	ObservedAt time.Time
+	// ActivityGeneration 锚定候选创建时的 shell 活动代次；新活动到达后旧候选自动失效。
+	ActivityGeneration int
+	Reason             string
+	ObservedAt         time.Time
 }
 
 type shellExecTombstone struct {
@@ -403,6 +405,7 @@ type toolResultEntryPayload struct {
 type toolCallEntryPayload struct {
 	ToolCallID               string          `json:"tool_call_id"`
 	ToolName                 string          `json:"tool_name"`
+	Arguments                string          `json:"arguments,omitempty"`
 	ReasoningContent         string          `json:"reasoning_content,omitempty"`
 	ReasoningSignature       string          `json:"reasoning_signature,omitempty"`
 	ReasoningSignatureSource string          `json:"reasoning_signature_source,omitempty"`

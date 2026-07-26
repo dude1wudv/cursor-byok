@@ -2054,8 +2054,11 @@ func applyLegacyShellResult(result ExecApplyResult, pending runtimecore.PendingE
 			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result rejected payload is empty")
 		}
 		if strings.Contains(strings.ToLower(strings.TrimSpace(item.Rejected.GetReason())), "skip") {
+			// legacy Skipped 与 stream Skipped 归一：交给 forwarder 的有界 retry/recovery，
+			// 不再漏到 foreground deadline 的通用收口。
 			result.IsTerminal = false
 			result.ToolCall = nil
+			result.ShellRecoveryCandidate = "skipped"
 			return result
 		}
 		result.ToolResultPayload = fmt.Sprintf("shell rejected: %s", strings.TrimSpace(item.Rejected.GetReason()))
@@ -2329,17 +2332,27 @@ func buildShellPermissionDeniedToolCall(toolCallID string, argsJSON []byte, deni
 	}
 }
 
+// ParseSimpleShellCommand 把不含 shell 元字符的单条命令拆成词元；复杂语法返回 false。
+// 该判定是 Cursor 兼容解析与 inspect 白名单策略的共同真相。
+func ParseSimpleShellCommand(command string) ([]string, bool) {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" || strings.ContainsAny(trimmed, "$;|&'\"`<>(){}[]^\r\n") {
+		return nil, false
+	}
+	parts := strings.Fields(trimmed)
+	if len(parts) == 0 || strings.Contains(parts[0], "=") {
+		return nil, false
+	}
+	return parts, true
+}
+
 // buildShellParsingMetadata keeps Cursor's required parsing_result present
 // without claiming that complex shell syntax was parsed successfully.
 func buildShellParsingMetadata(command string) ([]string, *agentv1.ShellCommandParsingResult) {
 	trimmed := strings.TrimSpace(command)
-	failed := &agentv1.ShellCommandParsingResult{ParsingFailed: true}
-	if trimmed == "" || strings.ContainsAny(trimmed, "$;|&'\"`<>(){}[]^\r\n") {
-		return nil, failed
-	}
-	parts := strings.Fields(trimmed)
-	if len(parts) == 0 || strings.Contains(parts[0], "=") {
-		return nil, failed
+	parts, simple := ParseSimpleShellCommand(trimmed)
+	if !simple {
+		return nil, &agentv1.ShellCommandParsingResult{ParsingFailed: true}
 	}
 	args := make([]*agentv1.ShellCommandParsingResult_ExecutableCommandArg, 0, len(parts)-1)
 	for _, value := range parts[1:] {

@@ -29,13 +29,13 @@ func TestReadonlySubagentToolsMatchPreDispatchPolicy(t *testing.T) {
 			t.Fatalf("loaded readonly tool %q is rejected: %v", name, err)
 		}
 	}
-	for _, name := range []string{"Write", "PatchEdit", "Delete", "Shell", "AwaitShell", "WriteShellStdin", "ForceBackgroundShell", "CallMcpTool", "Task"} {
+	for _, name := range []string{"Write", "PatchEdit", "Delete", "AwaitShell", "WriteShellStdin", "ForceBackgroundShell", "CallMcpTool", "Task"} {
 		if loaded[name] || isToolAllowedInMode(agentv1.AgentMode_AGENT_MODE_PLAN, "generalPurpose", name) {
 			t.Fatalf("readonly child can use %q", name)
 		}
 	}
-	if !loaded["FetchMcpResource"] {
-		t.Fatal("readonly child is missing FetchMcpResource")
+	if !loaded["FetchMcpResource"] || !loaded["Shell"] {
+		t.Fatal("readonly child is missing FetchMcpResource or whitelisted Shell")
 	}
 
 	downloadArgs, err := json.Marshal(map[string]any{"server": "test", "uri": "test://resource", "downloadPath": "output.txt"})
@@ -82,7 +82,7 @@ func TestTaskAccessModeControlsFirstDispatchTools(t *testing.T) {
 			for _, name := range names {
 				loaded[name] = true
 			}
-			for _, name := range []string{"Write", "PatchEdit", "Delete", "Shell"} {
+			for _, name := range []string{"Write", "PatchEdit", "Delete", "AwaitShell"} {
 				if loaded[name] != tt.wantShell {
 					t.Fatalf("tool %q loaded = %t, want %t", name, loaded[name], tt.wantShell)
 				}

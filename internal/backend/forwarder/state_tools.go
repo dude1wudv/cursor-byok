@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"cursor/gen/agentv1"
+	runtimecore "cursor/internal/backend/agent/core"
 	modeladapter "cursor/internal/backend/agent/model"
 )
 
@@ -173,8 +174,8 @@ func buildPlanExecutionPromptContext(intent InboundIntent) PromptContextMessage 
 	parts = append(parts, strings.Join([]string{
 		"Execute only the earliest incomplete Wave.",
 		"For a simple task or work that shares files or state, keep the work on the main line and complete the Wave sequentially without dispatching a subagent.",
-		"Use subagent_type=\"explore\" with readonly=true only for reconnaissance tasks. Never assign an implementation task to an Explore or readonly subagent.",
-		"For an implementation task assigned to a subagent, use subagent_type=\"generalPurpose\" with readonly=false so the child runs in Agent mode with editing tools. Its prompt must require the owned_paths changes to be written to disk and validated, not merely described.",
+		"Use subagent_type=\"explore\" with access_mode=\"inspect\" only for reconnaissance tasks. Never assign an implementation task to an Explore or inspect subagent.",
+		"For an implementation task assigned to a subagent, use subagent_type=\"generalPurpose\" with access_mode=\"act\" so the child runs in Agent mode with editing tools. Its prompt must require the owned_paths changes to be written to disk and validated, not merely described.",
 		"For independent tasks in the same Wave, dispatch the minimum necessary Task subagents together, never more than four direct subagents in one batch. Each Task prompt must include the task ID, scope, owned_paths, dependencies, acceptance criteria, expected file changes, validation command, and expected return format.",
 		"Do not duplicate delegated work on the main line. Wait for every required result in the current Wave, inspect the resulting workspace changes, update matching Todo IDs, and verify the completion gate before advancing.",
 		"A Task start or research-only report is not completion for an implementation task. If required owned_paths were not changed, validation did not run, or a required task fails, times out, conflicts, or has an unknown result, mark the Wave blocked and repair or resume it before continuing.",
@@ -988,7 +989,7 @@ func buildTaskArgsFromMap(payload map[string]any) *agentv1.TaskArgs {
 			strings.TrimSpace(stringValue(valueByAlias(payload, "subagent_type", "subagentType"))),
 		),
 		Attachments: stringSliceValue(valueByAlias(payload, "attachments")),
-		Mode:        taskModeFromReadonly(boolValue(valueByAlias(payload, "readonly", "readOnly"))),
+		Mode:        taskModeFromArgsMap(payload),
 	}
 	if model := strings.TrimSpace(stringValue(valueByAlias(payload, "model"))); model != "" {
 		if effort := normalizeTaskThinkingEffort(stringValue(valueByAlias(payload, "thinking_effort", "thinkingEffort"))); effort != "" {
@@ -1029,6 +1030,28 @@ func taskModeFromReadonly(readonly bool) agentv1.TaskMode {
 		return agentv1.TaskMode_TASK_MODE_PLAN
 	}
 	return agentv1.TaskMode_TASK_MODE_AGENT
+}
+
+// taskModeFromArgsMap 以 canonical access_mode 为真相推导卡片 Mode；
+// 解析失败（旧历史缺少 access_mode 且字段冲突）时退回 legacy readonly，不猜测权限。
+func taskModeFromArgsMap(payload map[string]any) agentv1.TaskMode {
+	if capability, err := runtimecore.ResolveTaskSubagentCapabilityFromArgs(payload); err == nil {
+		return taskModeFromReadonly(capability.Readonly)
+	}
+	return taskModeFromReadonly(boolValue(valueByAlias(payload, "readonly", "readOnly")))
+}
+
+// normalizeTaskToolCallMode 用原始 arguments 重新规范化投影中的 Task 卡片 Mode。
+func normalizeTaskToolCallMode(toolCall *agentv1.ToolCall, arguments string) {
+	task := toolCall.GetTaskToolCall()
+	if task == nil || task.Args == nil || strings.TrimSpace(arguments) == "" {
+		return
+	}
+	payload, err := decodeJSONObject([]byte(arguments))
+	if err != nil {
+		return
+	}
+	task.Args.Mode = taskModeFromArgsMap(payload)
 }
 
 func cloneTodoItems(items []*agentv1.TodoItem) []*agentv1.TodoItem {

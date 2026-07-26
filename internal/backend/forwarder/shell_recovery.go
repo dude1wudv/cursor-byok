@@ -18,6 +18,8 @@ const (
 	shellRecoveryReasonSkipped            = "skipped"
 )
 
+const shellRecoveryPhaseAbortRequested = "abort_requested"
+
 func initializePendingExecForTracking(pending runtimecore.PendingExec) runtimecore.PendingExec {
 	if strings.TrimSpace(pending.ExecKind) != "shell" {
 		return pending
@@ -99,11 +101,12 @@ func (service *Service) scheduleShellRecoveryCandidate(requestID string, pending
 		stream.ShellRecoveryCandidates = make(map[string]shellRecoveryCandidate)
 	}
 	candidate := shellRecoveryCandidate{
-		ExecID:     pending.ExecID,
-		MessageID:  pending.MessageID,
-		Generation: pending.ProviderPass,
-		Reason:     reason,
-		ObservedAt: time.Now().UTC(),
+		ExecID:             pending.ExecID,
+		MessageID:          pending.MessageID,
+		Generation:         pending.ProviderPass,
+		ActivityGeneration: current.ShellActivityGeneration,
+		Reason:             reason,
+		ObservedAt:         time.Now().UTC(),
 	}
 	stream.ShellRecoveryCandidates[pending.ExecID] = candidate
 	current.ShellRecoveryScheduled = true
@@ -123,6 +126,33 @@ func (service *Service) scheduleShellRecoveryCandidate(requestID string, pending
 
 func (service *Service) scheduleShellTransportCloseRecovery(requestID string, pending runtimecore.PendingExec) {
 	service.scheduleShellRecoveryCandidate(requestID, pending, shellRecoveryReasonTransportClosed)
+}
+
+// refreshShellForegroundActivity 把 Start/stdout/stderr 归一为单一活动迁移：递增活动代次、
+// 复位恢复阶段、撤销 skipped/transport 候选、失效旧 timer，并按最新代次重新安排 foreground 监督。
+func (service *Service) refreshShellForegroundActivity(stream *ActiveStream, pending runtimecore.PendingExec) runtimecore.PendingExec {
+	if service == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+		return pending
+	}
+	stream.mu.Lock()
+	current, found := stream.PendingExecs[pending.ExecID]
+	if !found || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass {
+		stream.mu.Unlock()
+		return pending
+	}
+	now := time.Now().UTC()
+	current.ShellActivityGeneration++
+	current.ShellRecoveryPhase = ""
+	current.ShellAbortRequestedAt = time.Time{}
+	current.ShellRecoveryScheduled = false
+	current.ShellForegroundDeadline = now.Add(shellForegroundTimeoutDuration(current.ArgsJSON) + shellTerminalRecoveryGrace)
+	stream.PendingExecs[current.ExecID] = current
+	delete(stream.ShellRecoveryCandidates, current.ExecID)
+	stream.UpdatedAt = now
+	stream.mu.Unlock()
+	clearStreamTimer(stream, providerTimerKey(streamTimerShellTransportClose, current.ExecID))
+	service.scheduleShellForegroundRecovery(stream.RequestID, current)
+	return current
 }
 
 func snapshotPendingExecWithStatus(stream *ActiveStream, execID string) (runtimecore.PendingExec, StreamStatus, bool) {
@@ -167,17 +197,67 @@ func (service *Service) recoverShellWithoutTerminalIfNeeded(stream *ActiveStream
 		if !current.ShellForegroundDeadline.IsZero() && time.Now().UTC().Before(current.ShellForegroundDeadline) {
 			return nil
 		}
-		stream.mu.Lock()
-		if stream.ShellRecoveryCandidates == nil {
-			stream.ShellRecoveryCandidates = make(map[string]shellRecoveryCandidate)
+		// 两阶段收口：先请求客户端 abort，短 grace 后仍无真实终态才本地关闭。
+		if current.ShellRecoveryPhase != shellRecoveryPhaseAbortRequested {
+			return service.requestShellAbortBeforeRecovery(stream, current)
 		}
-		stream.ShellRecoveryCandidates[current.ExecID] = shellRecoveryCandidate{
-			ExecID: current.ExecID, MessageID: current.MessageID, Generation: current.ProviderPass,
-			Reason: reason, ObservedAt: time.Now().UTC(),
-		}
-		stream.mu.Unlock()
 	}
 	return service.recoverShellWithoutTerminal(stream, current, reason)
+}
+
+// requestShellAbortBeforeRecovery 是 foreground 恢复第一阶段：登记候选并向客户端请求中止，不合成任何终态。
+func (service *Service) requestShellAbortBeforeRecovery(stream *ActiveStream, pending runtimecore.PendingExec) error {
+	if service == nil || stream == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	stream.mu.Lock()
+	current, found := stream.PendingExecs[pending.ExecID]
+	if !found || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass || current.ShellActivityGeneration != pending.ShellActivityGeneration {
+		stream.mu.Unlock()
+		return nil
+	}
+	current.ShellRecoveryPhase = shellRecoveryPhaseAbortRequested
+	current.ShellAbortRequestedAt = now
+	stream.PendingExecs[current.ExecID] = current
+	if stream.ShellRecoveryCandidates == nil {
+		stream.ShellRecoveryCandidates = make(map[string]shellRecoveryCandidate)
+	}
+	stream.ShellRecoveryCandidates[current.ExecID] = shellRecoveryCandidate{
+		ExecID:             current.ExecID,
+		MessageID:          current.MessageID,
+		Generation:         current.ProviderPass,
+		ActivityGeneration: current.ShellActivityGeneration,
+		Reason:             shellRecoveryReasonForegroundDeadline,
+		ObservedAt:         now,
+	}
+	stream.UpdatedAt = now
+	stream.mu.Unlock()
+	if service.broker != nil {
+		if err := service.broker.Publish(stream.RequestID, StreamEvent{Message: buildExecAbortMessage(current)}); err != nil {
+			return err
+		}
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_abort_requested", map[string]any{
+			"tool_call_id":        current.ToolCallID,
+			"exec_id":             current.ExecID,
+			"message_id":          current.MessageID,
+			"provider_pass":       current.ProviderPass,
+			"activity_generation": current.ShellActivityGeneration,
+			"reason":              shellRecoveryReasonForegroundDeadline,
+		})
+	}
+	service.scheduleStreamTimer(
+		stream,
+		providerTimerKey(streamTimerShellForeground, current.ExecID),
+		shellTerminalRecoveryGrace,
+		streamTimerShellForeground,
+		current.ExecID,
+		current.MessageID,
+		shellRecoveryReasonForegroundDeadline,
+	)
+	return nil
 }
 
 func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
@@ -193,7 +273,7 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 	stream.mu.Lock()
 	current, found := stream.PendingExecs[pending.ExecID]
 	candidate, candidateFound := stream.ShellRecoveryCandidates[pending.ExecID]
-	if !found || !candidateFound || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass || candidate.MessageID != pending.MessageID || candidate.Generation != pending.ProviderPass || candidate.Reason != strings.TrimSpace(reason) {
+	if !found || !candidateFound || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass || current.ShellActivityGeneration != candidate.ActivityGeneration || candidate.MessageID != pending.MessageID || candidate.Generation != pending.ProviderPass || candidate.Reason != strings.TrimSpace(reason) {
 		stream.mu.Unlock()
 		return nil
 	}
@@ -201,19 +281,43 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 		stream.mu.Unlock()
 		return nil
 	}
+	// 终态所有权在同一临界区内一次性提交：tombstone、pending 删除、候选清理和 batch terminal，
+	// 消除本地恢复与迟到 Exit 的双收口窗口。
+	now := time.Now().UTC()
+	cutoff := now.Add(-completedExecRetention)
 	if stream.ShellExecTombstones == nil {
 		stream.ShellExecTombstones = make(map[string]shellExecTombstone)
 	}
 	if stream.RecentCompletedExecs == nil {
 		stream.RecentCompletedExecs = make(map[uint32]time.Time)
 	}
-	stream.ShellExecTombstones[pending.ExecID] = shellExecTombstone{MessageID: pending.MessageID, Generation: pending.ProviderPass, CompletedAt: time.Now().UTC()}
+	for execID, tombstone := range stream.ShellExecTombstones {
+		if tombstone.CompletedAt.Before(cutoff) {
+			delete(stream.ShellExecTombstones, execID)
+		}
+	}
+	stream.ShellExecTombstones[pending.ExecID] = shellExecTombstone{MessageID: pending.MessageID, Generation: pending.ProviderPass, CompletedAt: now}
 	delete(stream.ShellRecoveryCandidates, pending.ExecID)
+	delete(stream.PendingExecs, pending.ExecID)
+	markTaskBatchTerminalLocked(stream, current)
+	if pending.MessageID != 0 {
+		for messageID, completedAt := range stream.RecentCompletedExecs {
+			if completedAt.Before(cutoff) {
+				delete(stream.RecentCompletedExecs, messageID)
+			}
+		}
+		stream.RecentCompletedExecs[pending.MessageID] = now
+	}
+	stream.UpdatedAt = now
 	stream.mu.Unlock()
 
 	pending = current
-	markExecCompleted(stream, pending)
+	clearStreamTimer(stream, providerTimerKey(streamTimerShellForeground, pending.ExecID))
+	clearStreamTimer(stream, providerTimerKey(streamTimerShellTransportClose, pending.ExecID))
 	result := fmt.Sprintf("Shell did not provide a terminal result (%s). The execution was closed locally after a per-command grace period.", candidate.Reason)
+	if candidate.Reason == shellRecoveryReasonForegroundDeadline {
+		result = "Shell timed out: no terminal result arrived before the foreground deadline and an abort was requested. The tool call was closed locally as a timeout; the command outcome is unknown."
+	}
 	if candidate.Reason == shellRecoveryReasonSkipped {
 		result = "shell skipped: Cursor rejected the execution before it started"
 	}
@@ -226,6 +330,9 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 			"message_id":          pending.MessageID,
 			"exec_id":             pending.ExecID,
 			"generation":          pending.ProviderPass,
+			"activity_generation": pending.ShellActivityGeneration,
+			"recovery_phase":      pending.ShellRecoveryPhase,
+			"terminal_owner":      "local_recovery",
 			"reason":              candidate.Reason,
 			"chunk_count":         pending.ChunkCount,
 			"stdout_buffer_bytes": len(pending.StdoutBuffer),
@@ -273,7 +380,8 @@ func (service *Service) retrySkippedShell(stream *ActiveStream, pending runtimec
 	current, found := stream.PendingExecs[pending.ExecID]
 	candidate, candidateFound := stream.ShellRecoveryCandidates[pending.ExecID]
 	eligible := found && candidateFound && candidate.Reason == shellRecoveryReasonSkipped &&
-		current.MessageID == pending.MessageID && current.ProviderPass == pending.ProviderPass && shellSkippedRetryEligibleLocked(stream, current)
+		current.MessageID == pending.MessageID && current.ProviderPass == pending.ProviderPass &&
+		candidate.ActivityGeneration == current.ShellActivityGeneration && shellSkippedRetryEligibleLocked(stream, current)
 	stream.mu.Unlock()
 	if !eligible {
 		return false, nil
@@ -303,7 +411,7 @@ func (service *Service) retrySkippedShell(stream *ActiveStream, pending runtimec
 	stream.mu.Lock()
 	current, found = stream.PendingExecs[pending.ExecID]
 	candidate, candidateFound = stream.ShellRecoveryCandidates[pending.ExecID]
-	if !found || !candidateFound || candidate.Reason != shellRecoveryReasonSkipped || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass || !shellSkippedRetryEligibleLocked(stream, current) {
+	if !found || !candidateFound || candidate.Reason != shellRecoveryReasonSkipped || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass || candidate.ActivityGeneration != current.ShellActivityGeneration || !shellSkippedRetryEligibleLocked(stream, current) {
 		stream.mu.Unlock()
 		return false, nil
 	}

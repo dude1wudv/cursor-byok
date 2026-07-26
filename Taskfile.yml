@@ -11,6 +11,8 @@ vars:
   BIN_DIR: "bin"
   APP_VERSION:
     sh: 'go run ./scripts/release version -config ./build/config.yml'
+  APP_COMMIT:
+    sh: 'git rev-parse --short HEAD 2>/dev/null || echo unknown'
   RELEASE_REPO: "dude1wudv/cursor-byok"
   RELEASE_BASE_NAME: "cursor-byok"
   RELEASE_PLATFORMS: "macos-arm64,macos-amd64,windows-amd64"

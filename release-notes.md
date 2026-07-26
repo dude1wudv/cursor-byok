@@ -1,28 +1,38 @@
-# Cursor助手 v0.0.69
+# Cursor助手 v0.0.70
 
-本版本恢复 v0.0.67 的请求缓存行为，并修复并发 Shell 在 Cursor 终端分配阶段被 skipped 的问题。
+本版本修复 Shell、Task/subagent 两条状态机的一致性缺陷，统一 inspect 权限契约，并补齐构建身份观测。
 
-## 请求缓存
+## Shell 生命周期
 
-- 当前请求、模式、Plan/Todo 和动态提醒重新作为 prompt context 持久化在首次出现的位置。
-- 移除 v0.0.68 的 latest-only suffix 编译路径；同一 turn 后续 provider pass 只追加 history，不移动已发送前缀。
-- 保留 `prompt_cache_key`、`LatestRequestPrefix` 和 `StableMessageCount` 的现有行为，不增加额外缓存策略。
+- Start/stdout/stderr 归一为单一活动迁移：递增活动代次、延长 foreground deadline、撤销恢复候选并重排监督定时器；活跃 Shell 不再被旧 deadline 错误本地收口。
+- foreground deadline 改为两阶段收口：先向客户端发送 abort 并进入 `abort_requested`，短 grace 后仍无真实终态才以 timeout 语义关闭；不合成成功。
+- 终态所有权在单一临界区内原子提交（tombstone、pending 删除、候选清理、batch terminal），消除本地恢复与迟到 Exit 的双收口窗口。
+- legacy `ShellResult_Rejected("Skipped")` 与 stream Skipped 归一，同样进入有界 retry/recovery。
+- Shell circuit 接线生效：同一 command/cwd/class 指纹累计 2 次 `permission/policy/capability` terminal 拒绝才开路；Skipped、transport、parse 不计；真实 Start 或成功会重置对应指纹。
 
-## Shell 分配
+## inspect 权限与受控 Shell
 
-- 同一 run 仍可并行运行最多 8 个已启动 Shell，但任意时刻只发送一个尚未收到 Cursor Start 的新 exec。
-- Start 到达后立即按 FIFO 放行下一项；Exit、Backgrounded、拒绝和恢复收口都会释放分配状态。
-- 仅对未见 Start/stdout/stderr、存在其他运行中终端且尚未重派的 skipped 使用新 exec/message ID 重派一次。
-- Shell dispatch、queue、Start、skipped、retry 和终态均记录脱敏关联信息；命令只记录 hash。
+- 修复嵌套 `medium_explore` 派遣校验：canonical `access_mode=inspect` 即可通过，不再要求 legacy `readonly=true`。
+- inspect（只读）子代理开放服务端强制的 Shell 白名单：单条简单命令、工作区绑定、短前台窗口；覆盖只读 Git 证据链（自动注入 `--no-pager --no-optional-locks`）、进程/端口查询与文件哈希；写入、网络、构建、脚本解释器在派发前拒绝。
+- 仅暴露 `Shell`，不暴露 `AwaitShell/WriteShellStdin/ForceBackgroundShell`；提示词与工具描述同步更新为 `access_mode=inspect/act`。
 
-## 保留的 v0.0.68 行为
+## Task 卡片与历史投影
 
-- OpenAI Responses reasoning、`call_id`、typed SSE 和交错工具结果回放保持不变。
-- 根会话模型固定、Multitask worker 收口、角色化工具权限和工具集调整保持不变。
+- started/completed/checkpoint 三处统一由 canonical capability 推导 `TaskMode`：inspect → Plan，act → Agent。
+- `tool_call` history 保存原始 arguments；投影时优先用原始 arguments、其次用同 ID `tool_result.arguments` 回填既有已完成记录，均缺失时保持原值。
+
+## Subagent 终态
+
+- dispatch failure 区分两种语义：exec 未发布时补写 `SubagentRunState=ERROR` 后回收 reservation 并收口工具调用，消除 RUNNING 残留；exec 已发布后失败记录 `subagent_dispatch_uncertain`，保留 pending/lease 等待真实结果或 abort 确认。
+
+## 观测
+
+- 新增 `buildinfo.Commit`，由 Windows/macOS/Linux（含 Docker）构建注入，无法解析时为 `unknown`。
+- 观测日志 baseEvent 统一附加 `build_version/build_commit`；Shell 恢复元数据记录活动代次、恢复阶段与终态所有者。
 
 ## 发布资产
 
-- `cursor-byok-0.0.69-windows-amd64.zip`
-- `cursor-byok-0.0.69-macos-arm64.tar.gz`
-- `cursor-byok-0.0.69-macos-amd64.tar.gz`
+- `cursor-byok-0.0.70-windows-amd64.zip`
+- `cursor-byok-0.0.70-macos-arm64.tar.gz`
+- `cursor-byok-0.0.70-macos-amd64.tar.gz`
 - `update.json`

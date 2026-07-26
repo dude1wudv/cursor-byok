@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -276,13 +277,13 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 			if decision.SubagentRole != "simple_explore" && decision.SubagentRole != "medium_explore" {
 				return decision, fmt.Errorf("medium_explore nested Task task_role must be simple_explore or medium_explore")
 			}
-			readonlyValue, found := args["readonly"]
-			if !found {
-				readonlyValue, found = args["readOnly"]
+			// canonical access_mode 是授权真相；legacy readonly 只经由兼容解析层进入。
+			capability, err := runtimecore.ResolveTaskSubagentCapabilityFromArgs(args)
+			if err != nil {
+				return decision, err
 			}
-			readonly, ok := readonlyValue.(bool)
-			if !found || !ok || !readonly {
-				return decision, fmt.Errorf("medium_explore nested Task must explicitly set readonly=true")
+			if !capability.Readonly {
+				return decision, fmt.Errorf("medium_explore nested Task must use access_mode=%q", runtimecore.TaskAccessModeInspect)
 			}
 		default:
 			return decision, fmt.Errorf("only medium_explore or complex_debug subagents may dispatch nested Task calls")
@@ -804,6 +805,33 @@ func (service *Service) rollbackSubagentDispatch(stream *ActiveStream, pending r
 	service.removePendingSubagentLaunch(stream.ConversationID, pending.ToolCallID)
 	if err := service.closeSubagentDispatch(stream, pending, firstNonEmpty(strings.TrimSpace(reason), "dispatch_failed")); err != nil {
 		log.Printf("forwarder subagent rollback metadata failed request_id=%s tool_call_id=%s err=%v", strings.TrimSpace(stream.RequestID), strings.TrimSpace(pending.ToolCallID), err)
+	}
+}
+
+// recordSubagentDispatchUncertain 记录 exec 已发布后派发链路失败的不确定状态：
+// worker 可能已在运行，因此保留 pending/lease/batch，等待真实结果、lease 超时或 abort 确认收口。
+func (service *Service) recordSubagentDispatchUncertain(stream *ActiveStream, pending runtimecore.PendingExec, cause error) {
+	if service == nil || stream == nil {
+		return
+	}
+	causeText := ""
+	if cause != nil {
+		causeText = strings.TrimSpace(cause.Error())
+	}
+	values := map[string]any{
+		"tool_call_id":  strings.TrimSpace(pending.ToolCallID),
+		"exec_id":       strings.TrimSpace(pending.ExecID),
+		"message_id":    pending.MessageID,
+		"provider_pass": pending.ProviderPass,
+		"cause":         causeText,
+	}
+	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "subagent_dispatch_uncertain", values),
+	}); err != nil {
+		log.Printf("forwarder subagent dispatch uncertain metadata failed request_id=%s tool_call_id=%s err=%v", strings.TrimSpace(stream.RequestID), strings.TrimSpace(pending.ToolCallID), err)
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "subagent_dispatch_uncertain", values)
 	}
 }
 

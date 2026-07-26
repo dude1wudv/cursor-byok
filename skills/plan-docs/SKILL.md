@@ -56,8 +56,8 @@ metadata:
 ## 执行契约
 
 - `main`：短链路、共享文件、强耦合或无法证明并行安全的任务。
-- `subagent:explore`：只读调查，只回传结论、文件证据和风险；调用 `Task` 时必须使用 `subagent_type="explore"` 与 `readonly=true`。
-- `subagent:generalPurpose`：独立实现；调用 `Task` 时必须使用 `subagent_type="generalPurpose"` 与 `readonly=false`，要求在 `owned_paths` 内实际落盘并执行验收；普通实现优先显式选择 `model="gpt-5.6-terra"`，只有高难度推理、架构决策或高质量审查才升级为 `model="gpt-5.6-sol"`；`thinking_effort` 按任务需要选择 `disabled|low|medium|high|xhigh|max`，未指定时继承父运行配置；只有 `owned_paths` 不重叠且可独立验收时并行。
+- `subagent:explore`：只读调查，只回传结论、文件证据和风险；调用 `Task` 时必须使用 `subagent_type="explore"` 与 `access_mode="inspect"`。
+- `subagent:generalPurpose`：独立实现；调用 `Task` 时必须使用 `subagent_type="generalPurpose"` 与 `access_mode="act"`，要求在 `owned_paths` 内实际落盘并执行验收；普通实现优先显式选择 `model="gpt-5.6-terra"`，只有高难度推理、架构决策或高质量审查才升级为 `model="gpt-5.6-sol"`；`thinking_effort` 按任务需要选择 `disabled|low|medium|high|xhigh|max`，未指定时继承父运行配置；只有 `owned_paths` 不重叠且可独立验收时并行。
 - 同波直接 Subagent 不超过 4 个；超过时拆成批次或后续 Wave。
 - 父代理不重复执行已委派工作；等待同波全部结果后统一综合。
 - Task 启动不等于完成。只有结果返回且验收通过，任务才能完成。
