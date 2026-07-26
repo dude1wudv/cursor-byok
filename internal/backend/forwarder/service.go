@@ -1589,6 +1589,63 @@ func shouldOpenShellCircuit(circuit shellCircuitState, rejectionClass string) bo
 	return !circuit.Open && strings.TrimSpace(rejectionClass) != "" && rejectionClass != "command_parse"
 }
 
+// recordPreDispatchShellRejection 把 pre-dispatch 校验拒绝纳入与 terminal 拒绝相同的指纹熔断账本
+// （同一 metadata 事件、同一阈值、同一 event-sourced 状态），防止模型对同一确定性校验错误无限重试
+// ——曾造成 inspect 子代理同一 git 命令被连拒 11 次、UI 刷屏 "Skipped git"。
+// 返回熔断是否随本次记录开路。
+func (service *Service) recordPreDispatchShellRejection(stream *ActiveStream, invocation runtimecore.ToolInvocation, cause error) (bool, error) {
+	if service == nil || stream == nil || cause == nil {
+		return false, nil
+	}
+	reason := cause.Error()
+	rejectionClass := classifyShellRejection(reason)
+	commandHash, argsHash, cwdHash := shellInvocationHashes(invocation.ArgsJSON)
+	fingerprint := planContentHash(strings.Join([]string{"Shell", commandHash, cwdHash, rejectionClass}, "\x00"))
+	circuit := currentTurnShellCircuit(stream)
+	count := circuit.FingerprintHits[fingerprint] + 1
+	values := map[string]any{
+		"source":          "pre_dispatch_policy",
+		"provider_pass":   currentProviderPass(stream),
+		"model_call_id":   strings.TrimSpace(invocation.ModelCallID),
+		"tool_call_id":    strings.TrimSpace(invocation.CallID),
+		"rejection_class": rejectionClass,
+		"rejected_reason": sanitizeShellRejectedReason(reason),
+		"fingerprint":     fingerprint,
+		"tool_name":       "Shell",
+		"command_hash":    commandHash,
+		"args_hash":       argsHash,
+		"cwd_hash":        cwdHash,
+		"count":           count,
+	}
+	entries := []HistoryEntry{newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_rejection_fingerprint", values)}
+	openCircuit := shouldOpenShellCircuit(circuit, rejectionClass) && count >= shellCircuitFingerprintOpenLimit
+	if openCircuit {
+		entries = append(entries, newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_circuit_open", map[string]any{
+			"source":                "pre_dispatch_policy",
+			"provider_pass":         currentProviderPass(stream),
+			"model_call_id":         strings.TrimSpace(invocation.ModelCallID),
+			"tool_call_id":          strings.TrimSpace(invocation.CallID),
+			"rejection_class":       rejectionClass,
+			"rejected_reason":       sanitizeShellRejectedReason(reason),
+			"parse_rejection_count": circuit.ParseRejections + boolToInt(rejectionClass == "command_parse"),
+		}))
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_circuit_decision", map[string]any{
+			"source":            "pre_dispatch_policy",
+			"tool_call_id":      strings.TrimSpace(invocation.CallID),
+			"rejection_class":   rejectionClass,
+			"rejected_reason":   sanitizeShellRejectedReason(reason),
+			"circuit_open":      openCircuit || circuit.Open,
+			"command_hash":      commandHash,
+			"cwd_hash":          cwdHash,
+			"fingerprint_count": count,
+		})
+	}
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, entries)
+	return openCircuit, err
+}
+
 // shellCircuitFingerprintClasses 是允许触发开路、也允许被 reset 清零的稳定拒绝类别。
 var shellCircuitFingerprintClasses = []string{"permission", "policy", "capability"}
 
@@ -3034,6 +3091,14 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	if trimmedToolName == "Shell" && isChildConversationSubagentTypeName(subagentTypeName) && normalizeMode(mode) == agentv1.AgentMode_AGENT_MODE_PLAN {
 		rewritten, err := service.enforceReadonlyShellPolicy(stream, invocation)
 		if err != nil {
+			opened, recordErr := service.recordPreDispatchShellRejection(stream, invocation, err)
+			if recordErr != nil {
+				return recordErr
+			}
+			if opened {
+				// 第二次同指纹失败：附上明确纠正指引并开路，后续同类调用由 circuit.Open 分支拦截。
+				err = fmt.Errorf("%s. Do not retry this Shell command this turn — the same deterministic validation error will repeat and Shell is now blocked; use Read/Grep/Glob instead or report the blocker", err.Error())
+			}
 			return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
 		}
 		invocation = rewritten

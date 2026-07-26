@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"fmt"
 	"testing"
 
 	"cursor/gen/agentv1"
@@ -168,6 +169,57 @@ func TestShellSkippedAndStallDoNotReleaseQueueButLateExitDoes(t *testing.T) {
 	}
 	if toolResults != 1 {
 		t.Fatalf("late exit tool results=%d, want 1", toolResults)
+	}
+}
+
+func TestPreDispatchShellRejectionOpensCircuitOnRepeat(t *testing.T) {
+	// 复现实际观测到的空转：inspect 子代理同一命令因确定性校验错误被反复拒绝。
+	// 第 1 次仅记账，第 2 次同指纹开路，第 3 次起由 handleToolInvocation 的 circuit.Open 分支拦截。
+	broker := NewStreamBroker()
+	stream, err := broker.OpenStream("request", "conversation", 1, "model", "model", agentv1.AgentMode_AGENT_MODE_PLAN, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream.CheckpointConversation = &ConversationFile{ConversationID: "conversation", Mode: "plan", NextTurnSeq: 2, NextEntrySeq: 1}
+	service := &Service{
+		broker:    broker,
+		projector: NewHistoryProjector(),
+		debug:     newDebugRecorder("", broker, nil),
+	}
+	invocation := runtimecore.ToolInvocation{
+		CallID:   "tool-1",
+		ToolName: "Shell",
+		ArgsJSON: []byte(`{"command":"git push origin main","working_directory":"E:\\repo"}`),
+	}
+	cause := fmt.Errorf("inspect Shell git subcommand %q is not read-only", "push")
+
+	opened, err := service.recordPreDispatchShellRejection(stream, invocation, cause)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened {
+		t.Fatal("first deterministic rejection must not open the circuit")
+	}
+	if circuit := currentTurnShellCircuit(stream); circuit.Open {
+		t.Fatal("circuit open after a single rejection")
+	}
+
+	// 模型对同一命令仅微调无关参数重试：command/cwd 归一化后指纹一致。
+	invocation.CallID = "tool-2"
+	invocation.ArgsJSON = []byte(`{"command":"git  push origin main","working_directory":"e:/repo","description":"retry"}`)
+	opened, err = service.recordPreDispatchShellRejection(stream, invocation, cause)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opened {
+		t.Fatal("second identical-fingerprint rejection must open the circuit")
+	}
+	circuit := currentTurnShellCircuit(stream)
+	if !circuit.Open {
+		t.Fatal("event-sourced circuit state did not reflect the open")
+	}
+	if circuit.RejectionClass != "policy" {
+		t.Fatalf("rejection class = %q, want policy", circuit.RejectionClass)
 	}
 }
 
