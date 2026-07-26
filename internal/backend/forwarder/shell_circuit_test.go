@@ -326,6 +326,37 @@ func TestShellSupervisionSingleTimerPerExec(t *testing.T) {
 	}
 }
 
+// TestPendingBridgeCountGatesParallelToolResume 验证并行工具调用的恢复门：
+// 同一 pass 的多个 PendingExecs 全部终态前 pendingBridgeCount 保持非零
+// （actor 的 providerActionResume 分支据此推迟且只恢复一次 provider）。
+func TestPendingBridgeCountGatesParallelToolResume(t *testing.T) {
+	stream := &ActiveStream{PendingExecs: map[string]runtimecore.PendingExec{}}
+	first := runtimecore.PendingExec{MessageID: 61, ExecID: "exec-61", ToolCallID: "tool-61", ExecKind: "read", ProviderPass: 1}
+	second := runtimecore.PendingExec{MessageID: 62, ExecID: "exec-62", ToolCallID: "tool-62", ExecKind: "grep", ProviderPass: 1}
+	third := runtimecore.PendingExec{MessageID: 63, ExecID: "exec-63", ToolCallID: "tool-63", ExecKind: "shell", ProviderPass: 1}
+	for _, pending := range []runtimecore.PendingExec{first, second, third} {
+		stream.PendingExecs[pending.ExecID] = pending
+	}
+	if count := pendingBridgeCount(stream); count != 3 {
+		t.Fatalf("pendingBridgeCount = %d, want 3", count)
+	}
+	// 乱序完成：后派发的先终态。
+	markExecCompleted(stream, third)
+	markExecCompleted(stream, first)
+	if count := pendingBridgeCount(stream); count != 1 {
+		t.Fatalf("pendingBridgeCount after 2 completions = %d, want 1", count)
+	}
+	// 重复完成同一 exec 不得影响剩余计数。
+	markExecCompleted(stream, first)
+	if count := pendingBridgeCount(stream); count != 1 {
+		t.Fatalf("pendingBridgeCount after duplicate completion = %d, want 1", count)
+	}
+	markExecCompleted(stream, second)
+	if count := pendingBridgeCount(stream); count != 0 {
+		t.Fatalf("pendingBridgeCount after all completions = %d, want 0 (provider may resume)", count)
+	}
+}
+
 func TestShellStallRecoveryDoesNotCompletePending(t *testing.T) {
 	pending := runtimecore.PendingExec{MessageID: 9, ExecID: "exec-stalled", ToolCallID: "tool-stalled", ExecKind: "shell"}
 	stream := &ActiveStream{

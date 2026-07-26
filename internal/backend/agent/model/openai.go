@@ -319,6 +319,39 @@ func applyOpenAIFastMode(body map[string]any, enabled bool) {
 	}
 }
 
+// openAIModelSupportsParallelToolCalls 判断该模型是否已知支持 Responses parallel_tool_calls。
+// 仅对已验证的 gpt-5.6 系列开启；未知兼容端点保持原行为（不发送该字段）。
+func openAIModelSupportsParallelToolCalls(modelID string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(modelID)), "gpt-5.6")
+}
+
+// applyOpenAIParallelToolCalls 在 Responses 请求（含 input 且 tools 非空）上开启并行工具调用。
+// 不覆盖用户通过 extra params 显式设置的值。
+func applyOpenAIParallelToolCalls(body map[string]any, modelID string) {
+	if !openAIModelSupportsParallelToolCalls(modelID) {
+		return
+	}
+	if _, isResponsesRequest := body["input"]; !isResponsesRequest {
+		return
+	}
+	if _, explicit := body["parallel_tool_calls"]; explicit {
+		return
+	}
+	switch tools := body["tools"].(type) {
+	case []any:
+		if len(tools) == 0 {
+			return
+		}
+	case []map[string]any:
+		if len(tools) == 0 {
+			return
+		}
+	default:
+		return
+	}
+	body["parallel_tool_calls"] = true
+}
+
 func shouldExposeOpenAIResponsesImageGeneration(req StreamRequest, tools []map[string]any) bool {
 	if !openAIResponsesToolNamePresent(tools, "GenerateImage") {
 		return false
@@ -1060,6 +1093,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	}
 	applyOpenAIResponsesReasoningSummary(bodyMap)
 	applyOpenAIFastMode(bodyMap, req.FastMode)
+	applyOpenAIParallelToolCalls(bodyMap, modelID)
 	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 && shouldSendOpenAIMaxOutputTokens(modelID) {
 		bodyMap["max_output_tokens"] = req.MaxTokens
 	}
