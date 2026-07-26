@@ -158,6 +158,22 @@ type queuedShellDispatch struct {
 	Pending         runtimecore.PendingExec
 }
 
+// providerPassMetrics 收集单个 provider pass 的低敏结构化性能指标；
+// 只含计数、字节数、耗时与哈希级诊断，不含提示词、工具正文或密钥。
+type providerPassMetrics struct {
+	Pass                 int
+	StartedAt            time.Time
+	FirstOutputAt        time.Time
+	CompileMillis        int64
+	ReplayMessageCount   int
+	ToolCount            int
+	EstimatedInputTokens int64
+	ToolResultBytes      int64
+	ExternalWaitMillis   int64
+	ExpectedCacheRead    bool
+	FrontierHintPresent  bool
+}
+
 type shellExecTombstone struct {
 	MessageID   uint32
 	Generation  int
@@ -188,6 +204,8 @@ type ActiveStream struct {
 	ProviderContinuationCount                   int
 	ProviderIncomplete                          bool
 	ToolInvocationCount                         int
+	ProviderPassMetrics                         *providerPassMetrics
+	LastProviderDoneAt                          time.Time
 	ActorMailbox                                chan streamCommandEnvelope
 	ActorDone                                   chan struct{}
 	Phase                                       TurnPhase

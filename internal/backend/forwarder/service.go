@@ -1074,6 +1074,8 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.QueuedForegroundShells = nil
 	stream.ShellMaxConcurrent = service.shellMaxConcurrentPerRun()
 	stream.ShellExecTombstones = make(map[string]shellExecTombstone)
+	stream.ProviderPassMetrics = nil
+	stream.LastProviderDoneAt = time.Time{}
 	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
 	stream.PartialToolCallIDs = make(map[string]struct{})
 	stream.PartialToolCallArgs = make(map[string]string)
@@ -2699,11 +2701,13 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", err)
 	}
+	compileStartedAt := time.Now().UTC()
 	compiled, err := service.compiler.Compile(conversation, mode, latestUserText, modelName)
 	if err != nil {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", err)
 	}
+	compileMillis := time.Since(compileStartedAt).Milliseconds()
 	compiled = guardCompiledConversationForProvider(compiled)
 	if currentTurnShellCircuit(stream).Open {
 		context := newPromptContextMessage(
@@ -2778,6 +2782,32 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		ArtifactPaths:      &modeladapter.LLMArtifactPaths{},
 	}
 	providerRequest.ThinkingEffort = thinkingEffort
+	passStartedAt := time.Now().UTC()
+	toolResultBytes := int64(0)
+	for _, message := range compiled.Messages {
+		if strings.TrimSpace(message.Role) == "tool" {
+			toolResultBytes += int64(len(message.Content))
+		}
+	}
+	passMetrics := &providerPassMetrics{
+		Pass:                 currentPass,
+		StartedAt:            passStartedAt,
+		CompileMillis:        compileMillis,
+		ReplayMessageCount:   len(compiled.Messages),
+		ToolCount:            len(compiled.Tools),
+		EstimatedInputTokens: estimateCompiledPromptTokens(compiled),
+		ToolResultBytes:      toolResultBytes,
+	}
+	if conversation != nil && conversation.LatestRequestPrefix != nil {
+		passMetrics.FrontierHintPresent = strings.TrimSpace(conversation.LatestRequestPrefix.FrontierHash) != ""
+		passMetrics.ExpectedCacheRead = conversation.LatestRequestPrefix.ExpectedCacheRead
+	}
+	stream.mu.Lock()
+	if !stream.LastProviderDoneAt.IsZero() {
+		passMetrics.ExternalWaitMillis = passStartedAt.Sub(stream.LastProviderDoneAt).Milliseconds()
+	}
+	stream.ProviderPassMetrics = passMetrics
+	stream.mu.Unlock()
 	service.debug.LogProvider(context.Background(), requestID, conversationID, "provider_request_prepared", map[string]any{
 		"model_call_id":          strings.TrimSpace(modelCallID),
 		"provider_pass":          currentPass,

@@ -70,11 +70,11 @@ const (
 	streamTimerNonStreamingRecovery streamTimerKind = "non_streaming_recovery"
 	// streamTimerShellSupervision 是每个 shell exec 唯一的监督定时器：
 	// foreground 截止与 skipped/transport grace 共用同一 key，重新安排即替换。
-	streamTimerShellSupervision streamTimerKind = "shell_supervision"
-	streamTimerSubagentResult       streamTimerKind = "subagent_result"
-	streamTimerExecResult           streamTimerKind = "exec_result"
-	streamTimerInteractionResult    streamTimerKind = "interaction_result"
-	streamTimerOrphanCancel         streamTimerKind = "orphan_cancel"
+	streamTimerShellSupervision  streamTimerKind = "shell_supervision"
+	streamTimerSubagentResult    streamTimerKind = "subagent_result"
+	streamTimerExecResult        streamTimerKind = "exec_result"
+	streamTimerInteractionResult streamTimerKind = "interaction_result"
+	streamTimerOrphanCancel      streamTimerKind = "orphan_cancel"
 )
 
 type streamProviderEvent struct {
@@ -575,6 +575,13 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 	}
 	service.renewParentSubagentLeaseFromChild(stream, event)
 	stream.mu.Lock()
+	if stream.ProviderPassMetrics != nil && stream.ProviderPassMetrics.FirstOutputAt.IsZero() {
+		switch event.Kind {
+		case modeladapter.ModelEventKindTurnFinished, modeladapter.ModelEventKindProviderError:
+		default:
+			stream.ProviderPassMetrics.FirstOutputAt = time.Now().UTC()
+		}
+	}
 	requestID := stream.RequestID
 	conversationID := stream.ConversationID
 	turnSeq := stream.TurnSeq
@@ -1022,6 +1029,10 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 	finishReason := stream.ProviderFinishReason
 	providerIncomplete := stream.ProviderIncomplete
 	usage := stream.ProviderUsage
+	passMetrics := stream.ProviderPassMetrics
+	stream.ProviderPassMetrics = nil
+	stream.LastProviderDoneAt = time.Now().UTC()
+	toolInvocationCount := stream.ToolInvocationCount
 	hadToolInvocation := stream.ToolInvocationCount > 0
 	partialToolCount := len(stream.PartialToolCallIDs)
 	pendingToolSideEffectCount := len(stream.PendingExecs) + len(stream.PendingInteractions)
@@ -1046,6 +1057,37 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 	status := stream.Status
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
+
+	if passMetrics != nil && service.debug != nil {
+		now := time.Now().UTC()
+		values := map[string]any{
+			"provider_pass":          passMetrics.Pass,
+			"model_call_id":          strings.TrimSpace(modelCallID),
+			"compile_ms":             passMetrics.CompileMillis,
+			"replay_message_count":   passMetrics.ReplayMessageCount,
+			"tool_count":             passMetrics.ToolCount,
+			"estimated_input_tokens": passMetrics.EstimatedInputTokens,
+			"tool_result_bytes":      passMetrics.ToolResultBytes,
+			"external_wait_ms":       passMetrics.ExternalWaitMillis,
+			"pass_duration_ms":       now.Sub(passMetrics.StartedAt).Milliseconds(),
+			"tool_invocations":       toolInvocationCount,
+			"parallel_width":         pendingToolSideEffectCount,
+			"finish_reason":          strings.TrimSpace(finishReason),
+			"incomplete":             providerIncomplete,
+			"usage_present":          usage.UsagePresent,
+			"input_tokens":           usage.InputTokens,
+			"output_tokens":          usage.OutputTokens,
+			"cache_read_tokens":      usage.CacheReadTokens,
+			"cache_write_tokens":     usage.CacheWriteTokens,
+			"expected_cache_read":    passMetrics.ExpectedCacheRead,
+			"frontier_hint_present":  passMetrics.FrontierHintPresent,
+			"provider_error_present": payload.Err != nil,
+		}
+		if !passMetrics.FirstOutputAt.IsZero() {
+			values["ttft_ms"] = passMetrics.FirstOutputAt.Sub(passMetrics.StartedAt).Milliseconds()
+		}
+		service.debug.LogRuntime(context.Background(), requestID, conversationID, "provider_pass_metrics", values)
+	}
 
 	if errors.Is(payload.Err, errProviderLoopInterrupted) || isTerminalStreamStatus(status) {
 		return nil
