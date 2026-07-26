@@ -1,3 +1,36 @@
+# Cursor助手 v0.0.72
+
+本版本修复 "Skipped git" 刷屏的真正根因（v0.0.70 inspect 只读 Shell 白名单在 pre-dispatch 阶段拒绝合法命令）、按证据精简 v0.0.67-v0.0.70 累积的 shell 调度脚手架，并落地性能与并行工具调用改进。
+
+## inspect Shell 契约修复（"Skipped git" 根因）
+
+- schema 宣告过的可选字段不再触发拒绝：`notify_on_output` 静默剥离（inspect 本就强制短前台窗口）、非 auto `profile` 归一为 auto；同时从 inspect Shell schema 中删除这两个字段，模型不再填写。此前模型按 schema 带上 `notify_on_output` 即被整调用拒绝，UI 呈现为连环 "Skipped git" 且模型无限重试。
+- 白名单专用引号感知分词器：`"path with spaces"`、`--format='%h %s'` 等带引号参数可通过（工具描述本身要求为含空格路径加引号）；引号外仍拒绝管道/重定向/变量/命令替换。git 改写重组时为含空格词元恢复引号。
+- 只读 git 白名单扩充：`grep`（禁 `-O`/`--open-files-in-pager` pager 逃逸）、`describe`、`shortlog`、`cherry`、`count-objects`、`stash list`、`reflog [show]`。刻意排除 `config`（凭据面）、`worktree`（改状态）、`ls-remote`（网络）。
+- pre-dispatch 校验拒绝接入既有指纹熔断（同一 command/cwd/class 第 2 次即开路，第 3 次起被拦截，达 local-block 上限终止 provider 循环），确定性校验错误不再空转；开路时错误文本附明确纠正指引。熔断状态 event-sourced 于历史，reconnect 后不重启空转。
+
+## 调度层精简（按证据删除）
+
+- 删除 v0.0.69 的 skip 重试机制（`retrySkippedShell`、`ShellStartedExecs`、`ShellRetryCountByToolCall`）——v0.0.69 awaiting-start 门之后本地历史中真实客户端 skip 为零，该机制从未有效触发。
+- `ShellRecoveryCandidates` 影子表并入 `PendingExec`（`ShellRecoveryState/StateAt/Reason/Generation`），消除双账本交叉校验；每个 exec 只保留一支监督定时器（`shell_supervision`，同 key 重排即替换）。
+- 保留经证实必要的机制：容量池 + FIFO、awaiting-start 门、活动代次、两阶段 abort（绝不合成成功）、tombstone 去重。无候选登记时本地收口仍拒绝执行。
+
+## 并行工具调用
+
+- OpenAI Responses：gpt-5.6 系列且 tools 非空时发送 `parallel_tool_calls: true`；未知兼容端点不发送；extra params 显式设置优先。
+- Claude 无需请求变更（Anthropic 默认允许并行 tool_use）：新增适配器回归测试锁定"一条 assistant 消息 N 个 tool_use → N 个独立事件、乱序 stop 参数互不串扰"，以及 forwarder 恢复门测试（同 pass 多 PendingExecs 全终态才恢复一次）。
+- Grep/Ls 工具描述补齐批量调用指引（全模式变体），独立只读检查在同一回复内批量发出。
+
+## 上下文成本与缓存稳定
+
+- 回放上限收紧：Read 24KiB、Grep/Glob/Ls 16KiB、Shell 32KiB、WebFetch/MCP 24KiB（Glob/Ls 此前无上限）。
+- 单回合 512KiB 回放预算：通过只前进的 `replay_budget_boundary` 持久化边界实现——最新 8 个结果保持正常额度，更早结果投影时压缩至 4KiB；历史文件保存完整事实，回放跨 pass 逐字节一致，不复现 v0.0.68 latest-only 击穿 prompt cache 的老问题。
+- 自动压缩新增 55% 窗口性能软阈值 + 20% 窗口再增长迟滞（`SoftCompactionBaselineTokens` 持久化）；原接近硬上限的防溢出触发保留。
+
+## 性能观测
+
+- 每个 provider pass 结束输出 `provider_pass_metrics` 结构化低敏指标：编译耗时、回放消息数、估算/实际 tokens、工具结果字节、TTFT、pass 时长、外部工具等待、工具数量、并行宽度、cache read/write tokens、终态；含 Anthropic `expected_cache_read`/前缀 hint 诊断。日志不含提示词、工具正文或密钥。
+
 # Cursor助手 v0.0.71
 
 本版本集中修复 Anthropic/Claude 适配链路的兼容缺陷：思考中对话提前结束、历史回放隐性 400、Plan 卡片不出现、非 Shell 工具调用永久卡死，以及 Grep 回放截断的数字矛盾与过度丢弃。
