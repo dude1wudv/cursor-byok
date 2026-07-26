@@ -254,16 +254,17 @@ type PendingExec struct {
 	LastShellActivityAt time.Time
 	// ShellActivityGeneration 在每次收到 Start/stdout/stderr 真实活动时递增，用于失效旧的恢复候选与定时器。
 	ShellActivityGeneration int
-	// ShellRecoveryPhase 记录 foreground 恢复阶段：空表示未进入恢复，abort_requested 表示已向客户端请求中止。
-	ShellRecoveryPhase string
-	// ShellAbortRequestedAt 记录 foreground 恢复第一阶段发出 abort 控制消息的时间。
-	ShellAbortRequestedAt time.Time
-	// LastShellHeartbeatAt 记录最近一次 shell heartbeat 到达时间。
-	LastShellHeartbeatAt time.Time
+	// ShellRecoveryState 记录 shell 异常收口状态机：0 未进入恢复，1 已登记恢复候选，2 已向客户端请求中止。
+	// 状态直接挂在 PendingExec 上，取代旧的 ShellRecoveryCandidates 影子表。
+	ShellRecoveryState int8
+	// ShellRecoveryStateAt 记录最近一次恢复状态迁移时间。
+	ShellRecoveryStateAt time.Time
+	// ShellRecoveryReason 记录进入恢复的原因（foreground_deadline / transport_closed / skipped）。
+	ShellRecoveryReason string
+	// ShellRecoveryGeneration 保存登记恢复候选时的 ShellActivityGeneration，用于失效旧定时器。
+	ShellRecoveryGeneration int
 	// ShellForegroundDeadline 表示前台 shell 预计最晚应收到终态的时间点。
 	ShellForegroundDeadline time.Time
-	// ShellRecoveryScheduled 标记是否已经为该 shell 安排了异常收口协程。
-	ShellRecoveryScheduled bool
 	// StdoutBuffer 保存当前 shell 已累计的 stdout 文本。
 	StdoutBuffer string
 	// StderrBuffer 保存当前 shell 已累计的 stderr 文本。

@@ -1073,9 +1073,6 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.ShellAwaitingStartExecID = ""
 	stream.QueuedForegroundShells = nil
 	stream.ShellMaxConcurrent = service.shellMaxConcurrentPerRun()
-	stream.ShellStartedExecs = make(map[string]struct{})
-	stream.ShellRetryCountByToolCall = make(map[string]int)
-	stream.ShellRecoveryCandidates = make(map[string]shellRecoveryCandidate)
 	stream.ShellExecTombstones = make(map[string]shellExecTombstone)
 	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
 	stream.PartialToolCallIDs = make(map[string]struct{})
@@ -1403,12 +1400,12 @@ func (service *Service) recordShellHandshakeEvent(stream *ActiveStream, pending 
 	if service == nil || stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
 		return
 	}
-	active, queued, limit, awaiting, started, retryCount := shellDispatchSnapshot(stream, pending.ExecID)
+	active, queued, limit, awaiting, started := shellDispatchSnapshot(stream, pending.ExecID)
 	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
 	values := map[string]any{
 		"tool_call_id": pending.ToolCallID, "exec_id": pending.ExecID, "message_id": pending.MessageID,
 		"stream_state": pending.StreamState, "start_seen": started, "awaiting_start": awaiting,
-		"active": active, "queued": queued, "limit": limit, "retry_count": retryCount,
+		"active": active, "queued": queued, "limit": limit,
 		"command_hash": commandHash, "args_hash": argsHash, "cwd_hash": cwdHash,
 	}
 	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
@@ -1430,18 +1427,14 @@ func (service *Service) recordShellSkippedEvent(stream *ActiveStream, pending ru
 	if service == nil || stream == nil {
 		return
 	}
-	active, queued, limit, awaiting, started, retryCount := shellDispatchSnapshot(stream, pending.ExecID)
+	active, queued, limit, awaiting, started := shellDispatchSnapshot(stream, pending.ExecID)
 	reason, rejectionClass := shellTerminalRejection(message)
 	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
-	recovery := "rejected"
-	if pending.FirstChunkAt.IsZero() && active > 1 && retryCount == 0 {
-		recovery = "retry_scheduled"
-	}
 	values := map[string]any{
 		"tool_call_id": pending.ToolCallID, "exec_id": pending.ExecID, "message_id": pending.MessageID,
 		"stream_state": pending.StreamState, "start_seen": started, "awaiting_start": awaiting,
-		"active": active, "queued": queued, "limit": limit, "retry_count": retryCount,
-		"rejection_class": rejectionClass, "rejected_reason": sanitizeShellRejectedReason(reason), "recovery": recovery,
+		"active": active, "queued": queued, "limit": limit,
+		"rejection_class": rejectionClass, "rejected_reason": sanitizeShellRejectedReason(reason), "recovery": "rejected",
 		"command_hash": commandHash, "args_hash": argsHash, "cwd_hash": cwdHash,
 	}
 	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
@@ -3544,10 +3537,6 @@ func (service *Service) applyExecProgress(stream *ActiveStream, pending runtimec
 		if current.FirstChunkAt.IsZero() {
 			current.FirstChunkAt = now
 		}
-		if stream.ShellStartedExecs == nil {
-			stream.ShellStartedExecs = make(map[string]struct{})
-		}
-		stream.ShellStartedExecs[current.ExecID] = struct{}{}
 		current.StreamState = "started"
 		current.LastShellActivityAt = now
 	case *agentv1.ShellStream_Backgrounded:
@@ -3581,7 +3570,6 @@ func (service *Service) applyExecControlProgress(stream *ActiveStream, pending r
 	switch message.GetMessage().(type) {
 	case *agentv1.ExecClientControlMessage_Heartbeat:
 		current.LastShellActivityAt = now
-		current.LastShellHeartbeatAt = now
 	case *agentv1.ExecClientControlMessage_StreamClose:
 		current.LastShellActivityAt = now
 	case *agentv1.ExecClientControlMessage_Throw:
@@ -4965,7 +4953,6 @@ func markExecCompleted(stream *ActiveStream, pending runtimecore.PendingExec) {
 
 	stream.mu.Lock()
 	delete(stream.PendingExecs, pending.ExecID)
-	delete(stream.ShellRecoveryCandidates, pending.ExecID)
 	if strings.TrimSpace(pending.ExecKind) == "shell" {
 		if stream.ShellExecTombstones == nil {
 			stream.ShellExecTombstones = make(map[string]shellExecTombstone)

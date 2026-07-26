@@ -68,8 +68,9 @@ const (
 	streamTimerProviderResume       streamTimerKind = "provider_resume"
 	streamTimerProviderRetry        streamTimerKind = "provider_retry"
 	streamTimerNonStreamingRecovery streamTimerKind = "non_streaming_recovery"
-	streamTimerShellForeground      streamTimerKind = "shell_foreground"
-	streamTimerShellTransportClose  streamTimerKind = "shell_transport_close"
+	// streamTimerShellSupervision 是每个 shell exec 唯一的监督定时器：
+	// foreground 截止与 skipped/transport grace 共用同一 key，重新安排即替换。
+	streamTimerShellSupervision streamTimerKind = "shell_supervision"
 	streamTimerSubagentResult       streamTimerKind = "subagent_result"
 	streamTimerExecResult           streamTimerKind = "exec_result"
 	streamTimerInteractionResult    streamTimerKind = "interaction_result"
@@ -1406,9 +1407,7 @@ func (service *Service) handleTimerEvent(stream *ActiveStream, payload *streamTi
 			return nil
 		}
 		return service.recoverNonStreamingExecAfterStreamClose(stream, current)
-	case streamTimerShellForeground:
-		return service.recoverShellWithoutTerminalIfNeeded(stream, payload.ExecID, payload.MessageID, shellRecoveryReasonForegroundDeadline)
-	case streamTimerShellTransportClose:
+	case streamTimerShellSupervision:
 		return service.recoverShellWithoutTerminalIfNeeded(stream, payload.ExecID, payload.MessageID, payload.Reason)
 	case streamTimerExecResult:
 		return service.recoverExecAfterResultTimeout(stream, payload.ExecID, payload.MessageID)

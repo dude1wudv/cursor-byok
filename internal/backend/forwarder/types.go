@@ -157,16 +157,6 @@ type queuedShellDispatch struct {
 	Pending         runtimecore.PendingExec
 }
 
-type shellRecoveryCandidate struct {
-	ExecID     string
-	MessageID  uint32
-	Generation int
-	// ActivityGeneration 锚定候选创建时的 shell 活动代次；新活动到达后旧候选自动失效。
-	ActivityGeneration int
-	Reason             string
-	ObservedAt         time.Time
-}
-
 type shellExecTombstone struct {
 	MessageID   uint32
 	Generation  int
@@ -228,9 +218,6 @@ type ActiveStream struct {
 	ShellAwaitingStartExecID    string
 	QueuedForegroundShells      []queuedShellDispatch
 	ShellMaxConcurrent          int
-	ShellStartedExecs           map[string]struct{}
-	ShellRetryCountByToolCall   map[string]int
-	ShellRecoveryCandidates     map[string]shellRecoveryCandidate
 	ShellExecTombstones         map[string]shellExecTombstone
 	PendingInteractions         map[string]runtimecore.PendingInteraction
 	PartialToolCallIDs          map[string]struct{}

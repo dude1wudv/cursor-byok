@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"cursor/gen/agentv1"
@@ -232,6 +233,96 @@ func TestSelectPendingExecStrictRejectsMixedIDs(t *testing.T) {
 	}
 	if pending, found, mismatch := selectPendingExecStrict(first.ExecID, first.MessageID, stream); !found || mismatch || pending.ToolCallID != first.ToolCallID {
 		t.Fatalf("matching IDs pending=%#v found=%t mismatch=%t", pending, found, mismatch)
+	}
+}
+
+func TestShellRecoveryStateTransitions(t *testing.T) {
+	broker := NewStreamBroker()
+	stream, err := broker.OpenStream("request", "conversation", 1, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream.CheckpointConversation = &ConversationFile{ConversationID: "conversation", Mode: "agent", NextTurnSeq: 2, NextEntrySeq: 1}
+	pending := runtimecore.PendingExec{
+		MessageID: 41, ExecID: "exec-41", ConversationID: "conversation", ToolCallID: "tool-41",
+		ExecKind: "shell", ProviderPass: 1, ArgsJSON: []byte(`{"command":"git status"}`),
+	}
+	stream.PendingExecs[pending.ExecID] = pending
+	service := &Service{broker: broker, projector: NewHistoryProjector(), debug: newDebugRecorder("", broker, nil)}
+
+	// none → candidate（skipped 信号）
+	service.scheduleShellRecoveryCandidate(stream.RequestID, pending, shellRecoveryReasonSkipped)
+	current := stream.PendingExecs[pending.ExecID]
+	if current.ShellRecoveryState != shellRecoveryStateCandidate || current.ShellRecoveryReason != shellRecoveryReasonSkipped {
+		t.Fatalf("candidate transition state=%d reason=%q", current.ShellRecoveryState, current.ShellRecoveryReason)
+	}
+
+	// candidate → none（真实活动复位并递增代次）
+	refreshed := service.refreshShellForegroundActivity(stream, current)
+	if refreshed.ShellRecoveryState != shellRecoveryStateNone || refreshed.ShellActivityGeneration != current.ShellActivityGeneration+1 {
+		t.Fatalf("activity reset state=%d generation=%d", refreshed.ShellRecoveryState, refreshed.ShellActivityGeneration)
+	}
+
+	// 陈旧收口调用（活动之后）必须 no-op
+	if err := service.recoverShellWithoutTerminal(stream, current, shellRecoveryReasonSkipped); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stream.PendingExecs[pending.ExecID]; !ok {
+		t.Fatal("stale recovery closed a refreshed shell")
+	}
+
+	// none → abort_requested → 本地超时收口
+	current = stream.PendingExecs[pending.ExecID]
+	if err := service.requestShellAbortBeforeRecovery(stream, current); err != nil {
+		t.Fatal(err)
+	}
+	current = stream.PendingExecs[pending.ExecID]
+	if current.ShellRecoveryState != shellRecoveryStateAbortRequested {
+		t.Fatalf("abort transition state=%d", current.ShellRecoveryState)
+	}
+	if err := service.recoverShellWithoutTerminal(stream, current, shellRecoveryReasonForegroundDeadline); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stream.PendingExecs[pending.ExecID]; ok {
+		t.Fatal("foreground recovery after abort did not close the exec")
+	}
+	timeoutResults := 0
+	for _, entry := range stream.CheckpointConversation.Entries {
+		if entry.Kind == "tool_result" && entry.ToolCallID == pending.ToolCallID {
+			timeoutResults++
+		}
+	}
+	if timeoutResults != 1 {
+		t.Fatalf("timeout tool results = %d, want 1", timeoutResults)
+	}
+}
+
+func TestShellSupervisionSingleTimerPerExec(t *testing.T) {
+	broker := NewStreamBroker()
+	stream, err := broker.OpenStream("request", "conversation", 1, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := runtimecore.PendingExec{
+		MessageID: 51, ExecID: "exec-51", ConversationID: "conversation", ToolCallID: "tool-51",
+		ExecKind: "shell", ProviderPass: 1, ArgsJSON: []byte(`{"command":"git status"}`),
+	}
+	stream.PendingExecs[pending.ExecID] = pending
+	service := &Service{broker: broker, projector: NewHistoryProjector(), debug: newDebugRecorder("", broker, nil)}
+
+	service.scheduleShellForegroundRecovery(stream.RequestID, pending)
+	service.scheduleShellRecoveryCandidate(stream.RequestID, pending, shellRecoveryReasonTransportClosed)
+
+	stream.mu.Lock()
+	shellTimers := 0
+	for key := range stream.TimerTokens {
+		if strings.Contains(key, pending.ExecID) {
+			shellTimers++
+		}
+	}
+	stream.mu.Unlock()
+	if shellTimers != 1 {
+		t.Fatalf("shell supervision timers for one exec = %d, want exactly 1", shellTimers)
 	}
 }
 

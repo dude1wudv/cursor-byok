@@ -25,7 +25,7 @@ func shellExecutionBegan(message *agentv1.ExecClientMessage) bool {
 	}
 }
 
-func shellDispatchSnapshot(stream *ActiveStream, execID string) (active int, queued int, limit int, awaitingStart bool, started bool, retryCount int) {
+func shellDispatchSnapshot(stream *ActiveStream, execID string) (active int, queued int, limit int, awaitingStart bool, started bool) {
 	if stream == nil {
 		return
 	}
@@ -35,9 +35,11 @@ func shellDispatchSnapshot(stream *ActiveStream, execID string) (active int, que
 	queued = len(stream.QueuedForegroundShells)
 	limit = shellDispatchLimitLocked(stream)
 	awaitingStart = stream.ShellAwaitingStartExecID == strings.TrimSpace(execID)
-	_, started = stream.ShellStartedExecs[strings.TrimSpace(execID)]
 	if pending, ok := stream.PendingExecs[strings.TrimSpace(execID)]; ok {
-		retryCount = stream.ShellRetryCountByToolCall[strings.TrimSpace(pending.ToolCallID)]
+		switch strings.TrimSpace(pending.StreamState) {
+		case "started", "streaming":
+			started = true
+		}
 	}
 	return
 }
@@ -68,7 +70,6 @@ func activateForegroundShellLocked(stream *ActiveStream, pending runtimecore.Pen
 	pending.OpenedAt = now
 	pending.LastShellActivityAt = now
 	pending.ShellForegroundDeadline = now.Add(shellForegroundTimeoutDuration(pending.ArgsJSON) + shellTerminalRecoveryGrace)
-	pending.ShellRecoveryScheduled = false
 	if stream.PendingExecs == nil {
 		stream.PendingExecs = make(map[string]runtimecore.PendingExec)
 	}
@@ -100,7 +101,6 @@ func reserveForegroundShellDispatch(stream *ActiveStream, message *agentv1.Agent
 	pending.OpenedAt = time.Time{}
 	pending.LastShellActivityAt = time.Time{}
 	pending.ShellForegroundDeadline = time.Time{}
-	pending.ShellRecoveryScheduled = false
 	stream.PendingExecs[pending.ExecID] = pending
 	stream.QueuedForegroundShells = append(stream.QueuedForegroundShells, queuedShellDispatch{
 		Message:         message,
@@ -155,7 +155,6 @@ func releaseForegroundShellDispatches(stream *ActiveStream, completed runtimecor
 		return nil
 	}
 	delete(stream.ActiveForegroundShells, completed.ExecID)
-	delete(stream.ShellStartedExecs, completed.ExecID)
 	if stream.ShellAwaitingStartExecID == completed.ExecID {
 		stream.ShellAwaitingStartExecID = ""
 	}
