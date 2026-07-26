@@ -10,17 +10,54 @@ import (
 const (
 	projectedReplayKiB = 1024
 
-	projectedReadReplayLimit       = 64 * projectedReplayKiB
-	projectedShellReplayLimit      = 128 * projectedReplayKiB
-	projectedShellStreamLimit      = 16 * projectedReplayKiB
-	projectedShellInterleavedLimit = 32 * projectedReplayKiB
-	projectedGrepReplayLimit       = 32 * projectedReplayKiB
+	projectedReadReplayLimit       = 24 * projectedReplayKiB
+	projectedShellReplayLimit      = 32 * projectedReplayKiB
+	projectedShellStreamLimit      = 8 * projectedReplayKiB
+	projectedShellInterleavedLimit = 16 * projectedReplayKiB
+	projectedGrepReplayLimit       = 16 * projectedReplayKiB
+	projectedListReplayLimit       = 16 * projectedReplayKiB
 	projectedEditReplayLimit       = 32 * projectedReplayKiB
 	projectedPatchEditReplayLimit  = 4 * projectedReplayKiB
-	projectedWebFetchReplayLimit   = 32 * projectedReplayKiB
+	projectedWebFetchReplayLimit   = 24 * projectedReplayKiB
 	projectedWebSearchReplayLimit  = 16 * projectedReplayKiB
-	projectedMcpReplayLimit        = 32 * projectedReplayKiB
+	projectedMcpReplayLimit        = 24 * projectedReplayKiB
+
+	// replayBudgetTotalBytes 是单回合工具结果回放的软预算；超限时通过持久化的
+	// replay_budget_boundary 边界把更早的结果压缩到 replayBudgetCompressedLimit。
+	// 边界只前进（单调），因此同一历史在每个 provider pass 的回放字节保持一致，
+	// 不会像滑动窗口那样每个 pass 重写前缀、击穿 prompt cache。
+	replayBudgetTotalBytes      = 512 * projectedReplayKiB
+	replayBudgetKeepFullResults = 8
+	replayBudgetCompressedLimit = 4 * projectedReplayKiB
 )
+
+// replayBudgetBoundarySeq 返回历史中最新一条 replay_budget_boundary 元数据的边界 seq；
+// 边界之内（seq <= boundary）的 tool_result 回放时压缩到 replayBudgetCompressedLimit。
+// 历史文件本身保存完整事实，压缩只作用于模型回放。
+func replayBudgetBoundarySeq(entries []HistoryEntry) int64 {
+	boundary := int64(0)
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if json.Unmarshal(entry.Payload, &payload) != nil || strings.TrimSpace(payload.Type) != "replay_budget_boundary" {
+			continue
+		}
+		if seq, ok := payload.Value["boundary_seq"].(float64); ok && int64(seq) > boundary {
+			boundary = int64(seq)
+		}
+	}
+	return boundary
+}
+
+// applyReplayBudgetCompression 对预算边界内的旧结果强制压缩额度（UTF-8 安全，带截断标记）。
+func applyReplayBudgetCompression(toolName string, content string) string {
+	if len(content) <= replayBudgetCompressedLimit {
+		return content
+	}
+	return truncateProjectedReplayText(firstNonEmpty(strings.TrimSpace(toolName), "tool"), content, replayBudgetCompressedLimit)
+}
 
 func limitProjectedToolResultReplay(toolName string, content string, resultText string, fromStoredToolCall bool, historical bool) string {
 	if compacted, ok := compactProjectedGenerateImageResultReplay(toolName, content, resultText); ok {
@@ -71,6 +108,8 @@ func projectedToolReplayLimit(toolName string) (int, bool) {
 		return projectedShellReplayLimit, true
 	case "Grep":
 		return projectedGrepReplayLimit, true
+	case "Glob", "Ls":
+		return projectedListReplayLimit, true
 	case "PatchEdit", "PatchEditLines", "PatchEditSpan":
 		return projectedPatchEditReplayLimit, true
 	case "Edit", "Write":

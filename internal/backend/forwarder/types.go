@@ -38,6 +38,7 @@ type ConversationFile struct {
 	AutoCompactionReserveTokens     int64                                 `json:"auto_compaction_reserve_tokens,omitempty"`
 	AutoCompactionTriggeredAt       string                                `json:"auto_compaction_triggered_at,omitempty"`
 	AutoCompactionSourceModelCallID string                                `json:"auto_compaction_source_model_call_id,omitempty"`
+	SoftCompactionBaselineTokens    int64                                 `json:"soft_compaction_baseline_tokens,omitempty"`
 	CurrentPlanText                 string                                `json:"current_plan_text,omitempty"`
 	CurrentPlans                    map[string]*agentv1.PlanRegistryEntry `json:"current_plans,omitempty"`
 	CurrentTodos                    []*agentv1.TodoItem                   `json:"current_todos,omitempty"`

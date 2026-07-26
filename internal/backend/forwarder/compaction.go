@@ -24,6 +24,10 @@ import (
 const (
 	compactionAutoReserveTokens      = 10000
 	compactionTriggerRemainingTokens = 8192
+	// compactionSoftUsageFraction 是性能软阈值：上下文超过窗口 55% 即触发压缩，
+	// 不必等到接近硬上限。软压缩后需再增长 compactionSoftRearmFraction 窗口才允许再次触发。
+	compactionSoftUsageFraction = 0.55
+	compactionSoftRearmFraction = 0.20
 	compactionPreferredTailTurns     = 4
 	compactionMinimumTailTurns       = 1
 	compactionReserveFloorTokens     = 8192
@@ -162,7 +166,8 @@ func (service *Service) buildAutoCompactionPlan(stream *ActiveStream, conversati
 		int64(conversation.TokenDetailsUsedTokens),
 	)
 	pendingExceeded := conversation.AutoCompactionPending && contextTokens > 0 && contextTokens > budgetTokens
-	if !pendingExceeded && !preflightExceeded {
+	softExceeded := compactionSoftThresholdExceeded(conversation, contextTokens, contextWindowSize)
+	if !pendingExceeded && !preflightExceeded && !softExceeded {
 		return nil, nil
 	}
 	usagePercent := 0.0
@@ -198,6 +203,23 @@ func (service *Service) buildAutoCompactionPlan(stream *ActiveStream, conversati
 		}
 	}
 	return plan, nil
+}
+
+// compactionSoftThresholdExceeded 判定 55% 性能软阈值是否触发。
+// 迟滞：上次（软）压缩后的基线之上还需新增至少 20% 窗口，防止同回合反复触发。
+func compactionSoftThresholdExceeded(conversation *ConversationFile, contextTokens int64, contextWindowSize int64) bool {
+	if conversation == nil || contextTokens <= 0 || contextWindowSize <= 0 {
+		return false
+	}
+	softThreshold := int64(float64(contextWindowSize) * compactionSoftUsageFraction)
+	if contextTokens <= softThreshold {
+		return false
+	}
+	baseline := conversation.SoftCompactionBaselineTokens
+	if baseline <= 0 {
+		return true
+	}
+	return contextTokens-baseline >= int64(float64(contextWindowSize)*compactionSoftRearmFraction)
 }
 
 func (service *Service) resolveCompactionBaselineTokens(conversationID string, compiled CompiledConversation, conversation *ConversationFile) (int64, error) {
@@ -590,6 +612,8 @@ func (service *Service) applyCompactionPlan(stream *ActiveStream, conversationID
 			}
 			item.TokenDetailsUsedTokens = 0
 			clearConversationAutoCompactionState(item)
+			// 软阈值迟滞基线：只有再增长 compactionSoftRearmFraction 窗口才允许下一次软压缩。
+			item.SoftCompactionBaselineTokens = estimateCompiledPromptTokens(recompiled)
 			return nil
 		})
 		if err != nil {
@@ -611,6 +635,7 @@ func (service *Service) applyCompactionPlan(stream *ActiveStream, conversationID
 		appendEntriesInPlace(item, resetEntrySequences(replacementEntries))
 		item.TokenDetailsUsedTokens = 0
 		clearConversationAutoCompactionState(item)
+		item.SoftCompactionBaselineTokens = estimateCompiledPromptTokens(recompiled)
 		return nil
 	})
 	return err

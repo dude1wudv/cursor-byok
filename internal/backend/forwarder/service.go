@@ -2714,6 +2714,10 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		compiled.Messages = append(compiled.Messages, context.Message)
 		compiled.CompileSummary = strings.TrimSpace(compiled.CompileSummary + " latest_suffix=" + context.Source)
 	}
+	if budgetErr := service.maybeAdvanceReplayBudgetBoundary(stream, conversation); budgetErr != nil {
+		service.setTurnPhase(stream, TurnPhaseFailed)
+		return service.failStream(stream, "unknown", budgetErr)
+	}
 	if compacted, compactErr := service.maybeCompactBeforeProvider(stream, conversation, compiled); compactErr != nil {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", compactErr)
@@ -4941,6 +4945,54 @@ func pendingAssistantToolShape(pending runtimecore.PendingExec) (string, []byte,
 		}
 		return toolName, append([]byte(nil), pending.ArgsJSON...), true
 	}
+}
+
+// maybeAdvanceReplayBudgetBoundary 在 provider pass 之间检查单回合工具结果回放预算；
+// 超限时追加一条只前进的 replay_budget_boundary 元数据：最新 replayBudgetKeepFullResults 个
+// 结果保持正常回放额度，边界之内的更早结果压缩到 replayBudgetCompressedLimit。
+// 历史条目本身不改写（UI/审计/恢复保持完整事实）；每次边界前进只付一次 prompt-cache 前缀重置。
+func (service *Service) maybeAdvanceReplayBudgetBoundary(stream *ActiveStream, conversation *ConversationFile) error {
+	if service == nil || stream == nil || conversation == nil {
+		return nil
+	}
+	existingBoundary := replayBudgetBoundarySeq(conversation.Entries)
+	type resultRef struct {
+		seq   int64
+		bytes int
+	}
+	refs := make([]resultRef, 0, 16)
+	totalBytes := 0
+	for _, entry := range conversation.Entries {
+		if strings.TrimSpace(entry.Kind) != "tool_result" || entry.TurnSeq != stream.TurnSeq || entry.Seq <= 0 {
+			continue
+		}
+		refs = append(refs, resultRef{seq: entry.Seq, bytes: len(entry.Payload)})
+		if entry.Seq > existingBoundary {
+			totalBytes += len(entry.Payload)
+		}
+	}
+	if totalBytes <= replayBudgetTotalBytes || len(refs) <= replayBudgetKeepFullResults {
+		return nil
+	}
+	boundary := refs[len(refs)-replayBudgetKeepFullResults-1].seq
+	if boundary <= existingBoundary {
+		return nil
+	}
+	values := map[string]any{
+		"boundary_seq":           boundary,
+		"turn_seq":               stream.TurnSeq,
+		"results_total_bytes":    totalBytes,
+		"result_count":           len(refs),
+		"kept_full":              replayBudgetKeepFullResults,
+		"compressed_limit_bytes": replayBudgetCompressedLimit,
+	}
+	if service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "replay_budget_boundary", values)
+	}
+	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "replay_budget_boundary", values),
+	})
+	return err
 }
 
 // markExecCompleted 保留一个短时 tombstone，避免迟到的 transport-level control 被误判为协议错误。

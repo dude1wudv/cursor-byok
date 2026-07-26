@@ -30,6 +30,7 @@ func (projector *HistoryProjector) ProjectPromptReplay(conversation *Conversatio
 		return nil, nil
 	}
 	entries := replayablePromptProjectionEntries(conversation.Entries)
+	budgetBoundarySeq := replayBudgetBoundarySeq(conversation.Entries)
 	messages := make([]modeladapter.Message, 0, len(entries)*2)
 	seenToolCalls := make(map[string]struct{})
 	openToolCalls := make(map[string]struct{})
@@ -140,6 +141,7 @@ func (projector *HistoryProjector) ProjectPromptReplay(conversation *Conversatio
 				return nil, fmt.Errorf("decode tool_result entry: %w", err)
 			}
 			historicalToolResult := isHistoricalReplayToolResult(conversation, entry)
+			budgetCompressed := budgetBoundarySeq > 0 && entry.Seq > 0 && entry.Seq <= budgetBoundarySeq
 			toolCallID := strings.TrimSpace(payload.ToolCallID)
 			if _, ok := seenToolCalls[toolCallID]; ok {
 				delete(openToolCalls, toolCallID)
@@ -169,15 +171,22 @@ func (projector *HistoryProjector) ProjectPromptReplay(conversation *Conversatio
 					if ok {
 						replayMessage.Name = toolName
 						replayMessage.Content = limitProjectedToolResultReplay(toolName, replayMessage.Content, payload.ResultText, true, historicalToolResult)
+						if budgetCompressed {
+							replayMessage.Content = applyReplayBudgetCompression(toolName, replayMessage.Content)
+						}
 						messages = append(messages, toModelMessage(replayMessage))
 						continue
 					}
+				}
+				content := limitProjectedToolResultReplay(toolName, payload.ResultText, "", false, historicalToolResult)
+				if budgetCompressed {
+					content = applyReplayBudgetCompression(toolName, content)
 				}
 				messages = append(messages, modeladapter.Message{
 					Role:       "tool",
 					Name:       toolName,
 					ToolCallID: toolCallID,
-					Content:    limitProjectedToolResultReplay(toolName, payload.ResultText, "", false, historicalToolResult),
+					Content:    content,
 				})
 				continue
 			}
@@ -207,6 +216,9 @@ func (projector *HistoryProjector) ProjectPromptReplay(conversation *Conversatio
 					if strings.TrimSpace(replay.Role) == "tool" {
 						toolName := firstNonEmpty(strings.TrimSpace(replay.Name), strings.TrimSpace(payload.ToolName))
 						replay.Content = limitProjectedToolResultReplay(toolName, replay.Content, payload.ResultText, true, historicalToolResult)
+						if budgetCompressed {
+							replay.Content = applyReplayBudgetCompression(toolName, replay.Content)
+						}
 					}
 					messages = append(messages, toModelMessage(replay))
 				}
@@ -251,7 +263,13 @@ func (projector *HistoryProjector) ProjectPromptReplay(conversation *Conversatio
 					Role:       "tool",
 					Name:       effectiveToolName,
 					ToolCallID: strings.TrimSpace(payload.ToolCallID),
-					Content:    limitProjectedToolResultReplay(payload.ToolName, payload.ResultText, "", false, historicalToolResult),
+					Content: func() string {
+						content := limitProjectedToolResultReplay(payload.ToolName, payload.ResultText, "", false, historicalToolResult)
+						if budgetCompressed {
+							content = applyReplayBudgetCompression(effectiveToolName, content)
+						}
+						return content
+					}(),
 				},
 			)
 		}
