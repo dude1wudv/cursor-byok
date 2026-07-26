@@ -280,6 +280,18 @@ func (ticket appendSequenceTicket) DiscardEpochCandidate() {
 	ticket.request.discard(ticket.state)
 }
 
+func (ticket appendSequenceTicket) CurrentSnapshot() (uint64, int64) {
+	if ticket.request == nil {
+		return 0, 0
+	}
+	ticket.request.mu.Lock()
+	defer ticket.request.mu.Unlock()
+	if ticket.request.current == nil {
+		return 0, 0
+	}
+	return ticket.request.current.epoch, ticket.request.current.currentNext()
+}
+
 func (ticket appendSequenceTicket) Snapshot() (uint64, int64, string) {
 	if ticket.state == nil {
 		return 0, 0, ticket.disposition

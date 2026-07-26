@@ -620,6 +620,9 @@ func (service *Service) observeMissingShellExecClientMessage(stream *ActiveStrea
 	defer stream.mu.Unlock()
 	shellID := backgroundShellIDForMessageLocked(stream, message.GetId(), message.GetExecId())
 	if shellID == "" {
+		if tombstone, ok := stream.ShellExecTombstones[strings.TrimSpace(message.GetExecId())]; ok && tombstone.MessageID == message.GetId() {
+			return true
+		}
 		return false
 	}
 	pending := runtimecore.PendingExec{

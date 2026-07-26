@@ -58,6 +58,8 @@ type OpenExecContext struct {
 type ExecBridge interface {
 	// OpenExec 打开一条执行桥请求。
 	OpenExec(openContext OpenExecContext, toolCall runtimecore.ToolInvocation) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error)
+	// ReopenShell 为同一逻辑 Shell 创建新的 transport attempt。
+	ReopenShell(openContext OpenExecContext, pending runtimecore.PendingExec) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error)
 	// OpenExecuteHook 打开一条 execute hook 请求。
 	OpenExecuteHook(request *agentv1.ExecuteHookRequest, execKind string) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error)
 	// ApplyExecClientMessage 处理客户端执行结果。
@@ -816,12 +818,39 @@ func (bridge *Bridge) openShell(openContext OpenExecContext, toolCall runtimecor
 		MessageID:      messageID,
 		ExecID:         execID,
 		ConversationID: strings.TrimSpace(openContext.ConversationID),
+		LogicalShellID: strings.TrimSpace(toolCall.CallID),
+		ShellAttempt:   1,
 		ArgsJSON:       append([]byte(nil), toolCall.ArgsJSON...),
 		ToolCallID:     toolCall.CallID,
 		ExecKind:       "shell",
 		StreamState:    "opened",
 		OpenedAt:       time.Now().UTC(),
 	}, nil
+}
+
+// ReopenShell 为同一逻辑调用生成全新的 transport 身份，隔离旧 attempt 的迟到事件。
+func (bridge *Bridge) ReopenShell(openContext OpenExecContext, previous runtimecore.PendingExec) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error) {
+	message, pending, err := bridge.openShell(openContext, runtimecore.ToolInvocation{
+		CallID:   previous.ToolCallID,
+		ToolName: "Shell",
+		ArgsJSON: previous.ArgsJSON,
+	})
+	if err != nil {
+		return nil, runtimecore.PendingExec{}, err
+	}
+	pending.ConversationID = previous.ConversationID
+	pending.ProviderPass = previous.ProviderPass
+	pending.ModelCallID = previous.ModelCallID
+	pending.ReasoningContent = previous.ReasoningContent
+	pending.ReasoningSignature = previous.ReasoningSignature
+	pending.ReasoningSignatureSource = previous.ReasoningSignatureSource
+	pending.LogicalShellID = strings.TrimSpace(previous.LogicalShellID)
+	if pending.LogicalShellID == "" {
+		pending.LogicalShellID = strings.TrimSpace(previous.ToolCallID)
+	}
+	pending.ShellAttempt = previous.ShellAttempt + 1
+	pending.ShellStartedPublished = previous.ShellStartedPublished
+	return message, pending, nil
 }
 
 type writeShellStdinArgs struct {

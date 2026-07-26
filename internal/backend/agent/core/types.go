@@ -224,6 +224,14 @@ type PendingExec struct {
 	ModelCallID string
 	// ToolCallID 是与该执行桥关联的工具调用标识。
 	ToolCallID string
+	// LogicalShellID 是跨 transport attempt 保持稳定的逻辑 Shell 标识。
+	LogicalShellID string
+	// ShellAttempt 是当前 transport attempt 序号，从 1 开始。
+	ShellAttempt int
+	// ShellStartedPublished 表示逻辑工具的 started 事件已经发布。
+	ShellStartedPublished bool
+	// ShellRetryNotBefore 表示被客户端跳过后允许再次派发的最早时间。
+	ShellRetryNotBefore time.Time
 	// ArgsJSON 保存打开该执行桥时的原始参数 JSON，便于恢复 completed ToolCall。
 	ArgsJSON []byte
 	// ReasoningContent 保存触发该工具调用时的 thinking 文本，供 checkpoint/replay 续跑复用。

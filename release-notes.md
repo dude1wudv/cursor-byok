@@ -1,6 +1,24 @@
 <!-- 发布约定：每次 Release 都保留“最近 5 个版本更新梗概”，覆盖当前版本和前 4 个版本。 -->
 
-# Cursor助手 v0.0.73
+# Cursor助手 v0.0.74
+
+本版本重构 Cursor Shell 调度，并修复 BidiAppend 重连时 append 代际未接管：默认 Shell 并发提升至 32；未启动即被客户端 `Skipped` 的 transport 不再直接失败，而是在同一逻辑 tool call 下退避重排队；等待项通过 started + checkpoint 保持 pending/loading，旧 attempt 的迟到事件按 transport generation 隔离。
+
+## BidiAppend 重连代际接管
+
+- 重连后的 `seq=1` 只有在 run/prewarm 成功解码并成功分发后才提交新 append epoch；duplicate run 虽不重复启动 provider，也会完成代际接管。
+- 代际提交从仅新 run 的业务路径移到 BidiAppend 成功分发边界；解码或分发失败仍回滚候选，旧 epoch 的迟到消息继续隔离。
+- `bidi_append_epoch_switched` 增加旧 epoch/next、新 epoch/next、duplicate run 与 reconnect 等非敏感证据，便于确认后续 `seq=2` 进入新代而非被判 stale。
+
+## Shell 32 并发与 Skipped 重排队
+
+- `shellMaxConcurrentPerRun` 默认值由 8 提升到 32；服务端队列持续填充可用槽位，等待项不占 active transport 配额。
+- Shell 首次入队先发布唯一一次 `ToolCallStarted` 与 checkpoint，再下发 transport；排队和重试期间逻辑卡片保持 pending，最终只发布一次 completed。
+- 仅对从未观察到 `Start/stdout/stderr` 的 `Skipped` 安全重派：每次生成新的 `exec_id/message_id`，最多 5 次，采用 250ms 起步、4s 封顶的有限指数退避并进入队尾，避免重试风暴和队首阻塞。
+- retired attempt 的迟到事件由 stream 生命周期 tombstone 吸收；若已有启动或输出证据则禁止重派，继续走原有 abort/recovery，避免有副作用命令重复执行。
+- 运行时事件新增逻辑 Shell ID、transport attempt、retry deadline 和可重试判定，便于还原 waiting→dispatch→skipped→retry→terminal 链路。
+
+## 上一版本 v0.0.73 详细记录
 
 本版本收口运行时与 Grep 契约：修复 Task 子代理在 Cursor UI 错显 Stopped、硬化 Shell 确定性拒绝熔断并补齐 FIFO 证据、按端点能力发送 `parallel_tool_calls` 并记录真实派发批次宽度、统一 provider pass 指标契约并对全部 debug 日志脱敏、闭合 Grep offset/head_limit 的 applied 回报契约并固定多 workspace 截断顺序、把自动压缩性能软阈值上调至 70%。
 
@@ -41,6 +59,12 @@
 
 ## 最近 5 个版本更新梗概
 
+### v0.0.74
+
+- 修复 BidiAppend 重连后 duplicate run 未提交新 epoch，确保后续 `seq=2` 进入新代；保留失败回滚、旧代隔离和非敏感切换证据。
+- Shell 默认并发提升至 32；逻辑 tool call 与 transport attempt 解耦，pre-start `Skipped` 采用新 transport 身份有限退避重排队。
+- waiting 期间保持 started/checkpoint pending，旧 attempt 迟到事件被隔离；已启动命令禁止重派，避免重复执行。
+
 ### v0.0.73
 
 - 修复 Task 子代理在 Cursor UI 错显 Stopped（客户端兼容投影 BACKGROUNDED，历史保持真实 RUNNING），硬化 Shell 确定性拒绝熔断并补齐 FIFO 排序证据。
@@ -61,14 +85,9 @@
 - 统一 Shell 活动迁移、两阶段 abort、终态所有权和指纹熔断，避免旧 deadline、双收口与重复拒绝循环。
 - 对齐 inspect 权限、Task 模式投影和 subagent 派遣终态，并为运行日志补充构建版本与提交身份。
 
-### v0.0.69
-
-- 恢复稳定的请求缓存前缀，撤回会破坏 prompt cache 的 latest-only suffix 编译方式。
-- 通过 awaiting-start 门和 FIFO 调度缓解并发 Shell 在 Cursor 终端分配阶段被 skipped 的问题。
-
 ## 发布资产
 
-- `cursor-byok-0.0.73-windows-amd64.zip`
-- `cursor-byok-0.0.73-macos-arm64.tar.gz`
-- `cursor-byok-0.0.73-macos-amd64.tar.gz`
+- `cursor-byok-0.0.74-windows-amd64.zip`
+- `cursor-byok-0.0.74-macos-arm64.tar.gz`
+- `cursor-byok-0.0.74-macos-amd64.tar.gz`
 - `update.json`

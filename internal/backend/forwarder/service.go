@@ -521,9 +521,6 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 		})
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	if strings.TrimSpace(intent.Kind) == "run" {
-		intent.AppendSequenceTicket = &appendTicket
-	}
 	service.debug.LogBidiRaw(ctx, requestID, intent.ConversationID, appendSeqno, dataHex, "accepted", map[string]any{
 		"client_kind":  strings.TrimSpace(clientKind),
 		"epoch":        appendEpoch,
@@ -531,6 +528,18 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 		"disposition":  appendDisposition,
 	})
 	service.debug.LogBidiDecoded(ctx, requestID, intent.ConversationID, appendSeqno, clientKind, message, intent, nil)
+	duplicateRun := false
+	previousEpoch, previousNext := uint64(0), int64(0)
+	if appendDisposition == "epoch_candidate" && strings.TrimSpace(intent.Kind) == "run" {
+		previousEpoch, previousNext = appendTicket.CurrentSnapshot()
+		if stream, ok := service.broker.Get(intent.RequestID); ok && stream != nil {
+			stream.mu.Lock()
+			duplicateRun = stream.RunAccepted &&
+				strings.TrimSpace(stream.ConversationID) == strings.TrimSpace(intent.ConversationID) &&
+				!isTerminalStreamStatus(stream.Status)
+			stream.mu.Unlock()
+		}
+	}
 	if err := service.dispatchInboundIntent(intent); err != nil {
 		if shouldAcknowledgeInterruptedInboundIntent(intent, err) {
 			service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "dispatch_interrupted_ignored", map[string]any{
@@ -548,6 +557,21 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 			code = connect.CodeInternal
 		}
 		return nil, connect.NewError(code, err)
+	}
+	if appendDisposition == "epoch_candidate" && strings.TrimSpace(intent.Kind) == "run" && appendTicket.CommitEpoch() {
+		newEpoch, _, disposition := appendTicket.Snapshot()
+		newNext := appendSeqno + 1
+		log.Printf("forwarder switched bidi append epoch request_id=%s old_epoch=%d old_next=%d new_epoch=%d new_next=%d disposition=%s duplicate_run=%t reconnect=true prewarm=%t", requestID, previousEpoch, previousNext, newEpoch, newNext, disposition, duplicateRun, intent.Prewarm)
+		service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "bidi_append_epoch_switched", map[string]any{
+			"old_epoch":     previousEpoch,
+			"old_next":      previousNext,
+			"new_epoch":     newEpoch,
+			"new_next":      newNext,
+			"disposition":   disposition,
+			"duplicate_run": duplicateRun,
+			"reconnect":     true,
+			"prewarm":       intent.Prewarm,
+		})
 	}
 	service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "inbound_intent_dispatched", map[string]any{
 		"kind":            strings.TrimSpace(intent.Kind),
@@ -1132,7 +1156,6 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		return err
 	}
 	if intent.Prewarm {
-		service.commitRunAppendEpoch(intent)
 		stream.mu.Lock()
 		stream.RunAccepted = true
 		providerActive := stream.ProviderActive
@@ -1150,7 +1173,6 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	if err := service.requestProviderAction(stream, providerActionStart); err != nil {
 		return err
 	}
-	service.commitRunAppendEpoch(intent)
 	stream.mu.Lock()
 	stream.RunAccepted = true
 	providerActive := stream.ProviderActive
@@ -1164,21 +1186,6 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		"provider_pass_count": providerPassCount,
 	})
 	return nil
-}
-
-func (service *Service) commitRunAppendEpoch(intent InboundIntent) {
-	if intent.AppendSequenceTicket == nil || !intent.AppendSequenceTicket.CommitEpoch() {
-		return
-	}
-	epoch, currentNext, disposition := intent.AppendSequenceTicket.Snapshot()
-	log.Printf("forwarder switched bidi append epoch request_id=%s epoch=%d current_next=%d disposition=%s", strings.TrimSpace(intent.RequestID), epoch, currentNext, disposition)
-	if service != nil && service.debug != nil {
-		service.debug.LogRuntime(context.Background(), intent.RequestID, intent.ConversationID, "bidi_append_epoch_switched", map[string]any{
-			"epoch":        epoch,
-			"current_next": currentNext,
-			"disposition":  disposition,
-		})
-	}
 }
 
 func (service *Service) loadPreviousSummaryReplay(conversationID string) ([][]byte, bool, error) {
@@ -1336,14 +1343,15 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		if _, ok := intent.ExecClientMessage.GetShellStream().GetEvent().(*agentv1.ShellStream_Start); ok {
 			service.recordShellHandshakeEvent(stream, pending)
 		}
-		if err := service.advanceForegroundShellStartQueue(stream, pending); err != nil {
-			return err
-		}
 	}
 	if !result.IsTerminal {
 		if strings.TrimSpace(result.ShellRecoveryCandidate) != "" {
 			if result.ShellRecoveryCandidate == shellRecoveryReasonSkipped {
 				service.recordShellSkippedEvent(stream, pending, intent.ExecClientMessage)
+				preStart := pending.ShellActivityGeneration == 0 && pending.ChunkCount == 0 && pending.FirstChunkAt.IsZero()
+				if preStart && pending.ShellAttempt > 0 && pending.ShellAttempt < shellMaxTransportAttempts {
+					return service.requeueSkippedForegroundShell(stream, pending)
+				}
 			}
 			service.scheduleShellRecoveryCandidate(intent.RequestID, pending, result.ShellRecoveryCandidate)
 		}
@@ -1437,7 +1445,9 @@ func (service *Service) recordShellSkippedEvent(stream *ActiveStream, pending ru
 	reason, rejectionClass := shellTerminalRejection(message)
 	commandHash, argsHash, cwdHash := shellInvocationHashes(pending.ArgsJSON)
 	values := map[string]any{
-		"tool_call_id": pending.ToolCallID, "exec_id": pending.ExecID, "message_id": pending.MessageID,
+		"tool_call_id": pending.ToolCallID, "logical_shell_id": pending.LogicalShellID,
+		"transport_attempt": pending.ShellAttempt, "retryable_pre_start": !started && pending.ChunkCount == 0,
+		"exec_id": pending.ExecID, "message_id": pending.MessageID,
 		"stream_state": pending.StreamState, "start_seen": started, "awaiting_start": awaiting,
 		"active": active, "queued": queued, "limit": limit,
 		"rejection_class": rejectionClass, "rejected_reason": sanitizeShellRejectedReason(reason), "recovery": "rejected",
@@ -2254,6 +2264,18 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 	if !found {
 		if messageID, ok := execControlMessageID(intent.ExecClientControlMessage); ok {
 			if _, detached := selectPendingSubagentFinalization("", messageID, stream); detached {
+				return nil
+			}
+			stream.mu.Lock()
+			retiredShell := false
+			for _, tombstone := range stream.ShellExecTombstones {
+				if tombstone.MessageID == messageID && tombstone.Reason == shellRecoveryReasonSkipped {
+					retiredShell = true
+					break
+				}
+			}
+			stream.mu.Unlock()
+			if retiredShell {
 				return nil
 			}
 		}
@@ -3335,6 +3357,17 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		// 失败语义从「确定未启动」变为「状态不确定」。
 		execPublished := false
 		failExecDispatch := func(cause error) error {
+			if strings.TrimSpace(pendingExec.ExecKind) == "shell" {
+				removePendingExec("dispatch_failed")
+				return service.completePreDispatchToolError(
+					stream,
+					invocation,
+					startedToolCall,
+					historyToolCall != nil,
+					true,
+					cause,
+				)
+			}
 			if strings.TrimSpace(pendingExec.ExecKind) != "subagent" {
 				removePendingExec("dispatch_failed")
 				return cause
@@ -5080,7 +5113,7 @@ func markExecCompleted(stream *ActiveStream, pending runtimecore.PendingExec) {
 			stream.ShellExecTombstones = make(map[string]shellExecTombstone)
 		}
 		for execID, tombstone := range stream.ShellExecTombstones {
-			if tombstone.CompletedAt.Before(cutoff) {
+			if tombstone.CompletedAt.Before(cutoff) && tombstone.Reason != shellRecoveryReasonSkipped {
 				delete(stream.ShellExecTombstones, execID)
 			}
 		}

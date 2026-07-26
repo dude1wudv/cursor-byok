@@ -144,9 +144,11 @@ func TestBidiAppendReusedRequestStartsNewRunEpoch(t *testing.T) {
 	}
 	broker.Unsubscribe(requestID, subscriberID)
 	appendPrewarm(t, service, requestID, "conversation-one", 1)
-	if epoch := currentAppendEpoch(t, service.appendSeq, requestID); epoch != firstEpoch {
-		t.Fatalf("RunSSE reconnect/duplicate run reset epoch: got=%d want=%d", epoch, firstEpoch)
+	duplicateEpoch := firstEpoch + 1
+	if epoch := currentAppendEpoch(t, service.appendSeq, requestID); epoch != duplicateEpoch {
+		t.Fatalf("RunSSE reconnect/duplicate run epoch=%d, want %d", epoch, duplicateEpoch)
 	}
+	appendPrewarm(t, service, requestID, "conversation-one", 2)
 
 	if err := broker.Complete(requestID, "", ""); err != nil {
 		t.Fatal(err)
@@ -155,8 +157,8 @@ func TestBidiAppendReusedRequestStartsNewRunEpoch(t *testing.T) {
 		t.Fatal("completed first run was not removed")
 	}
 	appendPrewarm(t, service, requestID, "conversation-two", 1)
-	if epoch := currentAppendEpoch(t, service.appendSeq, requestID); epoch != firstEpoch+1 {
-		t.Fatalf("second run epoch=%d, want %d", epoch, firstEpoch+1)
+	if epoch := currentAppendEpoch(t, service.appendSeq, requestID); epoch != duplicateEpoch+1 {
+		t.Fatalf("second run epoch=%d, want %d", epoch, duplicateEpoch+1)
 	}
 	stream, ok := broker.Get(requestID)
 	if !ok || stream == nil || stream.ConversationID != "conversation-two" || !stream.RunAccepted {

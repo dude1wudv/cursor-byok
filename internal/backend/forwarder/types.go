@@ -156,6 +156,7 @@ type queuedShellDispatch struct {
 	Message         *agentv1.AgentServerMessage
 	StartedToolCall *agentv1.ToolCall
 	Pending         runtimecore.PendingExec
+	ReadyAt         time.Time
 	Observation     shellDispatchObservation
 }
 
@@ -216,9 +217,12 @@ func (metrics *providerPassMetrics) ParallelWidth() int {
 }
 
 type shellExecTombstone struct {
-	MessageID   uint32
-	Generation  int
-	CompletedAt time.Time
+	MessageID      uint32
+	Generation     int
+	LogicalShellID string
+	Attempt        int
+	Reason         string
+	CompletedAt    time.Time
 }
 
 type ActiveStream struct {
@@ -548,7 +552,6 @@ type InboundIntent struct {
 	ExecClientControlMessage *agentv1.ExecClientControlMessage
 	InteractionResponse      *agentv1.InteractionResponse
 	KVClientMessage          *agentv1.KvClientMessage
-	AppendSequenceTicket     *appendSequenceTicket
 	CancelReason             string
 	IgnoredReason            string
 	Prewarm                  bool

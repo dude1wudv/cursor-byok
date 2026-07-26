@@ -305,7 +305,7 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 		stream.RecentCompletedExecs = make(map[uint32]time.Time)
 	}
 	for execID, tombstone := range stream.ShellExecTombstones {
-		if tombstone.CompletedAt.Before(cutoff) {
+		if tombstone.CompletedAt.Before(cutoff) && tombstone.Reason != shellRecoveryReasonSkipped {
 			delete(stream.ShellExecTombstones, execID)
 		}
 	}
