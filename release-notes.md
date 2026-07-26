@@ -1,3 +1,5 @@
+<!-- 发布约定：每次 Release 都保留“最近 5 个版本更新梗概”，覆盖当前版本和前 4 个版本。 -->
+
 # Cursor助手 v0.0.72
 
 本版本修复 "Skipped git" 刷屏的真正根因（v0.0.70 inspect 只读 Shell 白名单在 pre-dispatch 阶段拒绝合法命令）、按证据精简 v0.0.67-v0.0.70 累积的 shell 调度脚手架，并落地性能与并行工具调用改进。
@@ -31,46 +33,36 @@
 
 - 每个 provider pass 结束输出 `provider_pass_metrics` 结构化低敏指标：编译耗时、回放消息数、估算/实际 tokens、工具结果字节、TTFT、pass 时长、外部工具等待、工具数量、并行宽度、cache read/write tokens、终态；含 Anthropic `expected_cache_read`/前缀 hint 诊断。日志不含提示词、工具正文或密钥。
 
-# Cursor助手 v0.0.71
+## 最近 5 个版本更新梗概
 
-本版本集中修复 Anthropic/Claude 适配链路的兼容缺陷：思考中对话提前结束、历史回放隐性 400、Plan 卡片不出现、非 Shell 工具调用永久卡死，以及 Grep 回放截断的数字矛盾与过度丢弃。
+### v0.0.72
 
-## 流生命周期（对话提前结束）
+- 修复 inspect Shell 合法命令在 pre-dispatch 阶段被拒绝而导致的 “Skipped git” 刷屏，并通过指纹熔断阻止确定性错误无限重试。
+- 精简 Shell 调度与恢复状态机，加入 OpenAI Responses 并行工具调用、稳定回放预算、自动压缩软阈值和 provider pass 性能指标。
 
-- idle watchdog 改为按任意 SSE 流量（含 ping 心跳）刷新；长 extended thinking 数分钟无内容 delta 不再被 4 分钟掐断。仅有心跳但始终不产出内容的病态流由 10 倍时长 hard cap 兜底。
-- `pause_turn` 映射为受控未完成信号，forwarder 复用输出上限续写通道自动带历史继续，不再当正常结束收口。
-- SSE 流内 `error` 事件按类型映射为等价 HTTP 状态码（`overloaded_error`→529、`rate_limit_error`→429、`api_error`→500、`timeout_error`→408），接入既有可重试分类。
-- Anthropic scanner 单行缓冲从 1MiB 对齐到 64MiB，大工具参数不再撑爆流。
+### v0.0.71
 
-## 历史回放（隐性 400）
+- 修复 Claude extended thinking、`pause_turn`、SSE 错误映射及历史回放兼容问题，避免对话提前结束或隐性 400。
+- 为客户端工具与交互工具增加超时收口，修复 Plan 卡片渐进显示、thinking 参数兼容和 Grep 截断异常。
 
-- 回放层合并相邻同角色消息并去重 thinking 块，满足 Anthropic 角色交替约束。
-- 无有效 signature 的 thinking 不再回放为 thinking 块；新增 `redacted_thinking` 解析与原样回放。
-- 校验 `tool_use`/`tool_result` 配对，compaction/rewind 后的孤儿 tool_result 降级为普通文本。
+### v0.0.70
 
-## 工具调用卡死
+- 统一 Shell 活动迁移、两阶段 abort、终态所有权和指纹熔断，避免旧 deadline、双收口与重复拒绝循环。
+- 对齐 inspect 权限、Task 模式投影和 subagent 派遣终态，并为运行日志补充构建版本与提交身份。
 
-- 非 Shell 客户端执行工具（Read/Grep/Glob/写删/MCP/patch-edit 各阶段）新增结果超时 watchdog（普通 2 分钟、MCP 10 分钟），超时本地合成错误 tool_result 并继续回合；回包失配同样由该路径兜底。
-- 交互工具纳入超时保护：机器执行类（WebSearch/WebFetch/SwitchMode）3 分钟，等待人工输入类（AskQuestion/CreatePlan）30 分钟兜底取消，不再静默挂起。
-- Read/Grep/Glob 纳入 started 抑制名单，partial 行与 started 行不再在 UI 重复渲染。
+### v0.0.69
 
-## Plan 卡片
+- 恢复稳定的请求缓存前缀，撤回会破坏 prompt cache 的 latest-only suffix 编译方式。
+- 通过 awaiting-start 门和 FIFO 调度缓解并发 Shell 在 Cursor 终端分配阶段被 skipped 的问题。
 
-- 工具名变体（`create_plan`/`createPlan` 等）在适配器归一为 `CreatePlan`。
-- CreatePlan 参数尚不可解析时先发空占位 partial，卡片立即弹出；前缀解析支持从不完整 JSON 提取已闭合的 todo 对象。
-- 参数容错清洗：todo status 别名扩充（not_started/done/doing/wip 等）、未知 status 归一、字符串 todo 降级为 content-only、非法条目丢弃而非整卡失败。
-- plan 提示词增补：必须通过 CreatePlan 提交计划、`plan` 字段先于 `todos` 输出、status 枚举约束。
+### v0.0.68
 
-## 请求构造兼容
-
-- 渠道配置 `thinkingBudgetTokens` 时直接使用 legacy `{type:"enabled", budget_tokens}` 形态；adaptive 形态收到疑似兼容性 400 时自动降级 legacy 原地重试一次。
-- thinking 开启时从最终请求体（含 extra params 合并结果）剔除 `temperature`/`top_p`。
-
-## Grep 回放截断
-
-- context 行（-A/-B/-C）不再消耗匹配数预算（仅计内容字节），修复 context 模式下后续小结果被整体丢弃。
-- 截断 notice 改为陈述本结果实际保留字节与共享预算语义，消除「总量 646 却报 exceeded 32768」的矛盾。
+- 修复 GPT-5.6/OpenAI Responses 与 Cursor Multitask 的 worker 收口、会话模型固定和工具协议兼容问题。
+- 保留 reasoning、`call_id` 和 typed SSE 回放，收紧 Multitask 初始工具并修正 Task 卡片模型路由。
 
 ## 发布资产
 
-- `cursor-byok-0.0.71-windows-amd64.zip`
+- `cursor-byok-0.0.72-windows-amd64.zip`
+- `cursor-byok-0.0.72-macos-arm64.tar.gz`
+- `cursor-byok-0.0.72-macos-amd64.tar.gz`
+- `update.json`
