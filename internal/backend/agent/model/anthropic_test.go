@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -110,6 +111,129 @@ func mustMarshalAnthropicMessagesForTest(t *testing.T, messages []anthropicMessa
 	payload, err := json.Marshal(messages)
 	if err != nil {
 		t.Fatalf("marshal anthropic messages: %v", err)
+	}
+	return string(payload)
+}
+
+// TestBuildAnthropicThinkingConfig 验证 thinking 形态选择：默认 adaptive，
+// 仅显式配置 budget 时才走 legacy budget_tokens。
+func TestBuildAnthropicThinkingConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		req  StreamRequest
+		want map[string]any
+	}{
+		{
+			name: "default_adaptive",
+			req:  StreamRequest{AnthropicThinkingEffort: "xhigh"},
+			want: map[string]any{"type": "adaptive", "display": "summarized"},
+		},
+		{
+			name: "explicit_budget_legacy",
+			req:  StreamRequest{AnthropicThinkingEffort: "xhigh", ThinkingBudgetTokens: 4096},
+			want: map[string]any{"type": "enabled", "budget_tokens": 4096},
+		},
+		{
+			name: "runtime_disabled",
+			req:  StreamRequest{ThinkingEffort: "disabled", AnthropicThinkingEffort: "xhigh"},
+			want: map[string]any{"type": "disabled"},
+		},
+		{
+			name: "empty_effort_no_thinking",
+			req:  StreamRequest{},
+			want: nil,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := buildAnthropicThinkingConfig(testCase.req)
+			gotJSON := mustMarshalJSONForTest(t, got)
+			wantJSON := mustMarshalJSONForTest(t, testCase.want)
+			if gotJSON != wantJSON {
+				t.Fatalf("buildAnthropicThinkingConfig() = %s, want %s", gotJSON, wantJSON)
+			}
+		})
+	}
+}
+
+// TestAnthropicStreamAdaptiveThinkingCarriesOutputConfigEffort 验证默认（无显式
+// budget）请求体带 thinking.type=adaptive 且 output_config.effort 为配置的强度。
+func TestAnthropicStreamAdaptiveThinkingCarriesOutputConfigEffort(t *testing.T) {
+	body := streamAnthropicAndCaptureBody(t, StreamRequest{
+		ModelID:                 "claude-fable-5",
+		Messages:                []Message{{Role: "user", Content: "hello"}},
+		AnthropicThinkingEffort: "high",
+	})
+	thinking, _ := body["thinking"].(map[string]any)
+	if thinking == nil || thinking["type"] != "adaptive" {
+		t.Fatalf("thinking = %v, want type adaptive", body["thinking"])
+	}
+	outputConfig, _ := body["output_config"].(map[string]any)
+	if outputConfig == nil || outputConfig["effort"] != "high" {
+		t.Fatalf("output_config = %v, want effort high", body["output_config"])
+	}
+}
+
+// TestAnthropicStreamExplicitBudgetUsesLegacyThinking 验证显式配置 budget 时仍走
+// legacy {type:enabled,budget_tokens} 且不携带 legacy 上游不认识的 output_config。
+func TestAnthropicStreamExplicitBudgetUsesLegacyThinking(t *testing.T) {
+	body := streamAnthropicAndCaptureBody(t, StreamRequest{
+		ModelID:                 "claude-fable-5",
+		Messages:                []Message{{Role: "user", Content: "hello"}},
+		AnthropicThinkingEffort: "xhigh",
+		ThinkingBudgetTokens:    4096,
+	})
+	thinking, _ := body["thinking"].(map[string]any)
+	if thinking == nil || thinking["type"] != "enabled" {
+		t.Fatalf("thinking = %v, want type enabled", body["thinking"])
+	}
+	if budget, _ := thinking["budget_tokens"].(float64); budget != 4096 {
+		t.Fatalf("budget_tokens = %v, want 4096", thinking["budget_tokens"])
+	}
+	if _, exists := body["output_config"]; exists {
+		t.Fatalf("output_config = %v, want absent for legacy thinking", body["output_config"])
+	}
+}
+
+func streamAnthropicAndCaptureBody(t *testing.T, req StreamRequest) map[string]any {
+	t.Helper()
+	sse := "" +
+		"event: message_start\n" +
+		`data: {"type":"message_start","message":{"model":"claude-fable-5","usage":{}}}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}` + "\n\n" +
+		"event: message_stop\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		payload, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		} else if err := json.Unmarshal(payload, &captured); err != nil {
+			t.Errorf("unmarshal request body: %v", err)
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte(sse))
+	}))
+	defer server.Close()
+
+	adapter := &AnthropicAdapter{client: server.Client()}
+	req.BaseURL = server.URL
+	req.APIKey = "test-key"
+	if err := adapter.Stream(context.Background(), req, func(ModelEvent) error { return nil }); err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if captured == nil {
+		t.Fatal("request body was not captured")
+	}
+	return captured
+}
+
+func mustMarshalJSONForTest(t *testing.T, value any) string {
+	t.Helper()
+	payload, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal json: %v", err)
 	}
 	return string(payload)
 }

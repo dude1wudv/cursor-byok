@@ -12,7 +12,6 @@ const (
 	defaultChannelTimeoutMS           = int((2 * 60 * 60) * 1000)
 	defaultChannelContextWindowTokens = 200_000
 	defaultChannelMaxTokens           = 65_536
-	defaultChannelThinkingBudget      = 4_096
 	defaultChannelAnthropicEffort     = "xhigh"
 )
 
@@ -77,7 +76,6 @@ func resolveModelAdapterChannel(adapters []ModelAdapterConfig, requestedModel st
 		AnthropicMaxTokens:          defaultChannelMaxTokens,
 		AnthropicThinkingEffort:     defaultChannelAnthropicEffort,
 		ThinkingEnabled:             true,
-		ThinkingBudgetTokens:        defaultChannelThinkingBudget,
 	}
 	if matched.ContextWindowTokens > 0 {
 		resolved.ContextWindowTokens = matched.ContextWindowTokens

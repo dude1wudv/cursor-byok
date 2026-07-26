@@ -31,6 +31,10 @@
 - 多 workspace 截断确定性：共享回放预算按 workspace 路径排序分配，active editor 固定最后处理；相同输入重复执行，保留的 workspace/文件/匹配与提示逐字一致。
 - 截断提示透明化：区分并报告单条 2 KiB、每文件 100 匹配、全调用 300 匹配、全调用共享 32 KiB 四层限额，同时报告本结果进入前剩余额度、当前剩余额度与最终保留量，并标注 bridge 来源与上游 client/ripgrep 截断旗标；count/files 超过 300 项时输出保留数、总数与原因。bridge 32 KiB 与 forwarder 16 KiB 上限本版不变。
 
+## Anthropic 思考强度修复
+
+- 移除渠道解析中硬编码的 4096 thinking budget：`ThinkingBudgetTokens` 不再随渠道默认下发，Anthropic adaptive thinking 完全由 `output_config.effort`（默认 xhigh）决定，思考深度不再被固定预算截断；新增适配器与渠道解析回归测试锁定该行为。
+
 ## 自动压缩 70% 软阈值
 
 - 性能软阈值 `0.55 → 0.70`：200k 窗口下 140000 不触发、140001 才触发；有基线时仍需再增长至少 20% 窗口（40000 tokens）才允许再次触发。硬防溢出、preflight、pending、摘要生成与持久化逻辑不变；512 KiB 回放预算、缓存前缀稳定与迟滞语义不变。
