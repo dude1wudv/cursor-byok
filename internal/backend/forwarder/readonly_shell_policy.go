@@ -265,6 +265,19 @@ func isAllowedGitListFlag(token string) bool {
 	return false
 }
 
+func shellCommandSafeToRetry(argsJSON []byte) bool {
+	args, err := runtimecore.DecodeArgsMap(argsJSON)
+	if err != nil {
+		return false
+	}
+	tokens, simple := parseReadonlyShellCommand(runtimecore.ReadStringArg(args, "command"))
+	if !simple || len(tokens) == 0 {
+		return false
+	}
+	_, err = validateReadonlyShellCommandTokens(tokens)
+	return err == nil
+}
+
 // enforceReadonlyShellPolicy 在 pre-dispatch 阶段对 inspect child 的 Shell 调用强制白名单，
 // 校验通过时返回注入保护参数后的 invocation。
 func (service *Service) enforceReadonlyShellPolicy(stream *ActiveStream, invocation runtimecore.ToolInvocation) (runtimecore.ToolInvocation, error) {

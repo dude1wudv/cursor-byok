@@ -8,6 +8,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"cursor/gen/agentv1"
+	execbridge "cursor/internal/backend/agent/bridge/exec"
 	runtimecore "cursor/internal/backend/agent/core"
 )
 
@@ -86,11 +87,15 @@ func (service *Service) completePreDispatchToolError(
 		}
 	}
 	resultText := formatPreDispatchToolError(invocation, cause)
-	if err := service.appendToolResult(stream, invocation.CallID, strings.TrimSpace(invocation.ToolName), invocation.ArgsJSON, resultText, invocation.ReasoningContent, nil); err != nil {
+	var completedToolCall *agentv1.ToolCall
+	if strings.TrimSpace(invocation.ToolName) == "Shell" {
+		completedToolCall = execbridge.BuildShellRejectedToolCall(invocation.CallID, invocation.ArgsJSON, "pre-dispatch rejection: "+strings.TrimSpace(cause.Error()))
+	}
+	if err := service.appendToolResult(stream, invocation.CallID, strings.TrimSpace(invocation.ToolName), invocation.ArgsJSON, resultText, invocation.ReasoningContent, completedToolCall); err != nil {
 		return err
 	}
 	if hasCanonicalToolCall || startedEmitted {
-		if err := service.publishToolCallCompleted(stream.RequestID, invocation.CallID, invocation.ModelCallID, nil); err != nil {
+		if err := service.publishToolCallCompleted(stream.RequestID, invocation.CallID, invocation.ModelCallID, completedToolCall); err != nil {
 			return err
 		}
 	}

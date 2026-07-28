@@ -1307,6 +1307,7 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return fmt.Errorf("pending exec not found")
 	}
 	service.observeBackgroundShellExecClientMessage(stream, pending, intent.ExecClientMessage)
+	service.observeWriteShellStdinResult(stream, pending, intent.ExecClientMessage)
 	service.observeShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	pending = service.applyExecProgress(stream, pending, intent.ExecClientMessage)
 	if err := service.recordShellApprovalEvidence(stream, pending, intent.ExecClientMessage); err != nil {
@@ -1340,6 +1341,11 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	}
 	if shellExecutionBegan(intent.ExecClientMessage) {
 		pending = service.refreshShellForegroundActivity(stream, pending)
+		if acknowledgeForegroundShellStart(stream, pending) {
+			if err := service.dispatchReadyForegroundShells(stream); err != nil {
+				return err
+			}
+		}
 		if _, ok := intent.ExecClientMessage.GetShellStream().GetEvent().(*agentv1.ShellStream_Start); ok {
 			service.recordShellHandshakeEvent(stream, pending)
 		}
@@ -1348,10 +1354,6 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		if strings.TrimSpace(result.ShellRecoveryCandidate) != "" {
 			if result.ShellRecoveryCandidate == shellRecoveryReasonSkipped {
 				service.recordShellSkippedEvent(stream, pending, intent.ExecClientMessage)
-				preStart := pending.ShellActivityGeneration == 0 && pending.ChunkCount == 0 && pending.FirstChunkAt.IsZero()
-				if preStart && pending.ShellAttempt > 0 && pending.ShellAttempt < shellMaxTransportAttempts {
-					return service.requeueSkippedForegroundShell(stream, pending)
-				}
 			}
 			service.scheduleShellRecoveryCandidate(intent.RequestID, pending, result.ShellRecoveryCandidate)
 		}
@@ -1365,41 +1367,64 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	if strings.TrimSpace(pending.ExecKind) == "subagent" {
 		return service.finalizeSubagentExecResult(stream, pending, intent.ExecClientMessage, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
 	}
-	markExecCompleted(stream, pending)
+	if strings.TrimSpace(pending.ExecKind) == "execute_hook_pre_compact" {
+		markExecCompleted(stream, pending)
+		return service.handlePreCompactTerminal(stream, pending.ProviderPass, strings.TrimSpace(result.ToolResultPayload))
+	}
+	terminalPending := pending
+	if strings.TrimSpace(pending.ExecKind) == "shell" {
+		var claimed bool
+		pending, claimed = beginShellFinalization(stream, pending)
+		if !claimed {
+			return nil
+		}
+	}
 	backgroundShellToolCallID := ""
 	if strings.TrimSpace(pending.ExecKind) == "shell" && shellToolCallIsBackgrounded(result.ToolCall) {
 		backgroundShellToolCallID = firstNonEmpty(strings.TrimSpace(result.ToolCallID), strings.TrimSpace(pending.ToolCallID))
-	}
-	if strings.TrimSpace(pending.ExecKind) == "execute_hook_pre_compact" {
-		return service.handlePreCompactTerminal(stream, pending.ProviderPass, strings.TrimSpace(result.ToolResultPayload))
 	}
 	if result.ToolCall != nil {
 		if taskToolCall := result.ToolCall.GetTaskToolCall(); taskToolCall != nil && taskToolCall.GetArgs() != nil {
 			result.ToolCall = service.rewriteTaskToolCallModelForResolvedID(result.ToolCall, taskToolCall.GetArgs().GetModel())
 		}
+	}
+	if strings.TrimSpace(pending.ExecKind) == "shell" {
+		pending = snapshotShellTerminalResult(stream, pending, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
+	}
+	if result.ToolCall != nil {
 		if err := service.appendToolResult(stream, result.ToolCallID, deriveToolNameFromPendingExec(pending), pending.ArgsJSON, result.ToolResultPayload, pending.ReasoningContent, result.ToolCall); err != nil {
+			rollbackShellFinalization(stream, terminalPending)
+			service.scheduleShellFinalizationRetry(stream, terminalPending)
 			return err
 		}
 	} else if strings.TrimSpace(result.ToolResultPayload) != "" {
 		if err := service.appendToolResult(stream, pending.ToolCallID, deriveToolNameFromPendingExec(pending), pending.ArgsJSON, result.ToolResultPayload, pending.ReasoningContent, nil); err != nil {
+			rollbackShellFinalization(stream, terminalPending)
+			service.scheduleShellFinalizationRetry(stream, terminalPending)
 			return err
 		}
 	}
+	pending = markShellTerminalPersisted(stream, pending)
 	if backgroundShellToolCallID != "" {
 		if recordedToolCallID, recorded := recordBackgroundShellActionMemory(stream, backgroundShellToolCallID, time.Now().UTC()); recorded {
 			if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
 				newBackgroundShellActionMetadataEntry(stream.TurnSeq, stream.RequestID, recordedToolCallID, backgroundShellActionSourceLocalBackgrounded),
 			}); err != nil {
-				return err
+				log.Printf("forwarder background shell metadata failed request_id=%s exec_id=%s err=%v", stream.RequestID, pending.ExecID, err)
 			}
 		}
 	}
+	markExecCompleted(stream, pending)
 	displayToolCall := stripTaskPromptForDisplay(result.ToolCall)
+	advanceErr := service.advanceForegroundShellQueue(stream, pending)
 	if err := service.publishToolCallCompleted(intent.RequestID, result.ToolCallID, pending.ModelCallID, displayToolCall); err != nil {
-		return err
+		if strings.TrimSpace(pending.ExecKind) != "shell" {
+			return err
+		}
+		log.Printf("forwarder shell completed publish failed request_id=%s exec_id=%s err=%v", stream.RequestID, pending.ExecID, err)
 	}
-	if err := service.advanceForegroundShellQueue(stream, pending); err != nil {
-		return err
+	if advanceErr != nil {
+		return advanceErr
 	}
 	if err := service.syncSummaryCarryForward(stream.ConversationID, intent.RequestID, pending.ModelCallID); err != nil {
 		return err
@@ -1498,23 +1523,25 @@ func (service *Service) logShellTerminalResult(stream *ActiveStream, pending run
 		return
 	}
 	service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_terminal_result", map[string]any{
-		"source":           shellTerminalResultSource(message),
-		"terminal_variant": shellTerminalVariant(message),
-		"provider_pass":    pending.ProviderPass,
-		"model_call_id":    strings.TrimSpace(pending.ModelCallID),
-		"provider_item_id": providerItemID,
-		"provider_call_id": providerCallID,
-		"provider_status":  providerStatus,
-		"tool_call_id":     strings.TrimSpace(pending.ToolCallID),
-		"exec_id":          strings.TrimSpace(pending.ExecID),
-		"message_id":       pending.MessageID,
-		"stream_state":     strings.TrimSpace(pending.StreamState),
-		"dispatch_order":   "started_then_checkpoint_then_exec",
-		"command_hash":     commandHash,
-		"args_hash":        argsHash,
-		"cwd_hash":         cwdHash,
-		"rejection_class":  rejectionClass,
-		"rejected_reason":  sanitizeShellRejectedReason(reason),
+		"source":            shellTerminalResultSource(message),
+		"terminal_variant":  shellTerminalVariant(message),
+		"provider_pass":     pending.ProviderPass,
+		"model_call_id":     strings.TrimSpace(pending.ModelCallID),
+		"provider_item_id":  providerItemID,
+		"provider_call_id":  providerCallID,
+		"provider_status":   providerStatus,
+		"tool_call_id":      strings.TrimSpace(pending.ToolCallID),
+		"logical_shell_id":  strings.TrimSpace(pending.LogicalShellID),
+		"transport_attempt": pending.ShellAttempt,
+		"exec_id":           strings.TrimSpace(pending.ExecID),
+		"message_id":        pending.MessageID,
+		"stream_state":      strings.TrimSpace(pending.StreamState),
+		"dispatch_order":    "started_then_checkpoint_then_exec",
+		"command_hash":      commandHash,
+		"args_hash":         argsHash,
+		"cwd_hash":          cwdHash,
+		"rejection_class":   rejectionClass,
+		"rejected_reason":   sanitizeShellRejectedReason(reason),
 	})
 }
 
@@ -3609,7 +3636,7 @@ func (service *Service) applyExecProgress(stream *ActiveStream, pending runtimec
 			current.FirstChunkAt = now
 		}
 		current.ChunkCount++
-		current.StreamState = "streaming"
+		current.StreamState = shellLifecycleStreaming
 		current.LastShellActivityAt = now
 		current.StdoutBuffer += execbridge.DecodeShellStdout(event.Stdout)
 	case *agentv1.ShellStream_Stderr:
@@ -3620,14 +3647,14 @@ func (service *Service) applyExecProgress(stream *ActiveStream, pending runtimec
 			current.FirstChunkAt = now
 		}
 		current.ChunkCount++
-		current.StreamState = "streaming"
+		current.StreamState = shellLifecycleStreaming
 		current.LastShellActivityAt = now
 		current.StderrBuffer += event.Stderr.GetData()
 	case *agentv1.ShellStream_Start:
 		if current.FirstChunkAt.IsZero() {
 			current.FirstChunkAt = now
 		}
-		current.StreamState = "started"
+		current.StreamState = shellLifecycleStarted
 		current.LastShellActivityAt = now
 	case *agentv1.ShellStream_Backgrounded:
 		current.StreamState = "backgrounded"

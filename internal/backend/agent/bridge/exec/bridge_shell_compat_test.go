@@ -176,6 +176,20 @@ func TestShellStreamCloseRemainsPendingUntilLateExit(t *testing.T) {
 	}
 }
 
+func TestBuildShellRejectedToolCallCarriesPreDispatchReason(t *testing.T) {
+	toolCall := BuildShellRejectedToolCall("tool-shell", []byte(`{"command":"git push","working_directory":"E:\\repo"}`), "pre-dispatch rejection: policy")
+	shell := toolCall.GetShellToolCall()
+	if shell == nil || shell.GetResult().GetRejected() == nil {
+		t.Fatalf("explicit rejected shell result missing: %#v", toolCall)
+	}
+	if shell.GetResult().GetRejected().GetReason() != "pre-dispatch rejection: policy" {
+		t.Fatalf("rejection reason=%q", shell.GetResult().GetRejected().GetReason())
+	}
+	if shell.GetArgs().GetCommand() != "git push" || shell.GetArgs().GetToolCallId() != "tool-shell" {
+		t.Fatalf("rejected shell args=%#v", shell.GetArgs())
+	}
+}
+
 func TestShellApprovalSkipAndUnknownPayloadRemainPending(t *testing.T) {
 	pending := runtimecore.PendingExec{
 		MessageID:      7,

@@ -230,6 +230,16 @@ type PendingExec struct {
 	ShellAttempt int
 	// ShellStartedPublished 表示逻辑工具的 started 事件已经发布。
 	ShellStartedPublished bool
+	// ShellTerminalPersisted 表示唯一模型可见终态已经写入 history，之后才能回收 pending/lease。
+	ShellTerminalPersisted bool
+	// ShellTerminalSnapshotReady 表示已保存客户端返回的原始终态，持久化失败后必须重放该快照而不是合成新结果。
+	ShellTerminalSnapshotReady bool
+	// ShellTerminalToolCallID 保存原始终态关联的 tool_call_id。
+	ShellTerminalToolCallID string
+	// ShellTerminalResultPayload 保存原始终态回写给模型的文本结果。
+	ShellTerminalResultPayload string
+	// ShellTerminalToolCall 保存原始终态 ToolCall；写入时使用克隆，避免后续协议对象被修改。
+	ShellTerminalToolCall *agentv1.ToolCall
 	// ShellRetryNotBefore 表示被客户端跳过后允许再次派发的最早时间。
 	ShellRetryNotBefore time.Time
 	// ArgsJSON 保存打开该执行桥时的原始参数 JSON，便于恢复 completed ToolCall。
@@ -242,7 +252,7 @@ type PendingExec struct {
 	ReasoningSignatureSource string
 	// ExecKind 描述执行桥类型，例如 read、write、shellStream。
 	ExecKind string
-	// StreamState 描述当前流式执行桥的阶段。
+	// StreamState 描述当前执行桥阶段；Shell 使用 queued/opening/started/streaming/uncertain/retry_wait/finalizing 及原生终态。
 	StreamState string
 	// OpenedAt 表示执行桥请求发出的时间。
 	OpenedAt time.Time

@@ -2319,6 +2319,11 @@ func truncateShellStreamsForReplay(stdout string, stderr string) (string, string
 		truncateReplayTextMiddle("Shell stderr", stderr, shellReplayStreamLimit)
 }
 
+// BuildShellRejectedToolCall 构造未进入客户端执行阶段的显式拒绝结果。
+func BuildShellRejectedToolCall(toolCallID string, argsJSON []byte, reason string) *agentv1.ToolCall {
+	return buildShellRejectedToolCall(toolCallID, argsJSON, &agentv1.ShellRejected{Reason: strings.TrimSpace(reason)})
+}
+
 // buildShellRejectedToolCall 构造 Shell 被拒绝时的完成态 ToolCall。
 func buildShellRejectedToolCall(toolCallID string, argsJSON []byte, rejected *agentv1.ShellRejected) *agentv1.ToolCall {
 	args := decodeShellArgsForResult(argsJSON)

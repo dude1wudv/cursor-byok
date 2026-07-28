@@ -6,6 +6,10 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
+	"cursor/gen/agentv1"
+	execbridge "cursor/internal/backend/agent/bridge/exec"
 	runtimecore "cursor/internal/backend/agent/core"
 )
 
@@ -15,6 +19,7 @@ const (
 	shellRecoveryReasonForegroundDeadline = "foreground_deadline"
 	shellRecoveryReasonTransportClosed    = "transport_closed"
 	shellRecoveryReasonSkipped            = "skipped"
+	shellRecoveryReasonPersistenceFailed  = "persistence_failed"
 )
 
 // Shell 异常收口状态机取值（PendingExec.ShellRecoveryState）。
@@ -111,7 +116,11 @@ func (service *Service) scheduleShellRecoveryCandidate(requestID string, pending
 	current.ShellRecoveryStateAt = now
 	current.ShellRecoveryReason = reason
 	current.ShellRecoveryGeneration = current.ShellActivityGeneration
+	current.StreamState = shellLifecycleUncertain
 	stream.PendingExecs[pending.ExecID] = current
+	if active, ok := stream.ActiveForegroundShells[pending.ExecID]; ok && active.MessageID == current.MessageID {
+		stream.ActiveForegroundShells[pending.ExecID] = current
+	}
 	stream.UpdatedAt = now
 	stream.mu.Unlock()
 	service.scheduleStreamTimer(
@@ -127,6 +136,13 @@ func (service *Service) scheduleShellRecoveryCandidate(requestID string, pending
 
 func (service *Service) scheduleShellTransportCloseRecovery(requestID string, pending runtimecore.PendingExec) {
 	service.scheduleShellRecoveryCandidate(requestID, pending, shellRecoveryReasonTransportClosed)
+}
+
+func (service *Service) scheduleShellFinalizationRetry(stream *ActiveStream, pending runtimecore.PendingExec) {
+	if stream == nil {
+		return
+	}
+	service.scheduleShellRecoveryCandidate(stream.RequestID, pending, shellRecoveryReasonPersistenceFailed)
 }
 
 // refreshShellForegroundActivity 把 Start/stdout/stderr 归一为单一活动迁移：递增活动代次、
@@ -152,6 +168,87 @@ func (service *Service) refreshShellForegroundActivity(stream *ActiveStream, pen
 	stream.mu.Unlock()
 	service.scheduleShellForegroundRecovery(stream.RequestID, current)
 	return current
+}
+
+func beginShellFinalization(stream *ActiveStream, pending runtimecore.PendingExec) (runtimecore.PendingExec, bool) {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+		return pending, true
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	current, ok := stream.PendingExecs[pending.ExecID]
+	if !ok || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass {
+		return pending, false
+	}
+	if current.StreamState == shellLifecycleFinalizing || current.ShellTerminalPersisted {
+		return current, false
+	}
+	current.StreamState = shellLifecycleFinalizing
+	stream.PendingExecs[pending.ExecID] = current
+	if active, ok := stream.ActiveForegroundShells[pending.ExecID]; ok && active.MessageID == current.MessageID {
+		stream.ActiveForegroundShells[pending.ExecID] = current
+	}
+	return current, true
+}
+
+func snapshotShellTerminalResult(stream *ActiveStream, pending runtimecore.PendingExec, toolCallID, payload string, toolCall *agentv1.ToolCall) runtimecore.PendingExec {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+		return pending
+	}
+	var clonedToolCall *agentv1.ToolCall
+	if toolCall != nil {
+		clonedToolCall, _ = proto.Clone(toolCall).(*agentv1.ToolCall)
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	current, ok := stream.PendingExecs[pending.ExecID]
+	if !ok || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass {
+		return pending
+	}
+	current.ShellTerminalSnapshotReady = true
+	current.ShellTerminalToolCallID = firstNonEmpty(strings.TrimSpace(toolCallID), strings.TrimSpace(current.ToolCallID))
+	current.ShellTerminalResultPayload = payload
+	current.ShellTerminalToolCall = clonedToolCall
+	stream.PendingExecs[current.ExecID] = current
+	if active, ok := stream.ActiveForegroundShells[current.ExecID]; ok && active.MessageID == current.MessageID {
+		stream.ActiveForegroundShells[current.ExecID] = current
+	}
+	return current
+}
+
+func markShellTerminalPersisted(stream *ActiveStream, pending runtimecore.PendingExec) runtimecore.PendingExec {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+		return pending
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	current, ok := stream.PendingExecs[pending.ExecID]
+	if !ok || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass {
+		return pending
+	}
+	current.ShellTerminalPersisted = true
+	stream.PendingExecs[pending.ExecID] = current
+	if active, ok := stream.ActiveForegroundShells[pending.ExecID]; ok && active.MessageID == current.MessageID {
+		stream.ActiveForegroundShells[pending.ExecID] = current
+	}
+	return current
+}
+
+func rollbackShellFinalization(stream *ActiveStream, pending runtimecore.PendingExec) {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "shell" {
+		return
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	current, ok := stream.PendingExecs[pending.ExecID]
+	if !ok || current.MessageID != pending.MessageID || current.ProviderPass != pending.ProviderPass || current.ShellTerminalPersisted {
+		return
+	}
+	current.StreamState = pending.StreamState
+	stream.PendingExecs[pending.ExecID] = current
+	if active, ok := stream.ActiveForegroundShells[pending.ExecID]; ok && active.MessageID == current.MessageID {
+		stream.ActiveForegroundShells[pending.ExecID] = current
+	}
 }
 
 func snapshotPendingExecWithStatus(stream *ActiveStream, execID string) (runtimecore.PendingExec, StreamStatus, bool) {
@@ -207,20 +304,39 @@ func (service *Service) recoverShellWithoutTerminalIfNeeded(stream *ActiveStream
 		}
 		return service.recoverShellWithoutTerminal(stream, current, reason)
 	}
-	// 候选路径：仅当 PendingExec 上仍登记着同原因、同活动代次的候选时才收口。
-	if current.ShellRecoveryState != shellRecoveryStateCandidate ||
+	// 候选路径：仅当 PendingExec 上仍登记着同原因、同活动代次的候选时才继续。
+	candidateState := current.ShellRecoveryState == shellRecoveryStateCandidate ||
+		(reason == shellRecoveryReasonSkipped && current.ShellRecoveryState == shellRecoveryStateAbortRequested)
+	if !candidateState ||
 		current.ShellRecoveryReason != reason ||
 		current.ShellRecoveryGeneration != current.ShellActivityGeneration {
 		return nil
+	}
+	if reason == shellRecoveryReasonSkipped &&
+		current.ShellActivityGeneration == 0 &&
+		current.ChunkCount == 0 &&
+		current.FirstChunkAt.IsZero() &&
+		current.ShellAttempt > 0 &&
+		current.ShellAttempt < shellMaxTransportAttempts &&
+		shellCommandSafeToRetry(current.ArgsJSON) {
+		if current.ShellRecoveryState != shellRecoveryStateAbortRequested {
+			return service.requestShellAbortForReason(stream, current, shellRecoveryReasonSkipped)
+		}
+		return service.requeueSkippedForegroundShell(stream, current)
 	}
 	return service.recoverShellWithoutTerminal(stream, current, reason)
 }
 
 // requestShellAbortBeforeRecovery 是 foreground 恢复第一阶段：登记状态并向客户端请求中止，不合成任何终态。
 func (service *Service) requestShellAbortBeforeRecovery(stream *ActiveStream, pending runtimecore.PendingExec) error {
+	return service.requestShellAbortForReason(stream, pending, shellRecoveryReasonForegroundDeadline)
+}
+
+func (service *Service) requestShellAbortForReason(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
 	if service == nil || stream == nil {
 		return nil
 	}
+	reason = strings.TrimSpace(reason)
 	now := time.Now().UTC()
 	stream.mu.Lock()
 	current, found := stream.PendingExecs[pending.ExecID]
@@ -230,7 +346,7 @@ func (service *Service) requestShellAbortBeforeRecovery(stream *ActiveStream, pe
 	}
 	current.ShellRecoveryState = shellRecoveryStateAbortRequested
 	current.ShellRecoveryStateAt = now
-	current.ShellRecoveryReason = shellRecoveryReasonForegroundDeadline
+	current.ShellRecoveryReason = reason
 	current.ShellRecoveryGeneration = current.ShellActivityGeneration
 	stream.PendingExecs[current.ExecID] = current
 	stream.UpdatedAt = now
@@ -247,7 +363,7 @@ func (service *Service) requestShellAbortBeforeRecovery(stream *ActiveStream, pe
 			"message_id":          current.MessageID,
 			"provider_pass":       current.ProviderPass,
 			"activity_generation": current.ShellActivityGeneration,
-			"reason":              shellRecoveryReasonForegroundDeadline,
+			"reason":              reason,
 		})
 	}
 	service.scheduleStreamTimer(
@@ -257,7 +373,7 @@ func (service *Service) requestShellAbortBeforeRecovery(stream *ActiveStream, pe
 		streamTimerShellSupervision,
 		current.ExecID,
 		current.MessageID,
-		shellRecoveryReasonForegroundDeadline,
+		reason,
 	)
 	return nil
 }
@@ -290,37 +406,17 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 		stream.mu.Unlock()
 		return nil
 	}
-	if tombstone, completed := stream.ShellExecTombstones[pending.ExecID]; completed && tombstone.MessageID == pending.MessageID && tombstone.Generation == pending.ProviderPass {
+	if current.StreamState == shellLifecycleFinalizing || current.ShellTerminalPersisted {
 		stream.mu.Unlock()
 		return nil
 	}
-	// 终态所有权在同一临界区内一次性提交：tombstone、pending 删除和 batch terminal，
-	// 消除本地恢复与迟到 Exit 的双收口窗口。
-	now := time.Now().UTC()
-	cutoff := now.Add(-completedExecRetention)
-	if stream.ShellExecTombstones == nil {
-		stream.ShellExecTombstones = make(map[string]shellExecTombstone)
+	previous := current
+	current.StreamState = shellLifecycleFinalizing
+	stream.PendingExecs[current.ExecID] = current
+	if active, ok := stream.ActiveForegroundShells[current.ExecID]; ok && active.MessageID == current.MessageID {
+		stream.ActiveForegroundShells[current.ExecID] = current
 	}
-	if stream.RecentCompletedExecs == nil {
-		stream.RecentCompletedExecs = make(map[uint32]time.Time)
-	}
-	for execID, tombstone := range stream.ShellExecTombstones {
-		if tombstone.CompletedAt.Before(cutoff) && tombstone.Reason != shellRecoveryReasonSkipped {
-			delete(stream.ShellExecTombstones, execID)
-		}
-	}
-	stream.ShellExecTombstones[pending.ExecID] = shellExecTombstone{MessageID: pending.MessageID, Generation: pending.ProviderPass, CompletedAt: now}
-	delete(stream.PendingExecs, pending.ExecID)
-	markTaskBatchTerminalLocked(stream, current)
-	if pending.MessageID != 0 {
-		for messageID, completedAt := range stream.RecentCompletedExecs {
-			if completedAt.Before(cutoff) {
-				delete(stream.RecentCompletedExecs, messageID)
-			}
-		}
-		stream.RecentCompletedExecs[pending.MessageID] = now
-	}
-	stream.UpdatedAt = now
+	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 
 	pending = current
@@ -330,20 +426,50 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 		result = "Shell timed out: no terminal result arrived before the foreground deadline and an abort was requested. The tool call was closed locally as a timeout; the command outcome is unknown."
 	}
 	if reason == shellRecoveryReasonSkipped {
-		result = "shell skipped: Cursor rejected the execution before it started"
+		result = "Shell execution status is unknown: Cursor reported Skipped and no Start or output event was observed. The command was not automatically replayed unless it was classified as read-only; verify side effects before retrying."
 	}
-	if err := service.appendToolResult(stream, pending.ToolCallID, "Shell", pending.ArgsJSON, result, pending.ReasoningContent, nil); err != nil {
+	toolCallID := pending.ToolCallID
+	completedToolCall := execbridge.BuildShellRejectedToolCall(toolCallID, pending.ArgsJSON, result)
+	terminalOwner := "local_recovery"
+	if reason == shellRecoveryReasonPersistenceFailed && pending.ShellTerminalSnapshotReady {
+		toolCallID = firstNonEmpty(strings.TrimSpace(pending.ShellTerminalToolCallID), strings.TrimSpace(pending.ToolCallID))
+		result = pending.ShellTerminalResultPayload
+		completedToolCall = pending.ShellTerminalToolCall
+		terminalOwner = "persisted_terminal_retry"
+	} else if reason == shellRecoveryReasonPersistenceFailed {
+		result = "Shell reached a terminal event, but its original result could not be persisted and no terminal snapshot was available. The execution was not replayed; inspect logs before retrying any command with side effects."
+		completedToolCall = execbridge.BuildShellRejectedToolCall(toolCallID, pending.ArgsJSON, result)
+	}
+	if err := service.appendToolResult(stream, toolCallID, "Shell", pending.ArgsJSON, result, pending.ReasoningContent, completedToolCall); err != nil {
+		rollbackShellFinalization(stream, previous)
+		service.scheduleShellFinalizationRetry(stream, previous)
 		return err
+	}
+	pending = markShellTerminalPersisted(stream, pending)
+	if shellToolCallIsBackgrounded(completedToolCall) {
+		if recordedToolCallID, recorded := recordBackgroundShellActionMemory(stream, toolCallID, time.Now().UTC()); recorded {
+			if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+				newBackgroundShellActionMetadataEntry(stream.TurnSeq, stream.RequestID, recordedToolCallID, backgroundShellActionSourceLocalBackgrounded),
+			}); err != nil && service.debug != nil {
+				service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "background_shell_metadata_failed", map[string]any{
+					"tool_call_id": recordedToolCallID,
+					"exec_id":      pending.ExecID,
+					"error":        err.Error(),
+				})
+			}
+		}
 	}
 	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
 		newMetadataEntry(stream.TurnSeq, stream.RequestID, "shell_stream_recovered", map[string]any{
-			"tool_call_id":        pending.ToolCallID,
+			"tool_call_id":        toolCallID,
+			"logical_shell_id":    pending.LogicalShellID,
+			"transport_attempt":   pending.ShellAttempt,
 			"message_id":          pending.MessageID,
 			"exec_id":             pending.ExecID,
 			"generation":          pending.ProviderPass,
 			"activity_generation": pending.ShellActivityGeneration,
 			"recovery_state":      pending.ShellRecoveryState,
-			"terminal_owner":      "local_recovery",
+			"terminal_owner":      terminalOwner,
 			"reason":              reason,
 			"chunk_count":         pending.ChunkCount,
 			"stdout_buffer_bytes": len(pending.StdoutBuffer),
@@ -351,13 +477,26 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 			"terminal":            true,
 		}),
 	}); err != nil {
-		return err
+		if service.debug != nil {
+			service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_recovery_metadata_failed", map[string]any{
+				"tool_call_id": pending.ToolCallID,
+				"exec_id":      pending.ExecID,
+				"reason":       reason,
+				"error":        err.Error(),
+			})
+		}
 	}
-	if err := service.publishToolCallCompleted(stream.RequestID, pending.ToolCallID, pending.ModelCallID, nil); err != nil {
-		return err
+	markExecCompleted(stream, pending)
+	advanceErr := service.advanceForegroundShellQueue(stream, pending)
+	if err := service.publishToolCallCompleted(stream.RequestID, toolCallID, pending.ModelCallID, completedToolCall); err != nil && service.debug != nil {
+		service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "shell_completed_publish_failed", map[string]any{
+			"tool_call_id": toolCallID,
+			"exec_id":      pending.ExecID,
+			"error":        err.Error(),
+		})
 	}
-	if err := service.advanceForegroundShellQueue(stream, pending); err != nil {
-		return err
+	if advanceErr != nil {
+		return advanceErr
 	}
 	if err := service.syncSummaryCarryForward(stream.ConversationID, stream.RequestID, pending.ModelCallID); err != nil {
 		return err

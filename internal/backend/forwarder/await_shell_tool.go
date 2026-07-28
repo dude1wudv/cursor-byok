@@ -15,7 +15,10 @@ import (
 	runtimecore "cursor/internal/backend/agent/core"
 )
 
-const awaitShellOutputLimit = 16 * 1024
+const (
+	awaitShellOutputLimit             = 16 * 1024
+	backgroundShellCompletedRetention = 10 * time.Minute
+)
 
 const (
 	backgroundShellStatusBackgrounded     = "backgrounded"
@@ -116,6 +119,7 @@ func (service *Service) awaitShellSnapshot(stream *ActiveStream, args awaitShell
 	service.refreshBackgroundShellFromTerminalFile(stream, shellID)
 
 	stream.mu.Lock()
+	pruneBackgroundShellsLocked(stream, time.Now().UTC())
 	state, ok := stream.BackgroundShells[shellID]
 	if !ok || state == nil {
 		stream.mu.Unlock()
@@ -128,6 +132,8 @@ func (service *Service) awaitShellSnapshot(stream *ActiveStream, args awaitShell
 	}
 	stdoutStart := clampOffset(state.AwaitStdoutOffset, len(state.StdoutBuffer))
 	stderrStart := clampOffset(state.AwaitStderrOffset, len(state.StderrBuffer))
+	now := time.Now().UTC()
+	state.LastActivityAt = now
 	stdout := state.StdoutBuffer[stdoutStart:]
 	stderr := state.StderrBuffer[stderrStart:]
 	stdoutEnd := len(state.StdoutBuffer)
@@ -896,6 +902,64 @@ func appendBackgroundShellBuffer(current string, value string) string {
 		return current + trimmed
 	}
 	return current + "\n" + trimmed
+}
+
+func pruneBackgroundShellsLocked(stream *ActiveStream, now time.Time) {
+	if stream == nil || len(stream.BackgroundShells) == 0 {
+		return
+	}
+	cutoff := now.Add(-backgroundShellCompletedRetention)
+	for shellID, state := range stream.BackgroundShells {
+		if state == nil || !isBackgroundShellTerminalStatus(state.Status) || state.CompletedAt.IsZero() {
+			continue
+		}
+		leaseAt := state.CompletedAt
+		if state.LastActivityAt.After(leaseAt) {
+			leaseAt = state.LastActivityAt
+		}
+		if !leaseAt.Before(cutoff) {
+			continue
+		}
+		delete(stream.BackgroundShells, shellID)
+		if state.OriginalMessageID != 0 && stream.BackgroundShellsByMessageID[state.OriginalMessageID] == shellID {
+			delete(stream.BackgroundShellsByMessageID, state.OriginalMessageID)
+		}
+		if state.OriginalExecID != "" && stream.BackgroundShellsByExecID[state.OriginalExecID] == shellID {
+			delete(stream.BackgroundShellsByExecID, state.OriginalExecID)
+		}
+	}
+}
+
+func (service *Service) observeWriteShellStdinResult(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) {
+	if stream == nil || message == nil || message.GetWriteShellStdinResult() == nil {
+		return
+	}
+	result := message.GetWriteShellStdinResult()
+	shellIDValue := uint32(0)
+	if success := result.GetSuccess(); success != nil {
+		shellIDValue = success.GetShellId()
+	} else if args, err := runtimecore.DecodeArgsMap(pending.ArgsJSON); err == nil {
+		shellIDValue, _, _ = runtimecore.ReadUint32Arg(args, "shell_id", "shellId")
+	}
+	if shellIDValue == 0 {
+		return
+	}
+	shellID := strconv.FormatUint(uint64(shellIDValue), 10)
+	now := time.Now().UTC()
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	pruneBackgroundShellsLocked(stream, now)
+	state := stream.BackgroundShells[shellID]
+	if state == nil {
+		return
+	}
+	state.LastActivityAt = now
+	if writeError := result.GetError(); writeError != nil {
+		state.Status = backgroundShellStatusTransportClosed
+		state.CompletedAt = now
+		state.StderrBuffer = appendBackgroundShellBuffer(state.StderrBuffer, writeError.GetError())
+	}
+	stream.UpdatedAt = now
 }
 
 func ensureBackgroundShellStateLocked(stream *ActiveStream, shellID string, pending runtimecore.PendingExec, now time.Time) *BackgroundShellState {

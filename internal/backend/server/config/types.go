@@ -16,7 +16,7 @@ const (
 	DefaultProxyListenAddr                  = "127.0.0.1:18080"
 	DefaultFrontendBaseURL                  = "http://127.0.0.1"
 	DefaultRoutingMode                      = "local"
-	DefaultShellMaxConcurrentPerRun         = 32
+	DefaultShellMaxConcurrentPerRun         = 8
 	MinShellMaxConcurrentPerRun             = 1
 	MaxShellMaxConcurrentPerRun             = 32
 	MinProviderStreamIdleTimeoutSeconds     = 30

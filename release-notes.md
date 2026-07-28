@@ -1,6 +1,22 @@
 <!-- 发布约定：每次 Release 都保留“最近 5 个版本更新梗概”，覆盖当前版本和前 4 个版本。 -->
 
-# Cursor助手 v0.0.74
+# Cursor助手 v0.0.75
+
+本版本收敛 Cursor 原生 Shell 生命周期：未握手的 opening 请求按会话串行派发，运行并发恢复为保守默认值；`Skipped` 不再触发无条件重放，仅服务端可证明只读的命令允许有限重试，有副作用或状态不明的命令返回唯一“执行结果未知”终态。
+
+## Shell opening 背压与安全恢复
+
+- 拆分 opening 与 running 租约：同一会话最多只有一个 Shell 等待原生 `Start/stdout/stderr`，收到真实活动后才开放下一项；running 默认并发降至 8，避免向 Cursor 原生执行扩展突发分配大量终端。
+- `Skipped`、transport close 与 control throw 先进入短 grace，迟到活动可以恢复原 attempt；新 attempt 前请求中止旧 attempt，并继续按 `exec_id/message_id` 隔离迟到事件。
+- 自动重试仅允许服务端可验证的只读命令；写入、部署、提交以及无法分类的命令不自动重放，达到 attempt 上限后也会生成唯一模型可见终态。
+
+## 持久化优先与后台终端租约
+
+- Shell 终态先持久化 `tool_result`，成功后才清理 pending、写 tombstone、释放租约并推进队列；持久化失败会保留并重放原始 Exit 或 `backgrounded` 终态，不再丢失退出信息或 `shell_id`。
+- pre-dispatch 拒绝使用显式 Shell rejected 结果，区分“未发送”“transport skipped”和“已执行失败”。
+- 后台 `shell_id` 在 `AwaitShell`/`WriteShellStdin` 时续租；终态句柄按最后观察时间保留并回收，客户端确认 shell 不存在时立即失效。
+
+## 上一版本 v0.0.74 详细记录
 
 本版本重构 Cursor Shell 调度，并修复 BidiAppend 重连时 append 代际未接管：默认 Shell 并发提升至 32；未启动即被客户端 `Skipped` 的 transport 不再直接失败，而是在同一逻辑 tool call 下退避重排队；等待项通过 started + checkpoint 保持 pending/loading，旧 attempt 的迟到事件按 transport generation 隔离。
 
@@ -59,6 +75,12 @@
 
 ## 最近 5 个版本更新梗概
 
+### v0.0.75
+
+- Shell opening 按会话串行握手、running 默认并发降至 8；迟到活动可接管 uncertain attempt，避免终端分配突发造成 `Skipped` 放大。
+- 仅可证明只读的命令允许有限重试；副作用未知时不重放，attempt 上限与 pre-dispatch 拒绝均产生明确唯一终态。
+- `tool_result` 持久化先于 pending/tombstone 清理；原始终态可重放，后台 `shell_id` 采用续租、失效和保留期回收。
+
 ### v0.0.74
 
 - 修复 BidiAppend 重连后 duplicate run 未提交新 epoch，确保后续 `seq=2` 进入新代；保留失败回滚、旧代隔离和非敏感切换证据。
@@ -80,14 +102,9 @@
 - 修复 Claude extended thinking、`pause_turn`、SSE 错误映射及历史回放兼容问题，避免对话提前结束或隐性 400。
 - 为客户端工具与交互工具增加超时收口，修复 Plan 卡片渐进显示、thinking 参数兼容和 Grep 截断异常。
 
-### v0.0.70
-
-- 统一 Shell 活动迁移、两阶段 abort、终态所有权和指纹熔断，避免旧 deadline、双收口与重复拒绝循环。
-- 对齐 inspect 权限、Task 模式投影和 subagent 派遣终态，并为运行日志补充构建版本与提交身份。
-
 ## 发布资产
 
-- `cursor-byok-0.0.74-windows-amd64.zip`
-- `cursor-byok-0.0.74-macos-arm64.tar.gz`
-- `cursor-byok-0.0.74-macos-amd64.tar.gz`
+- `cursor-byok-0.0.75-windows-amd64.zip`
+- `cursor-byok-0.0.75-macos-arm64.tar.gz`
+- `cursor-byok-0.0.75-macos-amd64.tar.gz`
 - `update.json`
