@@ -239,7 +239,9 @@ func TestShellHookContextIsActivityButNotTerminal(t *testing.T) {
 		Id:     pending.MessageID,
 		ExecId: pending.ExecID,
 		Message: &agentv1.ExecClientMessage_ShellStream{ShellStream: &agentv1.ShellStream{
-			Event: &agentv1.ShellStream_HookContext{HookContext: &agentv1.ShellStreamHookContext{Context: "hook"}},
+			Event: &agentv1.ShellStream_HookContext{HookContext: &agentv1.ShellStreamHookContext{
+				HookAdditionalContexts: []*agentv1.HookAdditionalContext{{HookEventName: "before_shell", Content: "hook"}},
+			}},
 		}},
 	}, pending)
 	if err != nil {
@@ -288,7 +290,7 @@ func TestLegacyShellOutputWindowIsUsedWhenFullOutputIsMissing(t *testing.T) {
 			Result: &agentv1.ShellResult_Success{Success: &agentv1.ShellSuccess{
 				OutputHead:  stringPtr("head"),
 				OutputTail:  stringPtr("tail"),
-				ElidedChars: int32Ptr(12),
+				ElidedChars: uint32Ptr(12),
 			}},
 		}},
 	}, pending)

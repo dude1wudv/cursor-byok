@@ -825,6 +825,13 @@ func (bridge *Bridge) openShell(openContext OpenExecContext, toolCall runtimecor
 		}
 	}
 	simpleCommands, parsingResult := buildShellParsingMetadata(effectiveCommand)
+	var outputNotification []byte
+	if config := buildShellOutputNotificationConfig(args.NotifyOnOutput); config != nil {
+		outputNotification, err = proto.Marshal(config)
+		if err != nil {
+			return nil, runtimecore.PendingExec{}, fmt.Errorf("encode Shell output notification config failed: %w", err)
+		}
+	}
 	messageID := bridge.nextID()
 	execID := fmt.Sprintf("exec-shell-%d", time.Now().UnixNano())
 	serverMessage := &agentv1.AgentServerMessage{
@@ -844,7 +851,7 @@ func (bridge *Bridge) openShell(openContext OpenExecContext, toolCall runtimecor
 						TimeoutBehavior:          agentv1.TimeoutBehavior_TIMEOUT_BEHAVIOR_BACKGROUND,
 						HardTimeout:              int32Ptr(86400000),
 						Description:              stringPtrIfNonEmpty(args.Description),
-						OutputNotification:       buildShellOutputNotificationConfig(args.NotifyOnOutput),
+						OutputNotification:       outputNotification,
 						ConversationId:           stringPtrIfNonEmpty(openContext.ConversationID),
 					},
 				},

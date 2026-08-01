@@ -93,4 +93,78 @@ func TestCursor31321ProtocolFieldNumbers(t *testing.T) {
 			t.Fatalf("ShellStream.%s = %v, want message field %d", field.name, item, field.num)
 		}
 	}
+
+	assertField := func(message protoreflect.MessageDescriptor, name string, number protoreflect.FieldNumber, kind protoreflect.Kind) {
+		t.Helper()
+		field := message.Fields().ByName(protoreflect.Name(name))
+		if field == nil || field.Number() != number || field.Kind() != kind {
+			t.Fatalf("%s.%s = %v, want %s field %d", message.FullName(), name, field, kind, number)
+		}
+	}
+	assertOneofFields := func(message protoreflect.MessageDescriptor, fields map[string]protoreflect.FieldNumber) {
+		t.Helper()
+		for name, number := range fields {
+			assertField(message, name, number, protoreflect.MessageKind)
+		}
+	}
+
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("AgentRunRequest"), "client_supports_send_to_user", 23, protoreflect.BoolKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("AgentServerMessage"), "ttft_breakdown", 8, protoreflect.MessageKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ConversationAction"), "request_context_parts", 17, protoreflect.MessageKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ConversationAction"), "subscription_notification_action", 16, protoreflect.MessageKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("InteractionQuery"), "connect_scm_request_query", 14, protoreflect.MessageKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("InteractionResponse"), "connect_scm_request_response", 14, protoreflect.MessageKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("InteractionUpdate"), "response_comparison", 22, protoreflect.MessageKind)
+
+	execClient := agentv1.File_agent_v1_proto.Messages().ByName("ExecClientMessage")
+	assertField(execClient, "local_execution_time_ms", 39, protoreflect.Int32Kind)
+	assertField(execClient, "hook_additional_contexts", 45, protoreflect.MessageKind)
+	assertOneofFields(execClient, map[string]protoreflect.FieldNumber{
+		"canvas_diagnostics_result":           40,
+		"shell_allowlist_precheck_result":     41,
+		"mcp_allowlist_precheck_result":       42,
+		"web_fetch_allowlist_precheck_result": 43,
+		"git_diff_response":                   44,
+		"pi_read_result":                      46,
+		"pi_bash_result":                      47,
+		"pi_edit_result":                      48,
+		"pi_write_result":                     49,
+		"pi_grep_result":                      50,
+		"pi_find_result":                      51,
+		"pi_ls_result":                        52,
+		"conversation_search_result":          53,
+		"agent_store_conflict_result":         54,
+		"mini_swe_agent_bash_result":          55,
+	})
+
+	execServer := agentv1.File_agent_v1_proto.Messages().ByName("ExecServerMessage")
+	assertField(execServer, "accept_hook_additional_contexts", 55, protoreflect.BoolKind)
+	assertOneofFields(execServer, map[string]protoreflect.FieldNumber{
+		"canvas_diagnostics_args":           40,
+		"shell_allowlist_precheck_args":     41,
+		"mcp_allowlist_precheck_args":       42,
+		"web_fetch_allowlist_precheck_args": 43,
+		"git_diff_request":                  44,
+		"pi_read_args":                      45,
+		"pi_bash_args":                      46,
+		"pi_edit_args":                      47,
+		"pi_write_args":                     48,
+		"pi_grep_args":                      49,
+		"pi_find_args":                      50,
+		"pi_ls_args":                        51,
+		"mini_swe_agent_bash_args":          52,
+		"conversation_search_args":          53,
+		"agent_store_conflict_args":         54,
+	})
+
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ConversationTokenDetails"), "prompt_context_usage_tree", 4, protoreflect.MessageKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ShellArgs"), "output_notification", 18, protoreflect.BytesKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ShellFailure"), "elided_chars", 15, protoreflect.Uint32Kind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ShellSuccess"), "elided_chars", 17, protoreflect.Uint32Kind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ShellStreamHookContext"), "hook_additional_contexts", 1, protoreflect.MessageKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ShellSandboxUnsupported"), "reason", 4, protoreflect.StringKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ToolCall"), "hook_additional_contexts", 54, protoreflect.MessageKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ToolCall"), "tool_call_id", 57, protoreflect.StringKind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ToolCall"), "started_at_ms", 59, protoreflect.Uint64Kind)
+	assertField(agentv1.File_agent_v1_proto.Messages().ByName("ToolCall"), "completed_at_ms", 60, protoreflect.Uint64Kind)
 }

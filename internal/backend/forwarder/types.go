@@ -565,6 +565,8 @@ type InboundIntent struct {
 	ExcludeWorkspaceContext            bool
 	ClientSupportsInlineImages         bool
 	ClientSupportsInlineImagesSet      bool
+	ClientSupportsSendToUser           bool
+	ClientSupportsSendToUserSet        bool
 	SuppressSubagentProgressUpdateTool bool
 	ConversationState                  *agentv1.ConversationStateStructure
 	UserMessage                        *agentv1.UserMessage

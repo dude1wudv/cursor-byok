@@ -178,6 +178,8 @@ func TestRunRequestMetadataPreservesModelCapabilities(t *testing.T) {
 		ExcludeWorkspaceContext:            true,
 		ClientSupportsInlineImagesSet:      true,
 		ClientSupportsInlineImages:         false,
+		ClientSupportsSendToUserSet:        true,
+		ClientSupportsSendToUser:           true,
 		SuppressSubagentProgressUpdateTool: true,
 	})
 	if metadata["dev_raw_model_slug"] != "raw-model-slug" {
@@ -186,7 +188,7 @@ func TestRunRequestMetadataPreservesModelCapabilities(t *testing.T) {
 	if metadata["max_mode"] != true {
 		t.Fatalf("max_mode = %v", metadata["max_mode"])
 	}
-	if metadata["exclude_workspace_context"] != true || metadata["client_supports_inline_images"] != false || metadata["suppress_subagent_progress_update_tool"] != true {
+	if metadata["exclude_workspace_context"] != true || metadata["client_supports_inline_images"] != false || metadata["client_supports_send_to_user"] != true || metadata["suppress_subagent_progress_update_tool"] != true {
 		t.Fatalf("capability metadata = %#v", metadata)
 	}
 	parameters, ok := metadata["requested_model_parameters"].([]any)

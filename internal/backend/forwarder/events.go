@@ -362,7 +362,7 @@ func buildStartedToolCall(invocation runtimecore.ToolInvocation) *agentv1.ToolCa
 						WorkingDirectory:   strings.TrimSpace(input.WorkingDirectory),
 						ToolCallId:         invocation.CallID,
 						Description:        stringPtr(strings.TrimSpace(input.Description)),
-						OutputNotification: buildShellOutputNotificationConfig(input.NotifyOnOutput),
+						OutputNotification: buildShellOutputNotificationBytes(input.NotifyOnOutput),
 					},
 				},
 			},
@@ -613,6 +613,23 @@ func buildShellOutputNotificationConfig(input *struct {
 		Debounce:          debounce,
 		NotificationLimit: input.NotificationLimit,
 	}
+}
+
+func buildShellOutputNotificationBytes(input *struct {
+	Pattern           string   `json:"pattern"`
+	Reason            string   `json:"reason"`
+	DebounceMS        *float64 `json:"debounce_ms,omitempty"`
+	NotificationLimit *int32   `json:"notification_limit,omitempty"`
+}) []byte {
+	config := buildShellOutputNotificationConfig(input)
+	if config == nil {
+		return nil
+	}
+	payload, err := proto.Marshal(config)
+	if err != nil {
+		return nil
+	}
+	return payload
 }
 
 func stringPtr(value string) *string {

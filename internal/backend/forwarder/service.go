@@ -4225,6 +4225,9 @@ func buildRunRequestMetadata(intent InboundIntent) map[string]any {
 	if intent.ClientSupportsInlineImagesSet {
 		metadata["client_supports_inline_images"] = intent.ClientSupportsInlineImages
 	}
+	if intent.ClientSupportsSendToUserSet {
+		metadata["client_supports_send_to_user"] = intent.ClientSupportsSendToUser
+	}
 	metadata["suppress_subagent_progress_update_tool"] = intent.SuppressSubagentProgressUpdateTool
 	return metadata
 }
@@ -4497,18 +4500,21 @@ func extractConversationActionRequestContext(action *agentv1.ConversationAction)
 	if action == nil {
 		return nil
 	}
+	var requestContext *agentv1.RequestContext
 	switch item := action.GetAction().(type) {
 	case *agentv1.ConversationAction_UserMessageAction:
-		return item.UserMessageAction.GetRequestContext()
+		requestContext = item.UserMessageAction.GetRequestContext()
 	case *agentv1.ConversationAction_ResumeAction:
-		return item.ResumeAction.GetRequestContext()
+		requestContext = item.ResumeAction.GetRequestContext()
 	case *agentv1.ConversationAction_StartPlanAction:
-		return item.StartPlanAction.GetRequestContext()
+		requestContext = item.StartPlanAction.GetRequestContext()
 	case *agentv1.ConversationAction_ExecutePlanAction:
-		return item.ExecutePlanAction.GetRequestContext()
-	default:
-		return nil
+		requestContext = item.ExecutePlanAction.GetRequestContext()
 	}
+	if requestContext != nil {
+		return requestContext
+	}
+	return action.GetRequestContextParts().GetDynamicContext()
 }
 
 func conversationActionIsResume(action *agentv1.ConversationAction) bool {
@@ -4609,6 +4615,8 @@ func populateRunRequestCapabilities(intent *InboundIntent, request proto.Message
 		intent.ExcludeWorkspaceContext = runRequest.GetExcludeWorkspaceContext()
 		intent.ClientSupportsInlineImages = runRequest.GetClientSupportsInlineImages()
 		intent.ClientSupportsInlineImagesSet = hasProtoField(runRequest, "client_supports_inline_images")
+		intent.ClientSupportsSendToUser = runRequest.GetClientSupportsSendToUser()
+		intent.ClientSupportsSendToUserSet = hasProtoField(runRequest, "client_supports_send_to_user")
 		intent.SuppressSubagentProgressUpdateTool = runRequest.GetSuppressSubagentProgressUpdateTool()
 		return
 	}
@@ -4616,6 +4624,8 @@ func populateRunRequestCapabilities(intent *InboundIntent, request proto.Message
 		intent.ExcludeWorkspaceContext = prewarm.GetExcludeWorkspaceContext()
 		intent.ClientSupportsInlineImages = prewarm.GetClientSupportsInlineImages()
 		intent.ClientSupportsInlineImagesSet = hasProtoField(prewarm, "client_supports_inline_images")
+		intent.ClientSupportsSendToUser = prewarm.GetClientSupportsSendToUser()
+		intent.ClientSupportsSendToUserSet = hasProtoField(prewarm, "client_supports_send_to_user")
 		intent.SuppressSubagentProgressUpdateTool = prewarm.GetSuppressSubagentProgressUpdateTool()
 	}
 }
