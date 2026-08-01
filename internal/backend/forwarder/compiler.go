@@ -8,11 +8,13 @@ import (
 
 	"cursor/gen/agentv1"
 	modeladapter "cursor/internal/backend/agent/model"
+	promptengine "cursor/internal/backend/agent/prompt"
 	promptassets "cursor/prompt"
 )
 
 type PromptCompiler interface {
 	Compile(conversation *ConversationFile, mode agentv1.AgentMode, latestUserText string, modelName string) (CompiledConversation, error)
+	CompileWithOptions(conversation *ConversationFile, mode agentv1.AgentMode, latestUserText string, modelName string, options PromptCompileOptions) (CompiledConversation, error)
 	DerivePromptContexts(conversation *ConversationFile, mode agentv1.AgentMode, latestUserText string) ([]PromptContextMessage, error)
 }
 
@@ -35,6 +37,12 @@ func NewPromptCompiler(projector *HistoryProjector, catalog ToolCatalog, reminde
 
 // Compile 生成当前 turn 应发送给 provider 的消息和工具集合。
 func (compiler *DefaultPromptCompiler) Compile(conversation *ConversationFile, mode agentv1.AgentMode, latestUserText string, modelName string) (CompiledConversation, error) {
+	return compiler.CompileWithOptions(conversation, mode, latestUserText, modelName, PromptCompileOptions{})
+}
+
+// CompileWithOptions compiles a provider request with request-scoped client
+// capability filtering.
+func (compiler *DefaultPromptCompiler) CompileWithOptions(conversation *ConversationFile, mode agentv1.AgentMode, latestUserText string, modelName string, options PromptCompileOptions) (CompiledConversation, error) {
 	if compiler == nil || compiler.projector == nil || compiler.catalog == nil {
 		return CompiledConversation{}, fmt.Errorf("prompt compiler dependencies are not initialized")
 	}
@@ -66,7 +74,21 @@ func (compiler *DefaultPromptCompiler) Compile(conversation *ConversationFile, m
 	if err != nil {
 		return CompiledConversation{}, err
 	}
+	tools, _, err = filterToolsForPromptCompileOptions(tools, options)
+	if err != nil {
+		return CompiledConversation{}, err
+	}
 	replayMessages, err := compiler.projector.ProjectPromptReplay(conversation)
+	if err != nil {
+		return CompiledConversation{}, err
+	}
+	if options.ExcludeWorkspaceContext {
+		replayMessages = filterWorkspaceContextReplayMessages(replayMessages)
+	}
+	if options.ClientSupportsInlineImagesSet && !options.ClientSupportsInlineImages {
+		replayMessages = filterInlineImageContentParts(replayMessages)
+	}
+	promptContexts, err := compiler.DerivePromptContexts(conversation, normalizedMode, latestUserText)
 	if err != nil {
 		return CompiledConversation{}, err
 	}
@@ -96,12 +118,25 @@ func (compiler *DefaultPromptCompiler) Compile(conversation *ConversationFile, m
 		return CompiledConversation{}, err
 	}
 	messages = append(messages, replayMessages...)
+	for _, context := range promptContexts {
+		context = normalizePromptContextMessage(context)
+		if isReplayablePromptContext(context) {
+			messages = append(messages, context.Message)
+		}
+	}
+	messages = appendLatestRequestContextMessages(messages, options.LatestRequestContext, options.ExcludeWorkspaceContext)
+	for _, context := range options.TransientPromptContexts {
+		context = normalizePromptContextMessage(context)
+		if isReplayablePromptContext(context) {
+			messages = append(messages, context.Message)
+		}
+	}
 	return CompiledConversation{
 		Mode:               normalizedMode,
 		Messages:           messages,
 		StableMessageCount: stableReplayCount,
 		Tools:              tools,
-		CompileSummary:     fmt.Sprintf("mode=%s asset_mode=%s child=%t messages=%d tools=%d shared_rules_total=%d shared_rules_deduped=%d", normalizedMode.String(), string(assetMode), isChildConversationSubagentTypeName(subagentTypeName), len(messages), len(tools), sharedRuleTotal, sharedRuleCount),
+		CompileSummary:     fmt.Sprintf("mode=%s asset_mode=%s child=%t messages=%d tools=%d shared_rules_total=%d shared_rules_deduped=%d exclude_workspace_context=%t inline_images=%t suppress_subagent_progress_update_tool=%t", normalizedMode.String(), string(assetMode), isChildConversationSubagentTypeName(subagentTypeName), len(messages), len(tools), sharedRuleTotal, sharedRuleCount, options.ExcludeWorkspaceContext, options.ClientSupportsInlineImages, options.SuppressSubagentProgressUpdateTool),
 	}, nil
 }
 
@@ -134,16 +169,67 @@ func (compiler *DefaultPromptCompiler) DerivePromptContexts(conversation *Conver
 	candidates := make([]PromptContextMessage, 0, len(structuredStatePromptContexts)+len(structuredStateTailMessages)+len(promptReminders.PromptContexts)+len(promptReminders.TailMessages))
 	candidates = append(candidates, structuredStatePromptContexts...)
 	for _, message := range structuredStateTailMessages {
-		candidates = append(candidates, newPromptContextMessage(promptContextSourceStructuredTodoReminder, message, true))
+		candidates = append(candidates, newPromptContextMessage(promptContextSourceStructuredTodoReminder, message, false))
 	}
 	candidates = append(candidates, promptReminders.PromptContexts...)
 	for index, message := range promptReminders.TailMessages {
-		candidates = append(candidates, newPromptContextMessage(fmt.Sprintf("tail_reminder/%d", index), message, true))
-	}
-	for index := range candidates {
-		candidates[index].Persist = true
+		candidates = append(candidates, newPromptContextMessage(fmt.Sprintf("tail_reminder/%d", index), message, false))
 	}
 	return filterCurrentTurnPromptContexts(conversation, candidates), nil
+}
+
+func filterWorkspaceContextReplayMessages(messages []modeladapter.Message) []modeladapter.Message {
+	filtered := make([]modeladapter.Message, 0, len(messages))
+	for _, message := range messages {
+		content := strings.TrimSpace(message.Content)
+		if message.Role == "user" || message.Role == "system" {
+			if strings.Contains(content, "<user_info>") ||
+				strings.Contains(content, "<agent_transcripts>") ||
+				strings.Contains(content, "<mcp_file_system>") ||
+				strings.Contains(content, "<current_file_contents>") ||
+				strings.Contains(content, "<selected_files>") {
+				continue
+			}
+		}
+		filtered = append(filtered, message)
+	}
+	return filtered
+}
+
+func filterInlineImageContentParts(messages []modeladapter.Message) []modeladapter.Message {
+	filtered := make([]modeladapter.Message, 0, len(messages))
+	for _, message := range messages {
+		if len(message.ContentParts) == 0 {
+			filtered = append(filtered, message)
+			continue
+		}
+		parts := make([]modeladapter.ContentPart, 0, len(message.ContentParts))
+		for _, part := range message.ContentParts {
+			if strings.EqualFold(strings.TrimSpace(part.Type), "image") {
+				continue
+			}
+			parts = append(parts, part)
+		}
+		message.ContentParts = parts
+		if len(parts) == 0 && strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+		filtered = append(filtered, message)
+	}
+	return filtered
+}
+
+// appendLatestRequestContextMessages converts only request-scoped context to
+// provider messages; durable environment context remains in replay history.
+func appendLatestRequestContextMessages(messages []modeladapter.Message, requestContext *agentv1.RequestContext, excludeWorkspaceContext bool) []modeladapter.Message {
+	latest := latestRequestContextForProvider(requestContext, excludeWorkspaceContext)
+	if latest == nil {
+		return messages
+	}
+	for _, message := range promptengine.BuildRequestContextReplayMessages(latest) {
+		messages = append(messages, toModelMessage(message))
+	}
+	return messages
 }
 
 func loadToolCatalogForConversation(catalog ToolCatalog, mode agentv1.AgentMode, conversation *ConversationFile) ([]json.RawMessage, []string, error) {

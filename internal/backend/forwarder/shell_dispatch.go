@@ -30,7 +30,7 @@ func shellExecutionBegan(message *agentv1.ExecClientMessage) bool {
 		return false
 	}
 	switch message.GetShellStream().GetEvent().(type) {
-	case *agentv1.ShellStream_Start, *agentv1.ShellStream_Stdout, *agentv1.ShellStream_Stderr:
+	case *agentv1.ShellStream_Start, *agentv1.ShellStream_Stdout, *agentv1.ShellStream_Stderr, *agentv1.ShellStream_HookContext:
 		return true
 	default:
 		return false

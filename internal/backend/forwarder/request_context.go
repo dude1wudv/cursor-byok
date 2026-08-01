@@ -17,6 +17,63 @@ func normalizeRequestContextForStorage(requestContext *agentv1.RequestContext) *
 	return normalizeRequestContextForStorageMode(requestContext, true)
 }
 
+func cloneRequestContext(requestContext *agentv1.RequestContext) *agentv1.RequestContext {
+	if requestContext == nil {
+		return nil
+	}
+	cloned, ok := proto.Clone(requestContext).(*agentv1.RequestContext)
+	if !ok || cloned == nil {
+		return nil
+	}
+	return cloned
+}
+
+// normalizeRequestContextForHistory keeps the durable environment snapshot
+// while leaving request-scoped intent, hooks, and file contents out of replay.
+func normalizeRequestContextForHistory(requestContext *agentv1.RequestContext, includeStatic bool) *agentv1.RequestContext {
+	if requestContext == nil || !includeStatic {
+		return nil
+	}
+	normalized := normalizeRequestContextForStorageMode(requestContext, true)
+	if normalized == nil {
+		return nil
+	}
+	normalized.FileContents = nil
+	normalized.UserIntentSummary = nil
+	normalized.HooksAdditionalContext = nil
+	normalized.CommitAttributionMessage = nil
+	normalized.PrAttributionMessage = nil
+	return normalized
+}
+
+func latestRequestContextForProvider(requestContext *agentv1.RequestContext, excludeWorkspaceContext bool) *agentv1.RequestContext {
+	if requestContext == nil {
+		return nil
+	}
+	latest := &agentv1.RequestContext{}
+	if !excludeWorkspaceContext {
+		if fileContents := normalizeRealtimeFileContents(requestContext.GetFileContents()); len(fileContents) > 0 {
+			latest.FileContents = fileContents
+		}
+	}
+	if summary := strings.TrimSpace(requestContext.GetUserIntentSummary()); summary != "" {
+		latest.UserIntentSummary = stringPtr(truncatePromptGuardText("request_context.user_intent_summary", summary, promptGuardRealtimeTextChars))
+	}
+	if hooks := strings.TrimSpace(requestContext.GetHooksAdditionalContext()); hooks != "" {
+		latest.HooksAdditionalContext = stringPtr(truncatePromptGuardText("request_context.hooks_additional_context", hooks, promptGuardRealtimeTextChars))
+	}
+	if commit := strings.TrimSpace(requestContext.GetCommitAttributionMessage()); commit != "" {
+		latest.CommitAttributionMessage = stringPtr(truncatePromptGuardText("request_context.commit_attribution_message", commit, promptGuardRealtimeTextChars))
+	}
+	if pr := strings.TrimSpace(requestContext.GetPrAttributionMessage()); pr != "" {
+		latest.PrAttributionMessage = stringPtr(truncatePromptGuardText("request_context.pr_attribution_message", pr, promptGuardRealtimeTextChars))
+	}
+	if !hasRealtimeRequestContextContent(latest) {
+		return nil
+	}
+	return latest
+}
+
 func normalizeRequestContextForStorageMode(requestContext *agentv1.RequestContext, includeStatic bool) *agentv1.RequestContext {
 	if requestContext == nil {
 		return nil

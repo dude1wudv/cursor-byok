@@ -966,7 +966,7 @@ func (service *Service) scheduleProviderRetry(stream *ActiveStream, providerErr 
 	conversationID := stream.ConversationID
 	turnSeq := stream.TurnSeq
 	modelCallID := stream.CurrentModelCallID
-	continuationInjected := currentTurnHasPromptContextSource(stream.CheckpointConversation, turnSeq, promptContextSourceProviderStreamRecovery)
+	continuationInjected := hasTransientPromptContextSource(stream, promptContextSourceProviderStreamRecovery) || currentTurnHasPromptContextSource(stream.CheckpointConversation, turnSeq, promptContextSourceProviderStreamRecovery)
 	stream.mu.Unlock()
 
 	hasText := strings.TrimSpace(accumulatedText) != ""
@@ -987,10 +987,10 @@ func (service *Service) scheduleProviderRetry(stream *ActiveStream, providerErr 
 		"partial_tool_count":    partialToolCount,
 	})}
 	if (hasText || hasReasoning) && !continuationInjected {
-		entries = append(entries, newPromptContextEntry(turnSeq, requestID, newPromptContextReminder(
+		appendTransientPromptContext(stream, newPromptContextReminder(
 			promptContextSourceProviderStreamRecovery,
 			providerStreamRecoveryReminderText(),
-		)))
+		))
 	}
 	if _, err := service.appendConversationEntries(stream, conversationID, entries); err != nil {
 		return true, err
@@ -1177,10 +1177,10 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 					"finish_reason": finishReason,
 				})}
 				if continuationCount == 1 {
-					entries = append(entries, newPromptContextEntry(turnSeq, requestID, newPromptContextReminder(
+					appendTransientPromptContext(stream, newPromptContextReminder(
 						promptContextSourceProviderContinuation,
 						"The previous provider pass reached its output limit. Continue exactly from the prior assistant output, avoid repeating content already emitted, and finish the current task.",
-					)))
+					))
 				}
 				if _, err := service.appendConversationEntries(stream, conversationID, entries); err != nil {
 					return service.failStreamIfNonTerminal(stream, "unknown", err)
@@ -1310,22 +1310,11 @@ func (service *Service) handleSubagentEmptyStopAfterToolResult(stream *ActiveStr
 	if conversation == nil || !isChildConversationSubagentTypeName(conversation.SubagentTypeName) || !currentTurnHasToolResult(conversation, turnSeq) {
 		return false, nil
 	}
-	if currentTurnHasPromptContextSource(conversation, turnSeq, promptContextSourceSubagentEmptyStopRecovery) {
+	if hasTransientPromptContextSource(stream, promptContextSourceSubagentEmptyStopRecovery) || currentTurnHasPromptContextSource(conversation, turnSeq, promptContextSourceSubagentEmptyStopRecovery) {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return true, service.failStream(stream, "empty_response", errors.New(subagentEmptyStopErrorText))
 	}
-	context := newPromptContextReminder(promptContextSourceSubagentEmptyStopRecovery, subagentEmptyStopRecoveryText())
-	if _, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
-		newPromptContextEntry(turnSeq, requestID, context),
-	}); err != nil {
-		return true, err
-	}
-	if err := service.syncSummaryCarryForward(conversationID, requestID, modelCallID); err != nil {
-		return true, err
-	}
-	if err := service.publishCheckpoint(requestID, conversationID); err != nil {
-		return true, err
-	}
+	appendTransientPromptContext(stream, newPromptContextReminder(promptContextSourceSubagentEmptyStopRecovery, subagentEmptyStopRecoveryText()))
 	if err := service.requestProviderAction(stream, providerActionResume); err != nil {
 		return true, err
 	}

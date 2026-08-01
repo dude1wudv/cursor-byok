@@ -50,6 +50,7 @@ func (gateway *DefaultProviderGateway) StartStream(ctx context.Context, req Prov
 		MaxTokens:           req.MaxTokens,
 		Stream:              true,
 		RequestKnobs:        requestKnobs,
+		RequestMetadata:     cloneStringAnyMap(req.RequestMetadata),
 		CompileSummary:      req.CompileSummary,
 		Observer:            req.Observer,
 		ArtifactPaths:       req.ArtifactPaths,

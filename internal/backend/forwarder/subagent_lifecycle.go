@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"cursor/gen/agentv1"
+	execbridge "cursor/internal/backend/agent/bridge/exec"
 	runtimecore "cursor/internal/backend/agent/core"
 	modeladapter "cursor/internal/backend/agent/model"
 )
@@ -1013,6 +1014,48 @@ func isBackgroundSubagentAck(result *agentv1.SubagentResult) bool {
 	success := result.GetSuccess()
 	return strings.TrimSpace(success.GetFinalMessage()) == "" &&
 		(success.GetBackgroundReason() != agentv1.SubagentBackgroundReason_SUBAGENT_BACKGROUND_REASON_UNSPECIFIED || strings.TrimSpace(success.GetTranscriptPath()) != "")
+}
+
+func subagentAwaitCompletionMessage(message *agentv1.ExecClientMessage) *agentv1.ExecClientMessage {
+	if message == nil {
+		return nil
+	}
+	result := execbridge.ConvertSubagentAwaitResult(message.GetSubagentAwaitResult())
+	if result == nil {
+		return nil
+	}
+	return &agentv1.ExecClientMessage{
+		Id:     message.GetId(),
+		ExecId: message.GetExecId(),
+		Message: &agentv1.ExecClientMessage_SubagentResult{
+			SubagentResult: result,
+		},
+	}
+}
+
+func refreshSubagentLeaseFromAwait(stream *ActiveStream, pending runtimecore.PendingExec) bool {
+	if stream == nil || strings.TrimSpace(pending.ExecKind) != "subagent" {
+		return false
+	}
+	now := time.Now().UTC()
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if current, ok := stream.PendingExecs[pending.ExecID]; ok && current.MessageID == pending.MessageID && current.ProviderPass == pending.ProviderPass {
+		current = initializePendingSubagentLease(current, now)
+		current.LastSubagentProgressAt = now
+		current.SubagentLeaseDeadline = now.Add(subagentInactivityTimeout)
+		stream.PendingExecs[pending.ExecID] = current
+		stream.UpdatedAt = now
+		return true
+	}
+	if state, ok := stream.SubagentFinalizations[subagentFinalizationKey(pending)]; ok && state != nil && state.Pending.MessageID == pending.MessageID && state.Pending.ProviderPass == pending.ProviderPass {
+		state.Pending = initializePendingSubagentLease(state.Pending, now)
+		state.Pending.LastSubagentProgressAt = now
+		state.Pending.SubagentLeaseDeadline = now.Add(subagentInactivityTimeout)
+		stream.UpdatedAt = now
+		return true
+	}
+	return false
 }
 
 func subagentResultRunState(result *agentv1.SubagentResult) (agentv1.SubagentRunStatus, string, string) {

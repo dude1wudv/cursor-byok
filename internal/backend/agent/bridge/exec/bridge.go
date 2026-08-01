@@ -104,6 +104,8 @@ func (bridge *Bridge) OpenExec(openContext OpenExecContext, toolCall runtimecore
 		return bridge.openForceBackgroundShell(toolCall)
 	case "Task":
 		return bridge.openTask(openContext, toolCall)
+	case "SubagentAwait":
+		return bridge.openSubagentAwait(toolCall)
 	case "CallMcpTool":
 		return bridge.openMcp(toolCall)
 	case "ListMcpResources":
@@ -219,11 +221,28 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 	case "subagent":
 		subagentResult := msg.GetSubagentResult()
 		if subagentResult == nil {
+			if awaitResult := msg.GetSubagentAwaitResult(); awaitResult != nil {
+				subagentResult = ConvertSubagentAwaitResult(awaitResult)
+				if subagentResult == nil {
+					result.ToolResultPayload = summarizeSubagentAwaitResult(awaitResult)
+					return result, nil
+				}
+			}
+		}
+		if subagentResult == nil {
 			return result, nil
 		}
 		result.ToolResultPayload = summarizeSubagentResult(subagentResult)
 		result.ToolCall = buildTaskCompletedToolCall(pending.ArgsJSON, subagentResult)
 		result.IsTerminal = !isBackgroundSubagentResult(subagentResult)
+		return result, nil
+	case "subagent_await":
+		awaitResult := msg.GetSubagentAwaitResult()
+		if awaitResult == nil {
+			return result, nil
+		}
+		result.ToolResultPayload = summarizeSubagentAwaitResult(awaitResult)
+		result.IsTerminal = awaitResult.GetStillRunning() == nil
 		return result, nil
 	case "write_shell_stdin":
 		writeResult := msg.GetWriteShellStdinResult()
@@ -295,6 +314,24 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 				},
 			}
 			return result, nil
+		case *agentv1.ShellStream_HookContext:
+			if event.HookContext == nil {
+				return result, nil
+			}
+			result.ToolResultPayload = "shell hook context received"
+			return result, nil
+		case *agentv1.ShellStream_SandboxUnsupported:
+			if event.SandboxUnsupported == nil {
+				return result, nil
+			}
+			reason := strings.TrimSpace(event.SandboxUnsupported.GetReason())
+			if reason == "" {
+				reason = "sandbox unsupported"
+			}
+			result.ToolResultPayload = "shell sandbox unsupported: " + reason
+			result.ToolCall = buildShellRejectedToolCall(pending.ToolCallID, pending.ArgsJSON, &agentv1.ShellRejected{Reason: result.ToolResultPayload})
+			result.IsTerminal = true
+			return withShellConversationID(result, pending), nil
 		case *agentv1.ShellStream_Exit:
 			if event.Exit == nil {
 				return result, nil
@@ -964,6 +1001,66 @@ func isConcreteTaskModelSelection(modelID string) bool {
 	return strings.TrimSpace(modelID) != ""
 }
 
+type subagentAwaitArgs struct {
+	AgentID   string
+	TimeoutMS uint32
+}
+
+func decodeSubagentAwaitArgs(raw []byte) (subagentAwaitArgs, error) {
+	args, err := decodeArgsMap(raw)
+	if err != nil {
+		return subagentAwaitArgs{}, err
+	}
+	result := subagentAwaitArgs{
+		AgentID:   strings.TrimSpace(readStringArg(args, "agent_id", "agentId", "task_id", "taskId")),
+		TimeoutMS: 30000,
+	}
+	if result.AgentID == "" {
+		return result, fmt.Errorf("SubagentAwait agent_id is required")
+	}
+	if value, found, err := runtimecore.ReadInt64Arg(args, "timeout_ms", "timeoutMs", "block_until_ms", "blockUntilMs"); err != nil {
+		return result, err
+	} else if found {
+		if value < 0 || value > int64(^uint32(0)) {
+			return result, fmt.Errorf("SubagentAwait timeout_ms is out of range")
+		}
+		result.TimeoutMS = uint32(value)
+	}
+	return result, nil
+}
+
+func (bridge *Bridge) openSubagentAwait(toolCall runtimecore.ToolInvocation) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error) {
+	args, err := decodeSubagentAwaitArgs(toolCall.ArgsJSON)
+	if err != nil {
+		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode SubagentAwait args failed: %w", err)
+	}
+	messageID := bridge.nextID()
+	execID := fmt.Sprintf("exec-subagent-await-%d", time.Now().UnixNano())
+	serverMessage := &agentv1.AgentServerMessage{
+		Message: &agentv1.AgentServerMessage_ExecServerMessage{
+			ExecServerMessage: &agentv1.ExecServerMessage{
+				Id:     messageID,
+				ExecId: execID,
+				Message: &agentv1.ExecServerMessage_SubagentAwaitArgs{
+					SubagentAwaitArgs: &agentv1.SubagentAwaitArgs{
+						AgentId:   args.AgentID,
+						TimeoutMs: args.TimeoutMS,
+					},
+				},
+			},
+		},
+	}
+	return serverMessage, runtimecore.PendingExec{
+		MessageID:   messageID,
+		ExecID:      execID,
+		ArgsJSON:    append([]byte(nil), toolCall.ArgsJSON...),
+		ToolCallID:  toolCall.CallID,
+		ExecKind:    "subagent_await",
+		StreamState: "opened",
+		OpenedAt:    time.Now().UTC(),
+	}, nil
+}
+
 // openTask 构造 Task 对应的执行桥请求。
 func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore.ToolInvocation) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error) {
 	args, err := decodeArgsMap(toolCall.ArgsJSON)
@@ -1400,6 +1497,62 @@ func summarizeSubagentResult(result *agentv1.SubagentResult) string {
 	default:
 		return "unknown subagent result"
 	}
+}
+
+// ConvertSubagentAwaitResult 将新版 SubagentAwait 终态映射到既有 Task finalization 语义。
+// still_running 返回 nil，调用方只能续租/继续等待，不能把它当作子代理结果。
+func ConvertSubagentAwaitResult(result *agentv1.SubagentAwaitResult) *agentv1.SubagentResult {
+	if result == nil {
+		return nil
+	}
+	if complete := result.GetComplete(); complete != nil {
+		finalMessage := complete.GetFinalMessage()
+		return &agentv1.SubagentResult{Result: &agentv1.SubagentResult_Success{
+			Success: &agentv1.SubagentSuccess{
+				AgentId:        complete.GetAgentId(),
+				FinalMessage:   stringPtr(finalMessage),
+				TranscriptPath: complete.TranscriptPath,
+			},
+		}}
+	}
+	if notFound := result.GetNotFound(); notFound != nil {
+		agentID := notFound.GetAgentId()
+		return &agentv1.SubagentResult{Result: &agentv1.SubagentResult_Error{
+			Error: &agentv1.SubagentError{
+				AgentId: &agentID,
+				Error:   "subagent not found",
+			},
+		}}
+	}
+	if failure := result.GetError(); failure != nil {
+		agentID := failure.GetAgentId()
+		return &agentv1.SubagentResult{Result: &agentv1.SubagentResult_Error{
+			Error: &agentv1.SubagentError{
+				AgentId: &agentID,
+				Error:   failure.GetError(),
+			},
+		}}
+	}
+	return nil
+}
+
+func summarizeSubagentAwaitResult(result *agentv1.SubagentAwaitResult) string {
+	if result == nil {
+		return "subagent await result missing"
+	}
+	if stillRunning := result.GetStillRunning(); stillRunning != nil {
+		return fmt.Sprintf("subagent still running agent_id=%s", strings.TrimSpace(stillRunning.GetAgentId()))
+	}
+	if complete := result.GetComplete(); complete != nil {
+		return firstNonEmptyText(strings.TrimSpace(complete.GetFinalMessage()), fmt.Sprintf("subagent completed agent_id=%s", strings.TrimSpace(complete.GetAgentId())))
+	}
+	if notFound := result.GetNotFound(); notFound != nil {
+		return fmt.Sprintf("subagent not found agent_id=%s", strings.TrimSpace(notFound.GetAgentId()))
+	}
+	if failure := result.GetError(); failure != nil {
+		return firstNonEmptyText(strings.TrimSpace(failure.GetError()), "subagent await failed")
+	}
+	return "unknown subagent await result"
 }
 
 // summarizeDeleteResult 生成 Delete 结果摘要。
@@ -2065,15 +2218,17 @@ func applyLegacyShellResult(result ExecApplyResult, pending runtimecore.PendingE
 		if item.Success == nil {
 			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result success payload is empty")
 		}
-		result.ToolResultPayload = summarizeLegacyShellOutput(item.Success.GetStdout(), item.Success.GetStderr(), fmt.Sprintf("shell exited with code=%d", item.Success.GetExitCode()))
+		stdout := shellOutputWindow(item.Success.GetStdout(), item.Success.GetOutputHead(), item.Success.GetOutputTail())
+		result.ToolResultPayload = summarizeLegacyShellOutput(stdout, item.Success.GetStderr(), fmt.Sprintf("shell exited with code=%d", item.Success.GetExitCode()))
 		if normalized.GetIsBackground() || item.Success.GetShellId() != 0 {
-			result.ToolResultPayload = summarizeLegacyShellOutput(item.Success.GetStdout(), item.Success.GetStderr(), fmt.Sprintf("shell backgrounded: %d", item.Success.GetShellId()))
+			result.ToolResultPayload = summarizeLegacyShellOutput(stdout, item.Success.GetStderr(), fmt.Sprintf("shell backgrounded: %d", item.Success.GetShellId()))
 		}
 	case *agentv1.ShellResult_Failure:
 		if item.Failure == nil {
 			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result failure payload is empty")
 		}
-		result.ToolResultPayload = summarizeLegacyShellOutput(item.Failure.GetStdout(), item.Failure.GetStderr(), fmt.Sprintf("shell exited with code=%d", item.Failure.GetExitCode()))
+		stdout := shellOutputWindow(item.Failure.GetStdout(), item.Failure.GetOutputHead(), item.Failure.GetOutputTail())
+		result.ToolResultPayload = summarizeLegacyShellOutput(stdout, item.Failure.GetStderr(), fmt.Sprintf("shell exited with code=%d", item.Failure.GetExitCode()))
 	case *agentv1.ShellResult_Timeout:
 		if item.Timeout == nil {
 			return buildSyntheticShellProtocolFailure(result, pending, "legacy shell_result timeout payload is empty")
@@ -2133,6 +2288,22 @@ func summarizeLegacyShellOutput(stdout string, stderr string, fallback string) s
 		return output
 	}
 	return fallback
+}
+
+func shellOutputWindow(full string, head string, tail string) string {
+	if strings.TrimSpace(full) != "" {
+		return full
+	}
+	head = strings.TrimSpace(head)
+	tail = strings.TrimSpace(tail)
+	switch {
+	case head == "":
+		return tail
+	case tail == "" || head == tail:
+		return head
+	default:
+		return head + "\n...[shell output elided]...\n" + tail
+	}
 }
 
 func summarizeCapturedShellProtocolOutput(stdout string, stderr string) string {

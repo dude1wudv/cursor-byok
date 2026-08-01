@@ -228,17 +228,21 @@ type shellExecTombstone struct {
 type ActiveStream struct {
 	mu sync.Mutex
 
-	RequestID              string
-	ConversationID         string
-	TurnSeq                int64
-	ModelID                string
-	ModelName              string
-	Mode                   agentv1.AgentMode
-	LatestUserText         string
-	Status                 StreamStatus
-	RunAccepted            bool
-	ThinkingEffort         string
-	SubagentModelOverrides map[string]runtimecore.SubagentModelOverrideSelection
+	RequestID               string
+	ConversationID          string
+	TurnSeq                 int64
+	ModelID                 string
+	ModelName               string
+	Mode                    agentv1.AgentMode
+	LatestUserText          string
+	Status                  StreamStatus
+	RunAccepted             bool
+	ThinkingEffort          string
+	SubagentModelOverrides  map[string]runtimecore.SubagentModelOverrideSelection
+	RequestMetadata         map[string]any
+	PromptCompileOptions    PromptCompileOptions
+	LatestRequestContext    *agentv1.RequestContext
+	TransientPromptContexts []PromptContextMessage
 
 	CurrentModelCallID                          string
 	ProviderActive                              bool
@@ -376,10 +380,22 @@ type ProviderRequest struct {
 	Tools               []json.RawMessage
 	MaxTokens           int
 	RequestKnobs        map[string]any
+	RequestMetadata     map[string]any
 	CompileSummary      string
 	Observer            modeladapter.LLMArtifactObserver
 	ArtifactPaths       *modeladapter.LLMArtifactPaths
 	RequestBodyOverride map[string]any
+}
+
+// PromptCompileOptions controls request-scoped client capabilities. These
+// values affect only the current provider request and are not persisted.
+type PromptCompileOptions struct {
+	ExcludeWorkspaceContext            bool
+	ClientSupportsInlineImagesSet      bool
+	ClientSupportsInlineImages         bool
+	SuppressSubagentProgressUpdateTool bool
+	LatestRequestContext               *agentv1.RequestContext
+	TransientPromptContexts            []PromptContextMessage
 }
 
 type ProviderGateway interface {
@@ -525,41 +541,54 @@ const (
 )
 
 type InboundIntent struct {
-	Kind                     string
-	RequestID                string
-	ConversationID           string
-	ModelID                  string
-	ModelName                string
-	ThinkingEffort           string
-	Mode                     agentv1.AgentMode
-	HasExplicitMode          bool
-	ModeSource               ModeSource
-	StartsRun                bool
-	ExecutePlan              bool
-	ExecutePlanID            string
-	ExecutePlanFileURI       string
-	ExecutePlanFilePath      string
-	ExecutePlanKickoffID     string
-	ExecutePlanText          string
-	ExecutePlanHash          string
-	SubagentTypeName         string
-	SubagentModelOverrides   map[string]runtimecore.SubagentModelOverrideSelection
-	ConversationState        *agentv1.ConversationStateStructure
-	UserMessage              *agentv1.UserMessage
-	RequestContext           *agentv1.RequestContext
-	ClientMessage            *agentv1.AgentClientMessage
-	ExecClientMessage        *agentv1.ExecClientMessage
-	ExecClientControlMessage *agentv1.ExecClientControlMessage
-	InteractionResponse      *agentv1.InteractionResponse
-	KVClientMessage          *agentv1.KvClientMessage
-	CancelReason             string
-	IgnoredReason            string
-	Prewarm                  bool
+	Kind                               string
+	RequestID                          string
+	ConversationID                     string
+	ModelID                            string
+	ModelName                          string
+	ThinkingEffort                     string
+	Mode                               agentv1.AgentMode
+	HasExplicitMode                    bool
+	ModeSource                         ModeSource
+	StartsRun                          bool
+	ExecutePlan                        bool
+	ExecutePlanID                      string
+	ExecutePlanFileURI                 string
+	ExecutePlanFilePath                string
+	ExecutePlanKickoffID               string
+	ExecutePlanText                    string
+	ExecutePlanHash                    string
+	SubagentTypeName                   string
+	SubagentModelOverrides             map[string]runtimecore.SubagentModelOverrideSelection
+	RequestedModelPayload              map[string]any
+	DevRawModelSlug                    string
+	ExcludeWorkspaceContext            bool
+	ClientSupportsInlineImages         bool
+	ClientSupportsInlineImagesSet      bool
+	SuppressSubagentProgressUpdateTool bool
+	ConversationState                  *agentv1.ConversationStateStructure
+	UserMessage                        *agentv1.UserMessage
+	RequestContext                     *agentv1.RequestContext
+	ClientMessage                      *agentv1.AgentClientMessage
+	ExecClientMessage                  *agentv1.ExecClientMessage
+	ExecClientControlMessage           *agentv1.ExecClientControlMessage
+	InteractionResponse                *agentv1.InteractionResponse
+	KVClientMessage                    *agentv1.KvClientMessage
+	CancelReason                       string
+	IgnoredReason                      string
+	Prewarm                            bool
 }
 
 // normalizeMode 对外部传入的 mode 做最小归一化，但不再静默降级。
 func normalizeMode(mode agentv1.AgentMode) agentv1.AgentMode {
-	return mode
+	switch mode {
+	case agentv1.AgentMode_AGENT_MODE_TRIAGE:
+		return agentv1.AgentMode_AGENT_MODE_DEBUG
+	case agentv1.AgentMode_AGENT_MODE_PROJECT:
+		return agentv1.AgentMode_AGENT_MODE_PLAN
+	default:
+		return mode
+	}
 }
 
 func isSupportedActiveMode(mode agentv1.AgentMode) bool {
@@ -620,6 +649,10 @@ func parseModeAlias(raw string) (agentv1.AgentMode, error) {
 		return agentv1.AgentMode_AGENT_MODE_PLAN, nil
 	case "debug":
 		return agentv1.AgentMode_AGENT_MODE_DEBUG, nil
+	case "triage":
+		return agentv1.AgentMode_AGENT_MODE_TRIAGE, nil
+	case "project":
+		return agentv1.AgentMode_AGENT_MODE_PROJECT, nil
 	case "multitask":
 		return agentv1.AgentMode_AGENT_MODE_MULTITASK, nil
 	default:
@@ -637,6 +670,10 @@ func parseTargetModeID(raw string) (agentv1.AgentMode, error) {
 		return agentv1.AgentMode_AGENT_MODE_PLAN, nil
 	case "debug":
 		return agentv1.AgentMode_AGENT_MODE_DEBUG, nil
+	case "triage":
+		return agentv1.AgentMode_AGENT_MODE_TRIAGE, nil
+	case "project":
+		return agentv1.AgentMode_AGENT_MODE_PROJECT, nil
 	case "multitask":
 		return agentv1.AgentMode_AGENT_MODE_MULTITASK, nil
 	default:

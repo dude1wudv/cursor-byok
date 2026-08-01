@@ -250,6 +250,8 @@ var agentModeToolNames = map[string]struct{}{
 	"ReadLints":            {},
 	"Shell":                {},
 	"AwaitShell":           {},
+	"Await":                {},
+	"SubagentAwait":        {},
 	"WriteShellStdin":      {},
 	"ForceBackgroundShell": {},
 	"SwitchMode":           {},
@@ -261,16 +263,18 @@ var agentModeToolNames = map[string]struct{}{
 }
 
 var multitaskModeToolNames = map[string]struct{}{
-	"AskQuestion": {},
-	"Glob":        {},
-	"Grep":        {},
-	"Ls":          {},
-	"Read":        {},
-	"SwitchMode":  {},
-	"Task":        {},
-	"TodoWrite":   {},
-	"WebFetch":    {},
-	"WebSearch":   {},
+	"AskQuestion":   {},
+	"Glob":          {},
+	"Grep":          {},
+	"Ls":            {},
+	"Read":          {},
+	"SwitchMode":    {},
+	"Task":          {},
+	"Await":         {},
+	"SubagentAwait": {},
+	"TodoWrite":     {},
+	"WebFetch":      {},
+	"WebSearch":     {},
 }
 
 var debugModeToolNames = map[string]struct{}{
@@ -286,6 +290,8 @@ var debugModeToolNames = map[string]struct{}{
 	"ReadLints":            {},
 	"Shell":                {},
 	"AwaitShell":           {},
+	"Await":                {},
+	"SubagentAwait":        {},
 	"WriteShellStdin":      {},
 	"ForceBackgroundShell": {},
 	"Task":                 {},
@@ -308,6 +314,8 @@ var askModeToolNames = map[string]struct{}{
 	"ReadLints":            {},
 	"Shell":                {},
 	"AwaitShell":           {},
+	"Await":                {},
+	"SubagentAwait":        {},
 	"WriteShellStdin":      {},
 	"ForceBackgroundShell": {},
 	"Task":                 {},
@@ -329,6 +337,8 @@ var planModeToolNames = map[string]struct{}{
 	"ReadLints":            {},
 	"Shell":                {},
 	"AwaitShell":           {},
+	"Await":                {},
+	"SubagentAwait":        {},
 	"WriteShellStdin":      {},
 	"ForceBackgroundShell": {},
 	"Task":                 {},
@@ -509,6 +519,31 @@ func filterTaskToolForSubagentRole(conversation *ConversationFile, items []json.
 	}
 	return filtered, names, nil
 }
+
+// filterToolsForPromptCompileOptions applies capabilities negotiated by the
+// local Cursor client after the mode and subagent filters have run. Keeping
+// this at the final catalog boundary makes the same decision apply to both
+// root and child conversations without changing the static tool assets.
+func filterToolsForPromptCompileOptions(items []json.RawMessage, options PromptCompileOptions) ([]json.RawMessage, []string, error) {
+	filtered := make([]json.RawMessage, 0, len(items))
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		name, err := extractToolName(item)
+		if err != nil {
+			return nil, nil, err
+		}
+		if options.ClientSupportsInlineImagesSet && !options.ClientSupportsInlineImages && name == "GenerateImage" {
+			continue
+		}
+		if options.SuppressSubagentProgressUpdateTool && name == "SubagentAwait" {
+			continue
+		}
+		filtered = append(filtered, item)
+		names = append(names, name)
+	}
+	return filtered, names, nil
+}
+
 func selectToolsByOrderedNames(items []json.RawMessage, orderedNames []string) ([]json.RawMessage, []string, error) {
 	byName := make(map[string]json.RawMessage, len(items))
 	for _, item := range items {

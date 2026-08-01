@@ -401,6 +401,37 @@
     }
   },
   {
+    "type": "function",
+    "function": {
+      "name": "Await",
+      "description": "Wait for a background shell or subagent result. Provide task_id or agent_id when polling a detached task; set block_until_ms or timeout_ms to control the wait.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "task_id": {"type": "string", "description": "Background shell or task identifier."},
+          "agent_id": {"type": "string", "description": "Detached subagent identifier."},
+          "block_until_ms": {"type": "number", "description": "Maximum wait in milliseconds; use 0 for a non-blocking check."},
+          "pattern": {"type": "string", "description": "Optional multiline regex to match accumulated output."}
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "SubagentAwait",
+      "description": "Poll a detached subagent by agent_id. A still-running response is not a final result; use the returned completion or error before continuing.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {"type": "string", "description": "The detached subagent identifier returned by Task."},
+          "timeout_ms": {"type": "number", "description": "Maximum wait in milliseconds."}
+        },
+        "required": ["agent_id"]
+      }
+    }
+  },
+  {
     "function": {
       "description": "Writes literal characters to an existing background shell session. Use only when a previous Shell result returned a shell_id and the process is waiting for stdin. Include any needed newline in chars.",
       "name": "WriteShellStdin",

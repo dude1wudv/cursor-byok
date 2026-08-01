@@ -45,8 +45,8 @@ func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversa
 		readonly := normalizedMode == agentv1.AgentMode_AGENT_MODE_PLAN
 		return appendCurrentTurnAttentionReminders(PromptReminders{
 			PromptContexts: []PromptContextMessage{
-				newPromptContextReminder(promptContextSourceSubagentContract, subagentContractText(readonly, conversation.SubagentTypeName, conversation.SubagentRole, conversation.SubagentDepth)),
-				newPromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, true, readonly)),
+				newDurablePromptContextReminder(promptContextSourceSubagentContract, subagentContractText(readonly, conversation.SubagentTypeName, conversation.SubagentRole, conversation.SubagentDepth)),
+				newDurablePromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, true, readonly)),
 			},
 		}, latestUserText)
 	}
@@ -56,13 +56,13 @@ func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversa
 
 	result := PromptReminders{
 		PromptContexts: []PromptContextMessage{
-			newPromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, false, false)),
+			newDurablePromptContextReminder(promptContextSourceActiveModeContract, currentModeContractText(normalizedMode, false, false)),
 		},
 	}
 	if normalizedMode == agentv1.AgentMode_AGENT_MODE_PLAN {
 		if reminder := strings.TrimSpace(promptassets.MustReadPlanSystemReminder()); reminder != "" {
 			result.PromptContexts = append([]PromptContextMessage{
-				newPromptContextReminder(promptContextSourcePlanTurnContract, reminder),
+				newDurablePromptContextReminder(promptContextSourcePlanTurnContract, reminder),
 			}, result.PromptContexts...)
 		}
 		return appendCurrentTurnAttentionReminders(result, latestUserText)
@@ -153,6 +153,12 @@ func newPromptContextReminder(source string, content string) PromptContextMessag
 		},
 		false,
 	)
+}
+
+func newDurablePromptContextReminder(source string, content string) PromptContextMessage {
+	context := newPromptContextReminder(source, content)
+	context.Persist = true
+	return context
 }
 
 func subagentContractText(readonly bool, subagentType string, subagentRole string, subagentDepth int) string {

@@ -4310,6 +4310,9 @@ message ShellFailure {
   optional ShellAbortReason abort_reason = 10;
   bool aborted = 11;
   optional int32 local_execution_time_ms = 12;
+  optional string output_head = 13;
+  optional string output_tail = 14;
+  optional int32 elided_chars = 15;
 }
 
 // Copied from: local:agent.v1.ShellHookApprovalRequirement (var: Ek)
@@ -4404,6 +4407,8 @@ message ShellStream {
     ShellRejected rejected = 5;
     ShellPermissionDenied permission_denied = 6;
     ShellStreamBackgrounded backgrounded = 7;
+    ShellStreamHookContext hook_context = 8;
+    ShellSandboxUnsupported sandbox_unsupported = 9;
   }
 }
 
@@ -4437,9 +4442,19 @@ message ShellStreamStderr {
   string data = 1;
 }
 
+// Copied from: local:agent.v1.ShellStreamHookContext
+message ShellStreamHookContext {
+  string context = 1;
+}
+
 // Copied from: local:agent.v1.ShellStreamStdout (var: Nk)
 message ShellStreamStdout {
   string data = 1;
+}
+
+// Copied from: local:agent.v1.ShellSandboxUnsupported
+message ShellSandboxUnsupported {
+  string reason = 1;
 }
 
 // Copied from: local:agent.v1.ShellSuccess (var: Mk)
@@ -4458,6 +4473,9 @@ message ShellSuccess {
   optional int32 ms_to_wait = 12;
   optional int32 local_execution_time_ms = 13;
   optional ShellBackgroundReason background_reason = 14;
+  optional string output_head = 15;
+  optional string output_tail = 16;
+  optional int32 elided_chars = 17;
 }
 
 // Copied from: local:agent.v1.ShellTimeout (var: Hk)

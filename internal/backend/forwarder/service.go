@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"cursor/gen/agentv1"
 	"cursor/gen/aiserverv1"
@@ -486,7 +487,7 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("request_id is required"))
 	}
 	appendSeqno := req.Msg.GetAppendSeqno()
-	dataHex := req.Msg.GetData()
+	dataHex := protocol.BidiAppendDebugData(req.Msg.GetData(), req.Msg.GetDataBinary())
 	appendTicket, staleAppend, err := service.appendSeq.Acquire(ctx, requestID, appendSeqno)
 	appendEpoch, currentNext, appendDisposition := appendTicket.Snapshot()
 	if err != nil {
@@ -503,13 +504,14 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 	}
 	defer appendTicket.DiscardEpochCandidate()
 	defer appendTicket.Release()
-	message, clientKind, err := protocol.DecodeAgentClientMessage(dataHex)
+	message, clientKind, canonicalDataHex, err := protocol.DecodeBidiAppendAgentClientMessage(req.Msg.GetData(), req.Msg.GetDataBinary())
 	if err != nil {
-		service.debug.LogBidiRaw(ctx, requestID, "", appendSeqno, dataHex, "decode_error", map[string]any{
+		service.debug.LogBidiRaw(ctx, requestID, "", appendSeqno, firstNonEmpty(canonicalDataHex, dataHex), "decode_error", map[string]any{
 			"error": err.Error(),
 		})
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
+	dataHex = canonicalDataHex
 	intent, err := service.decodeInboundIntent(requestID, message, clientKind)
 	if err != nil {
 		service.debug.LogBidiRaw(ctx, requestID, "", appendSeqno, dataHex, "intent_error", map[string]any{
@@ -756,6 +758,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		intent.ConversationState = runRequest.GetConversationState()
 		intent.UserMessage = extractUserMessage(message)
 		intent.RequestContext = extractRequestContext(message)
+		populateRunRequestCapabilities(&intent, runRequest, runRequest.GetRequestedModel())
 		if service.shouldIgnoreEmptyResumeRunRequest(requestID, runRequest, intent.UserMessage, intent.RequestContext) {
 			intent.Kind = "metadata"
 			intent.StartsRun = false
@@ -798,6 +801,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		intent.ConversationID = conversationID
 		intent.SubagentTypeName = strings.TrimSpace(prewarmRequest.GetSubagentTypeName())
 		intent.ConversationState = prewarmRequest.GetConversationState()
+		populateRunRequestCapabilities(&intent, prewarmRequest, prewarmRequest.GetRequestedModel())
 		intent.Mode, intent.ModeSource, intent.HasExplicitMode, err = extractPrewarmMode(prewarmRequest)
 		if err != nil {
 			return InboundIntent{}, err
@@ -1093,6 +1097,15 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.RunAccepted = false
 	stream.ThinkingEffort = strings.TrimSpace(intent.ThinkingEffort)
 	stream.SubagentModelOverrides = cloneSubagentModelOverrides(intent.SubagentModelOverrides)
+	stream.RequestMetadata = buildRunRequestMetadata(intent)
+	stream.PromptCompileOptions = PromptCompileOptions{
+		ExcludeWorkspaceContext:            intent.ExcludeWorkspaceContext,
+		ClientSupportsInlineImagesSet:      intent.ClientSupportsInlineImagesSet,
+		ClientSupportsInlineImages:         intent.ClientSupportsInlineImages,
+		SuppressSubagentProgressUpdateTool: intent.SuppressSubagentProgressUpdateTool,
+	}
+	stream.LatestRequestContext = cloneRequestContext(intent.RequestContext)
+	stream.TransientPromptContexts = nil
 	stream.PendingProviderAction = providerActionNone
 	stream.PendingCompaction = nil
 	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
@@ -1286,13 +1299,26 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return fmt.Errorf("exec correlation mismatch: exec_id and message_id identify different pending executions")
 	}
 	if !found {
-		if intent.ExecClientMessage.GetSubagentResult() != nil {
+		if intent.ExecClientMessage.GetSubagentResult() != nil || intent.ExecClientMessage.GetSubagentAwaitResult() != nil {
 			if finalizing, ok := selectPendingSubagentFinalization(intent.ExecClientMessage.GetExecId(), intent.ExecClientMessage.GetId(), stream); ok {
 				result, err := service.execBridge.ApplyExecClientMessage(intent.ExecClientMessage, finalizing)
 				if err != nil {
 					return err
 				}
-				return service.finalizeSubagentExecResult(stream, finalizing, intent.ExecClientMessage, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
+				if !result.IsTerminal {
+					if intent.ExecClientMessage.GetSubagentAwaitResult().GetStillRunning() != nil {
+						refreshSubagentLeaseFromAwait(stream, finalizing)
+					}
+					return nil
+				}
+				effectiveMessage := intent.ExecClientMessage
+				if effectiveMessage.GetSubagentResult() == nil {
+					effectiveMessage = subagentAwaitCompletionMessage(effectiveMessage)
+					if effectiveMessage == nil {
+						return nil
+					}
+				}
+				return service.finalizeSubagentExecResult(stream, finalizing, effectiveMessage, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
 			}
 		}
 		if service.observeMissingBackgroundShellExecClientMessage(stream, intent.ExecClientMessage) {
@@ -1313,7 +1339,8 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	if err := service.recordShellApprovalEvidence(stream, pending, intent.ExecClientMessage); err != nil {
 		return err
 	}
-	if strings.TrimSpace(pending.ExecKind) == "subagent" && intent.ExecClientMessage.GetSubagentResult() == nil {
+	isSubagentAwait := intent.ExecClientMessage.GetSubagentAwaitResult() != nil
+	if strings.TrimSpace(pending.ExecKind) == "subagent" && intent.ExecClientMessage.GetSubagentResult() == nil && !isSubagentAwait {
 		return nil
 	}
 	if strings.TrimSpace(pending.ExecKind) == "subagent" && !subagentGenerationIsCurrent(stream, pending) {
@@ -1351,6 +1378,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		}
 	}
 	if !result.IsTerminal {
+		if strings.TrimSpace(pending.ExecKind) == "subagent" && isSubagentAwait && intent.ExecClientMessage.GetSubagentAwaitResult().GetStillRunning() != nil {
+			refreshSubagentLeaseFromAwait(stream, pending)
+		}
 		if strings.TrimSpace(result.ShellRecoveryCandidate) != "" {
 			if result.ShellRecoveryCandidate == shellRecoveryReasonSkipped {
 				service.recordShellSkippedEvent(stream, pending, intent.ExecClientMessage)
@@ -1365,7 +1395,14 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return err
 	}
 	if strings.TrimSpace(pending.ExecKind) == "subagent" {
-		return service.finalizeSubagentExecResult(stream, pending, intent.ExecClientMessage, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
+		effectiveMessage := intent.ExecClientMessage
+		if isSubagentAwait {
+			effectiveMessage = subagentAwaitCompletionMessage(intent.ExecClientMessage)
+			if effectiveMessage == nil {
+				return nil
+			}
+		}
+		return service.finalizeSubagentExecResult(stream, pending, effectiveMessage, result.ToolCallID, result.ToolResultPayload, result.ToolCall)
 	}
 	if strings.TrimSpace(pending.ExecKind) == "execute_hook_pre_compact" {
 		markExecCompleted(stream, pending)
@@ -2727,9 +2764,17 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 	thinkingEffort := stream.ThinkingEffort
 	mode := stream.Mode
 	latestUserText := stream.LatestUserText
+	requestMetadata := cloneStringAnyMap(stream.RequestMetadata)
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 	log.Printf("forwarder provider pass started request_id=%s model_call_id=%s provider_pass=%d", strings.TrimSpace(requestID), strings.TrimSpace(modelCallID), currentPass)
+	if currentTurnShellCircuit(stream).Open {
+		appendTransientPromptContext(stream, newPromptContextMessage(
+			shellCircuitPromptSource,
+			modeladapter.Message{Role: "user", Content: wrapSystemReminder(shellCircuitPromptText)},
+			false,
+		))
+	}
 	if retryAttempt > 0 && strings.TrimSpace(previousModelCallID) != "" {
 		retryClass, _ := providerRetryClassification(errors.New(retryError))
 		if _, err := service.appendConversationEntries(stream, conversationID, []HistoryEntry{
@@ -2763,22 +2808,14 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		return service.failStream(stream, "unknown", err)
 	}
 	compileStartedAt := time.Now().UTC()
-	compiled, err := service.compiler.Compile(conversation, mode, latestUserText, modelName)
+	compileOptions := snapshotPromptCompileOptions(stream)
+	compiled, err := service.compiler.CompileWithOptions(conversation, mode, latestUserText, modelName, compileOptions)
 	if err != nil {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", err)
 	}
 	compileMillis := time.Since(compileStartedAt).Milliseconds()
 	compiled = guardCompiledConversationForProvider(compiled)
-	if currentTurnShellCircuit(stream).Open {
-		context := newPromptContextMessage(
-			shellCircuitPromptSource,
-			modeladapter.Message{Role: "user", Content: wrapSystemReminder(shellCircuitPromptText)},
-			false,
-		)
-		compiled.Messages = append(compiled.Messages, context.Message)
-		compiled.CompileSummary = strings.TrimSpace(compiled.CompileSummary + " latest_suffix=" + context.Source)
-	}
 	if budgetErr := service.maybeAdvanceReplayBudgetBoundary(stream, conversation); budgetErr != nil {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", budgetErr)
@@ -2838,6 +2875,7 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		Tools:              compiled.Tools,
 		MaxTokens:          maxTokens,
 		RequestKnobs:       requestKnobs,
+		RequestMetadata:    requestMetadata,
 		CompileSummary:     compiled.CompileSummary,
 		Observer:           service.recorder,
 		ArtifactPaths:      &modeladapter.LLMArtifactPaths{},
@@ -3040,7 +3078,7 @@ func (service *Service) persistDerivedPromptContexts(stream *ActiveStream, conve
 	entries := make([]HistoryEntry, 0, len(contexts))
 	for _, context := range contexts {
 		context = normalizePromptContextMessage(context)
-		if !isReplayablePromptContext(context) {
+		if !context.Persist || !isReplayablePromptContext(context) {
 			continue
 		}
 		entries = append(entries, newPromptContextEntry(turnSeq, requestID, context))
@@ -3656,6 +3694,9 @@ func (service *Service) applyExecProgress(stream *ActiveStream, pending runtimec
 		}
 		current.StreamState = shellLifecycleStarted
 		current.LastShellActivityAt = now
+	case *agentv1.ShellStream_HookContext:
+		current.StreamState = shellLifecycleStarted
+		current.LastShellActivityAt = now
 	case *agentv1.ShellStream_Backgrounded:
 		current.StreamState = "backgrounded"
 		current.LastShellActivityAt = now
@@ -3977,7 +4018,7 @@ func (service *Service) checkpointCompiledConversation(stream *ActiveStream, con
 		return CompiledConversation{}, false
 	}
 	_, modelName, latestUserText, mode := checkpointPromptContext(stream)
-	compiled, err := service.compiler.Compile(conversation, mode, latestUserText, modelName)
+	compiled, err := service.compiler.CompileWithOptions(conversation, mode, latestUserText, modelName, snapshotPromptCompileOptions(stream))
 	if err != nil {
 		log.Printf("forwarder checkpoint token estimate failed request_id=%s conversation_id=%s err=%v", strings.TrimSpace(activeStreamRequestID(stream)), strings.TrimSpace(conversation.ConversationID), err)
 		return CompiledConversation{}, false
@@ -4114,7 +4155,7 @@ func (service *Service) failActiveStream(stream *ActiveStream, conversationID st
 func buildRunEntries(intent InboundIntent, effectiveMode agentv1.AgentMode, turnSeq int64) ([]HistoryEntry, error) {
 	entries := make([]HistoryEntry, 0, 4)
 	if intent.RequestContext != nil {
-		normalized := normalizeRequestContextForStorageMode(intent.RequestContext, turnSeq == 1)
+		normalized := normalizeRequestContextForHistory(intent.RequestContext, turnSeq == 1)
 		if normalized != nil {
 			payload, err := protojson.Marshal(normalized)
 			if err != nil {
@@ -4163,11 +4204,29 @@ func buildRunEntries(intent InboundIntent, effectiveMode agentv1.AgentMode, turn
 }
 
 func buildRunRequestMetadata(intent InboundIntent) map[string]any {
-	return map[string]any{
-		"model_id":   intent.ModelID,
-		"model_name": intent.ModelName,
+	metadata := map[string]any{
+		"model_id":   strings.TrimSpace(intent.ModelID),
+		"model_name": strings.TrimSpace(intent.ModelName),
 		"prewarm":    intent.Prewarm,
 	}
+	if requestedModel := cloneStringAnyMap(intent.RequestedModelPayload); len(requestedModel) > 0 {
+		metadata["requested_model"] = requestedModel
+		if maxMode, ok := requestedModel["max_mode"].(bool); ok {
+			metadata["max_mode"] = maxMode
+		}
+		if parameters, ok := requestedModel["parameters"]; ok {
+			metadata["requested_model_parameters"] = parameters
+		}
+	}
+	if rawSlug := strings.TrimSpace(intent.DevRawModelSlug); rawSlug != "" {
+		metadata["dev_raw_model_slug"] = rawSlug
+	}
+	metadata["exclude_workspace_context"] = intent.ExcludeWorkspaceContext
+	if intent.ClientSupportsInlineImagesSet {
+		metadata["client_supports_inline_images"] = intent.ClientSupportsInlineImages
+	}
+	metadata["suppress_subagent_progress_update_tool"] = intent.SuppressSubagentProgressUpdateTool
+	return metadata
 }
 
 func buildPlanExecutionMetadata(intent InboundIntent) map[string]any {
@@ -4536,6 +4595,37 @@ func extractRequestedModelID(message *agentv1.AgentClientMessage) string {
 		return firstNonEmpty(extractRequestedModelIDFromRequestedModel(prewarm.GetRequestedModel()), prewarm.GetModelDetails().GetModelId())
 	}
 	return ""
+}
+
+func populateRunRequestCapabilities(intent *InboundIntent, request proto.Message, requestedModel *agentv1.RequestedModel) {
+	if intent == nil {
+		return
+	}
+	if requestedModel != nil {
+		intent.RequestedModelPayload = cloneStringAnyMap(requestedModelPayload(requestedModel))
+	}
+	if runRequest, ok := request.(*agentv1.AgentRunRequest); ok {
+		intent.DevRawModelSlug = strings.TrimSpace(runRequest.GetDevRawModelSlug())
+		intent.ExcludeWorkspaceContext = runRequest.GetExcludeWorkspaceContext()
+		intent.ClientSupportsInlineImages = runRequest.GetClientSupportsInlineImages()
+		intent.ClientSupportsInlineImagesSet = hasProtoField(runRequest, "client_supports_inline_images")
+		intent.SuppressSubagentProgressUpdateTool = runRequest.GetSuppressSubagentProgressUpdateTool()
+		return
+	}
+	if prewarm, ok := request.(*agentv1.PrewarmRequest); ok {
+		intent.ExcludeWorkspaceContext = prewarm.GetExcludeWorkspaceContext()
+		intent.ClientSupportsInlineImages = prewarm.GetClientSupportsInlineImages()
+		intent.ClientSupportsInlineImagesSet = hasProtoField(prewarm, "client_supports_inline_images")
+		intent.SuppressSubagentProgressUpdateTool = prewarm.GetSuppressSubagentProgressUpdateTool()
+	}
+}
+
+func hasProtoField(message proto.Message, fieldName string) bool {
+	if message == nil {
+		return false
+	}
+	field := message.ProtoReflect().Descriptor().Fields().ByName(protoreflect.Name(fieldName))
+	return field != nil && message.ProtoReflect().Has(field)
 }
 
 func extractRequestedModelIDFromRequestedModel(model *agentv1.RequestedModel) string {
@@ -5414,6 +5504,8 @@ func deriveToolNameFromPendingExec(pending runtimecore.PendingExec) string {
 		return "ForceBackgroundShell"
 	case "subagent":
 		return "Task"
+	case "subagent_await":
+		return "SubagentAwait"
 	default:
 		return ""
 	}
@@ -5451,6 +5543,8 @@ func execKindFromToolName(name string) (string, bool) {
 		return "force_background_shell", true
 	case "Task":
 		return "subagent", true
+	case "SubagentAwait":
+		return "subagent_await", true
 	default:
 		return "", false
 	}
@@ -5458,7 +5552,7 @@ func execKindFromToolName(name string) (string, bool) {
 
 func isExecTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "Read", "Write", "PatchEdit", "Delete", "Shell", "WriteShellStdin", "ForceBackgroundShell", "Grep", "Glob", "Ls", "ReadLints", "CallMcpTool", "FetchMcpResource", "Task":
+	case "Read", "Write", "PatchEdit", "Delete", "Shell", "WriteShellStdin", "ForceBackgroundShell", "Grep", "Glob", "Ls", "ReadLints", "CallMcpTool", "FetchMcpResource", "Task", "SubagentAwait":
 		return true
 	default:
 		return false

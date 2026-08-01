@@ -3,6 +3,7 @@ package execbridge
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"cursor/gen/agentv1"
@@ -223,5 +224,78 @@ func TestShellApprovalSkipAndUnknownPayloadRemainPending(t *testing.T) {
 	}
 	if !result.IsTerminal || result.ToolCall.GetShellToolCall().GetArgs().GetConversationId() != "conversation-31217" {
 		t.Fatalf("authoritative exit did not finalize with conversation id: %#v", result)
+	}
+}
+
+func TestShellHookContextIsActivityButNotTerminal(t *testing.T) {
+	pending := runtimecore.PendingExec{
+		MessageID:  9,
+		ExecID:     "exec-shell-hook",
+		ToolCallID: "tool-shell-hook",
+		ExecKind:   "shell",
+		ArgsJSON:   []byte(`{"command":"git status"}`),
+	}
+	result, err := NewBridge().ApplyExecClientMessage(&agentv1.ExecClientMessage{
+		Id:     pending.MessageID,
+		ExecId: pending.ExecID,
+		Message: &agentv1.ExecClientMessage_ShellStream{ShellStream: &agentv1.ShellStream{
+			Event: &agentv1.ShellStream_HookContext{HookContext: &agentv1.ShellStreamHookContext{Context: "hook"}},
+		}},
+	}, pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsTerminal || result.ShellRecoveryCandidate != "" {
+		t.Fatalf("hook context finalized or became recovery candidate: %#v", result)
+	}
+}
+
+func TestShellSandboxUnsupportedIsExplicitTerminalFailure(t *testing.T) {
+	pending := runtimecore.PendingExec{
+		MessageID:  10,
+		ExecID:     "exec-shell-sandbox",
+		ToolCallID: "tool-shell-sandbox",
+		ExecKind:   "shell",
+		ArgsJSON:   []byte(`{"command":"git status"}`),
+	}
+	result, err := NewBridge().ApplyExecClientMessage(&agentv1.ExecClientMessage{
+		Id:     pending.MessageID,
+		ExecId: pending.ExecID,
+		Message: &agentv1.ExecClientMessage_ShellStream{ShellStream: &agentv1.ShellStream{
+			Event: &agentv1.ShellStream_SandboxUnsupported{SandboxUnsupported: &agentv1.ShellSandboxUnsupported{Reason: "unsupported"}},
+		}},
+	}, pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsTerminal || result.ToolCall == nil || result.ToolCall.GetShellToolCall().GetResult().GetRejected() == nil {
+		t.Fatalf("sandbox unsupported was not an explicit terminal rejection: %#v", result)
+	}
+}
+
+func TestLegacyShellOutputWindowIsUsedWhenFullOutputIsMissing(t *testing.T) {
+	pending := runtimecore.PendingExec{
+		MessageID:  11,
+		ExecID:     "exec-shell-window",
+		ToolCallID: "tool-shell-window",
+		ExecKind:   "shell",
+		ArgsJSON:   []byte(`{"command":"git status"}`),
+	}
+	result, err := NewBridge().ApplyExecClientMessage(&agentv1.ExecClientMessage{
+		Id:     pending.MessageID,
+		ExecId: pending.ExecID,
+		Message: &agentv1.ExecClientMessage_ShellResult{ShellResult: &agentv1.ShellResult{
+			Result: &agentv1.ShellResult_Success{Success: &agentv1.ShellSuccess{
+				OutputHead:  stringPtr("head"),
+				OutputTail:  stringPtr("tail"),
+				ElidedChars: int32Ptr(12),
+			}},
+		}},
+	}, pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsTerminal || !strings.Contains(result.ToolResultPayload, "head") || !strings.Contains(result.ToolResultPayload, "tail") {
+		t.Fatalf("windowed output was not surfaced: %#v", result)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"strings"
+	"time"
 
 	modeladapter "cursor/internal/backend/agent/model"
 )
@@ -28,6 +29,81 @@ func normalizePromptContextMessage(context PromptContextMessage) PromptContextMe
 		context.ContentHash = promptContextContentHash(context.Message)
 	}
 	return context
+}
+
+func clonePromptContextMessage(context PromptContextMessage) PromptContextMessage {
+	cloned := normalizePromptContextMessage(context)
+	cloned.Message.ContentParts = append([]modeladapter.ContentPart(nil), context.Message.ContentParts...)
+	for index := range cloned.Message.ContentParts {
+		if image := cloned.Message.ContentParts[index].Image; image != nil {
+			imageCopy := *image
+			imageCopy.Data = append([]byte(nil), image.Data...)
+			cloned.Message.ContentParts[index].Image = &imageCopy
+		}
+	}
+	cloned.Message.ToolCalls = append([]modeladapter.ToolCallDescriptor(nil), context.Message.ToolCalls...)
+	cloned.Message.OpenAIResponsesReasoningSummary = append([]byte(nil), context.Message.OpenAIResponsesReasoningSummary...)
+	return cloned
+}
+
+func clonePromptContextMessages(contexts []PromptContextMessage) []PromptContextMessage {
+	if len(contexts) == 0 {
+		return nil
+	}
+	cloned := make([]PromptContextMessage, 0, len(contexts))
+	for _, context := range contexts {
+		cloned = append(cloned, clonePromptContextMessage(context))
+	}
+	return cloned
+}
+
+func snapshotPromptCompileOptions(stream *ActiveStream) PromptCompileOptions {
+	if stream == nil {
+		return PromptCompileOptions{}
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	options := stream.PromptCompileOptions
+	options.LatestRequestContext = cloneRequestContext(stream.LatestRequestContext)
+	options.TransientPromptContexts = clonePromptContextMessages(stream.TransientPromptContexts)
+	return options
+}
+
+func appendTransientPromptContext(stream *ActiveStream, context PromptContextMessage) bool {
+	if stream == nil {
+		return false
+	}
+	context = clonePromptContextMessage(context)
+	if !isReplayablePromptContext(context) {
+		return false
+	}
+	key := promptContextKey(context)
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	for _, existing := range stream.TransientPromptContexts {
+		if promptContextKey(existing) == key {
+			return false
+		}
+	}
+	context.Persist = false
+	stream.TransientPromptContexts = append(stream.TransientPromptContexts, context)
+	stream.UpdatedAt = time.Now().UTC()
+	return true
+}
+
+func hasTransientPromptContextSource(stream *ActiveStream, source string) bool {
+	if stream == nil || strings.TrimSpace(source) == "" {
+		return false
+	}
+	needle := strings.TrimSpace(source)
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	for _, context := range stream.TransientPromptContexts {
+		if strings.TrimSpace(context.Source) == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func promptContextContentHash(message modeladapter.Message) string {

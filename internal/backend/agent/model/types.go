@@ -128,6 +128,9 @@ type StreamRequest struct {
 	Stream bool
 	// RequestKnobs 保存本轮请求的附加参数摘要。
 	RequestKnobs map[string]any
+	// RequestMetadata 保存 Cursor 本地模式的请求能力与模型元数据；
+	// provider adapter 不会把它直接发送到上游 HTTP body。
+	RequestMetadata map[string]any
 	// CompileSummary 保存当前 prompt 编译摘要。
 	CompileSummary string
 	// Observer 负责写入 request-scoped LLM 工件。

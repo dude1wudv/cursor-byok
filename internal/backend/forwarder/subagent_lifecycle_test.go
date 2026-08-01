@@ -398,6 +398,48 @@ func TestBackgroundAckDetachesWithoutTerminalAndLateResultFinalizesOnce(t *testi
 	}
 }
 
+func TestSubagentAwaitStillRunningDoesNotReleaseParent(t *testing.T) {
+	broker := NewStreamBroker()
+	stream, err := broker.OpenStream("request-await", "conversation-await", 1, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := runtimecore.PendingExec{
+		MessageID:    61,
+		ExecID:       "exec-await-parent",
+		ToolCallID:   "tool-await-parent",
+		ExecKind:     "subagent",
+		ProviderPass: 1,
+		ModelCallID:  "model-call",
+		ArgsJSON:     []byte(`{"description":"inspect","prompt":"check"}`),
+	}
+	stream.CheckpointConversation = &ConversationFile{ConversationID: stream.ConversationID, Mode: "agent", NextTurnSeq: 2, NextEntrySeq: 1}
+	stream.PendingExecs[pending.ExecID] = pending
+	stream.SubagentFinalizations = make(map[string]*SubagentFinalizationState)
+	registerTaskBatchMember(stream, pending)
+	service := &Service{broker: broker, projector: NewHistoryProjector(), execBridge: execbridge.NewBridge(), debug: newDebugRecorder("", broker, nil)}
+
+	message := &agentv1.ExecClientMessage{
+		Id: pending.MessageID, ExecId: pending.ExecID,
+		Message: &agentv1.ExecClientMessage_SubagentAwaitResult{SubagentAwaitResult: &agentv1.SubagentAwaitResult{
+			Result: &agentv1.SubagentAwaitResult_StillRunning{StillRunning: &agentv1.SubagentAwaitStillRunning{AgentId: "agent-1"}},
+		}},
+	}
+	if err := service.handleExecResult(InboundIntent{Kind: "exec_result", RequestID: stream.RequestID, ExecClientMessage: message}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := stream.PendingExecs[pending.ExecID]; !found {
+		t.Fatal("still_running removed the blocking child")
+	}
+	member := stream.TaskBatches[pending.ProviderPass].Members[pending.ToolCallID]
+	if member == nil || member.ParentReleased || member.Terminal {
+		t.Fatalf("still_running changed parent/terminal state: %#v", member)
+	}
+	if len(stream.CheckpointConversation.Entries) != 0 {
+		t.Fatalf("still_running wrote terminal history: %#v", stream.CheckpointConversation.Entries)
+	}
+}
+
 func TestExplicitCancelFinalizesDetachedSubagentAsAborted(t *testing.T) {
 	broker := NewStreamBroker()
 	stream, err := broker.OpenStream("request-cancel", "conversation-cancel", 1, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "test")
