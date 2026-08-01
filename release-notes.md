@@ -1,8 +1,28 @@
 <!-- 发布约定：每次 Release 都保留“最近 5 个版本更新梗概”，覆盖当前版本和前 4 个版本。 -->
 
-# Cursor助手 v0.0.75
+# Cursor助手 v0.0.76
 
-本版本收敛 Cursor 原生 Shell 生命周期：未握手的 opening 请求按会话串行派发，运行并发恢复为保守默认值；`Skipped` 不再触发无条件重放，仅服务端可证明只读的命令允许有限重试，有副作用或状态不明的命令返回唯一“执行结果未知”终态。
+本版本完成 Cursor 3.13.21 本地模式兼容性收口：支持 BidiAppend 二进制载荷与新版 exec/protocol 字段，区分 Shell 未启动、已运行和后端不可用终态，隔离子代理父代理唤醒与子代理完成，并收紧 Await、MCP structured content 与 latest-only prompt context 的处理边界。
+
+## Bidi 二进制载荷与新版协议字段
+
+- BidiAppend 优先解码新版 `data_binary`，兼容旧版 hex `data`；两种载荷同时出现且不一致时拒绝请求并保留冲突证据，避免静默解析为空。
+- 补齐 Cursor 3.13.21 的 exec 结果分支、Shell hook context、sandbox unsupported、输出裁剪、Await/SubagentAwait、交互与 checkpoint 扩展字段，并通过 descriptor field-number 回归测试锁定编号。
+- `client_supports_send_to_user` 等能力字段进入 metadata，旧客户端继续走兼容 fallback，不改变已支持的 legacy wire 格式。
+
+## Shell 后端不可用与恢复语义
+
+- `Skipped` 或无 Exit 的 stream close 在确认 `Start/stdout/stderr/hook_context` 前进入 recovery candidate/uncertain，不再直接完成或伪造 exit-0 成功。
+- 仅服务端可证明尚未启动且安全的只读命令允许有限重试；迟到 Exit 按 `exec_id/message_id/attempt/generation` 隔离，已观察到执行活动的命令禁止重放。
+- `ShellStreamHookContext` 与 `ShellSandboxUnsupported` 进入统一终态判定，明确区分 transport 未发送、backend unavailable、permission/sandbox failure 和真实命令退出。
+
+## 子代理 Await 与上下文边界
+
+- 拆分父代理可继续与子代理真实终态：background ack 只释放父代理等待，不写入子代理完成结果；只有权威 success/error/aborted 才能单次 finalization。
+- `Await`/`SubagentAwait` 的 `still_running` 只续租或安排轮询，不重复唤醒 provider；迟到结果按 agent、tool call、generation 和 lease 关联。
+- MCP structured content 保留原始结构，request context 的 dynamic/latest-only 内容不污染 replay history，稳定契约继续参与持久化与压缩。
+
+## 上一版本 v0.0.75 详细记录
 
 ## Shell opening 背压与安全恢复
 
@@ -75,6 +95,12 @@
 
 ## 最近 5 个版本更新梗概
 
+### v0.0.76
+
+- 兼容 Cursor 3.13.21 本地模式的 `data_binary`、exec oneof、Shell hook/sandbox、Await/SubagentAwait 与 checkpoint 扩展字段。
+- 修复 Shell `Skipped`、stream close 和迟到 Exit 的终态误判，禁止在未确认执行结果时伪造成功或重复执行副作用命令。
+- 分离父代理继续与子代理完成语义，保留 detached child lease/correlation；收紧 MCP structured content 和 latest-only prompt context 持久化边界。
+
 ### v0.0.75
 
 - Shell opening 按会话串行握手、running 默认并发降至 8；迟到活动可接管 uncertain attempt，避免终端分配突发造成 `Skipped` 放大。
@@ -97,14 +123,9 @@
 - 修复 inspect Shell 合法命令在 pre-dispatch 阶段被拒绝而导致的 “Skipped git” 刷屏，并通过指纹熔断阻止确定性错误无限重试。
 - 精简 Shell 调度与恢复状态机，加入 OpenAI Responses 并行工具调用、稳定回放预算、自动压缩软阈值和 provider pass 性能指标。
 
-### v0.0.71
-
-- 修复 Claude extended thinking、`pause_turn`、SSE 错误映射及历史回放兼容问题，避免对话提前结束或隐性 400。
-- 为客户端工具与交互工具增加超时收口，修复 Plan 卡片渐进显示、thinking 参数兼容和 Grep 截断异常。
-
 ## 发布资产
 
-- `cursor-byok-0.0.75-windows-amd64.zip`
-- `cursor-byok-0.0.75-macos-arm64.tar.gz`
-- `cursor-byok-0.0.75-macos-amd64.tar.gz`
+- `cursor-byok-0.0.76-windows-amd64.zip`
+- `cursor-byok-0.0.76-macos-arm64.tar.gz`
+- `cursor-byok-0.0.76-macos-amd64.tar.gz`
 - `update.json`
