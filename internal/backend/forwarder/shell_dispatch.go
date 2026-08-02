@@ -465,6 +465,17 @@ func (service *Service) requeueSkippedForegroundShell(stream *ActiveStream, skip
 	if service == nil || stream == nil {
 		return nil
 	}
+	// Retry must use the same server-side read-only rewrite as pre-dispatch.
+	// This disables inspect-only options such as notify_on_output/profile and
+	// injects Git protections before the command is sent back to Cursor.
+	stream.mu.Lock()
+	workspacePaths := append([]string(nil), stream.WorkspacePaths...)
+	stream.mu.Unlock()
+	rewrittenArgs, err := applyReadonlyShellPolicy(skipped.ArgsJSON, workspacePaths)
+	if err != nil {
+		return err
+	}
+	skipped.ArgsJSON = rewrittenArgs
 	message, retry, err := service.execBridge.ReopenShell(execbridge.OpenExecContext{
 		ConversationID: stream.ConversationID,
 		ModelID:        stream.ModelID,

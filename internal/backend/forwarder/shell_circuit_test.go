@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+
 	"cursor/gen/agentv1"
 	execbridge "cursor/internal/backend/agent/bridge/exec"
 	runtimecore "cursor/internal/backend/agent/core"
@@ -230,6 +233,22 @@ func TestSkippedReadonlyShellAtAttemptLimitReturnsUnknown(t *testing.T) {
 			results++
 			if !strings.Contains(string(entry.Payload), "status is unknown") {
 				t.Fatalf("unexpected result payload: %s", entry.Payload)
+			}
+			// 只读 inspect 的最终 Skipped 应投影为 silent backgrounded，而不是 Rejected。
+			// result_text 可保留 "Skipped" 供模型消费；UI 形态看 tool_call 是否 backgrounded success。
+			if strings.Contains(string(entry.Payload), `"rejected"`) {
+				t.Fatalf("safe inspect skip still projected as rejected UI payload: %s", entry.Payload)
+			}
+			if !strings.Contains(string(entry.Payload), `"isBackground"`) && !strings.Contains(string(entry.Payload), `"is_background"`) {
+				t.Fatalf("safe inspect skip missing backgrounded projection: %s", entry.Payload)
+			}
+			if !strings.Contains(string(entry.Payload), `"success"`) {
+				t.Fatalf("safe inspect skip missing success projection: %s", entry.Payload)
+			}
+		}
+		if entry.Kind == "metadata" && strings.Contains(string(entry.Payload), "shell_stream_recovered") {
+			if !strings.Contains(string(entry.Payload), `"silent_inspect_skip":true`) && !strings.Contains(string(entry.Payload), `"silent_inspect_skip": true`) {
+				t.Fatalf("recovery metadata missing silent_inspect_skip: %s", entry.Payload)
 			}
 		}
 	}
@@ -709,5 +728,194 @@ func TestShellStallRecoveryDoesNotCompletePending(t *testing.T) {
 		if entry.Kind == "tool_result" {
 			t.Fatal("stall recovery synthesized terminal tool result")
 		}
+	}
+}
+
+func TestSkippedGitAndTasklistSuppressedInUI(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command string
+	}{
+		{name: "git status", command: "git status --short"},
+		{name: "tasklist", command: "tasklist"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			broker := NewStreamBroker()
+			stream, err := broker.OpenStream("request-"+tc.name, "conversation-"+tc.name, 1, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			toolCallID := "tool-" + strings.ReplaceAll(tc.name, " ", "-")
+			stream.CheckpointConversation = &ConversationFile{ConversationID: stream.ConversationID, Mode: "agent", NextTurnSeq: 2, NextEntrySeq: 1}
+			pending := runtimecore.PendingExec{
+				MessageID: 41, ExecID: "exec-" + toolCallID, ConversationID: stream.ConversationID, ToolCallID: toolCallID, LogicalShellID: toolCallID,
+				ExecKind: "shell", ProviderPass: 1, ModelCallID: "model-call", ShellAttempt: shellMaxTransportAttempts,
+				ArgsJSON: []byte(fmt.Sprintf(`{"command":%q}`, tc.command)),
+			}
+			if !reserveForegroundShellDispatch(stream, &agentv1.AgentServerMessage{}, pending) {
+				t.Fatal("shell was unexpectedly queued")
+			}
+			service := &Service{broker: broker, projector: NewHistoryProjector(), execBridge: execbridge.NewBridge(), debug: newDebugRecorder("", broker, nil)}
+			service.scheduleShellRecoveryCandidate(stream.RequestID, pending, shellRecoveryReasonSkipped)
+			if err := service.recoverShellWithoutTerminalIfNeeded(stream, pending.ExecID, pending.MessageID, shellRecoveryReasonSkipped); err != nil {
+				t.Fatal(err)
+			}
+
+			var resultPayload []byte
+			for _, entry := range stream.CheckpointConversation.Entries {
+				if entry.Kind == "tool_result" && entry.ToolCallID == toolCallID {
+					resultPayload = entry.Payload
+				}
+			}
+			if len(resultPayload) == 0 {
+				t.Fatal("missing tool_result for silent inspect skip")
+			}
+			if strings.Contains(string(resultPayload), `"rejected"`) {
+				t.Fatalf("inspect skip still uses rejected UI payload: %s", resultPayload)
+			}
+
+			// checkpoint 投影应剥离 silent inspect Shell，避免 reconnect 再刷 Skipped。
+			state, err := service.projector.ProjectLegacyCheckpoint(stream.CheckpointConversation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, rawTurn := range state.GetTurns() {
+				turn := &agentv1.ConversationTurnStructure{}
+				if err := proto.Unmarshal(rawTurn, turn); err != nil {
+					t.Fatal(err)
+				}
+				agentTurn := turn.GetAgentConversationTurn()
+				if agentTurn == nil {
+					continue
+				}
+				for _, rawStep := range agentTurn.GetSteps() {
+					step := &agentv1.ConversationStep{}
+					if err := proto.Unmarshal(rawStep, step); err != nil {
+						t.Fatal(err)
+					}
+					if shell := step.GetToolCall().GetShellToolCall(); shell != nil {
+						t.Fatalf("silent inspect shell leaked into checkpoint: %#v", shell)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCheckpointDoesNotMistakeBackgroundShellWithoutIDForSilentSkip(t *testing.T) {
+	isBackground := true
+	toolCall := &agentv1.ToolCall{
+		Tool: &agentv1.ToolCall_ShellToolCall{
+			ShellToolCall: &agentv1.ShellToolCall{
+				Args: &agentv1.ShellArgs{Command: "git status --short"},
+				Result: &agentv1.ShellResult{
+					IsBackground: &isBackground,
+					Result: &agentv1.ShellResult_Success{
+						Success: &agentv1.ShellSuccess{Command: "git status --short"},
+					},
+				},
+			},
+		},
+	}
+	if isSilentInspectShellSkippedToolCall(toolCall) {
+		t.Fatal("real background shell with nil shell_id was mistaken for synthetic silent skip")
+	}
+	shellID := uint32(0)
+	toolCall.GetShellToolCall().GetResult().GetSuccess().ShellId = &shellID
+	if !isSilentInspectShellSkippedToolCall(toolCall) {
+		t.Fatal("explicit shell_id=0 sentinel was not recognized as synthetic silent skip")
+	}
+}
+
+func TestSilentInspectCheckpointSanitizerUsesRecoveryMetadataScope(t *testing.T) {
+	const toolCallID = "reused-tool-id"
+	synthetic := execbridge.BuildShellSkippedBackgroundedToolCall(
+		toolCallID,
+		[]byte(`{"command":"git status --short"}`),
+		"Skipped by Cursor",
+	)
+	toolCallJSON, err := protojson.Marshal(synthetic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultPayload, err := json.Marshal(toolResultEntryPayload{
+		ToolCallID: toolCallID,
+		ToolName:   "Shell",
+		ToolCall:   toolCallJSON,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolCallPayload, err := json.Marshal(toolCallEntryPayload{
+		ToolCallID: toolCallID,
+		ToolName:   "Shell",
+		ToolCall:   toolCallJSON,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []HistoryEntry{
+		{TurnSeq: 1, RequestID: "request-1", Kind: "tool_call", ToolCallID: toolCallID, Payload: toolCallPayload},
+		{TurnSeq: 1, RequestID: "request-1", Kind: "tool_result", ToolCallID: toolCallID, Payload: resultPayload},
+		newMetadataEntry(1, "request-1", "shell_stream_recovered", map[string]any{
+			"tool_call_id":        toolCallID,
+			"terminal_owner":      "silent_inspect_skip",
+			"silent_inspect_skip": true,
+		}),
+		// The same tool ID in another request/turn is a real record and must survive.
+		{TurnSeq: 2, RequestID: "request-2", Kind: "tool_call", ToolCallID: toolCallID, Payload: toolCallPayload},
+		{TurnSeq: 2, RequestID: "request-2", Kind: "tool_result", ToolCallID: toolCallID, Payload: resultPayload},
+		// A rejected "skip" without the explicit recovery marker is historical data,
+		// not evidence that the sanitizer may delete it.
+		{TurnSeq: 3, RequestID: "request-3", Kind: "tool_result", ToolCallID: toolCallID, Payload: resultPayload},
+	}
+
+	filtered := sanitizeSkippedGitTasklistEntries(entries)
+	for _, entry := range filtered {
+		if entry.TurnSeq == 1 && entry.RequestID == "request-1" &&
+			(entry.Kind == "tool_call" || entry.Kind == "tool_result") {
+			t.Fatalf("metadata-authorized synthetic entry survived: %#v", entry)
+		}
+	}
+	if got := len(filtered); got != 4 {
+		t.Fatalf("filtered entry count=%d, want 4 (metadata plus unrelated records)", got)
+	}
+	for _, entry := range filtered {
+		if entry.TurnSeq == 2 && entry.RequestID == "request-2" && entry.ToolCallID != toolCallID {
+			t.Fatalf("unexpected unrelated entry: %#v", entry)
+		}
+	}
+}
+
+func TestNewCursorSkippedRecoveryKeepsMutatingRejected(t *testing.T) {
+	broker := NewStreamBroker()
+	stream, err := broker.OpenStream("request", "conversation", 1, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream.CheckpointConversation = &ConversationFile{ConversationID: "conversation", Mode: "agent", NextTurnSeq: 2, NextEntrySeq: 1}
+	pending := runtimecore.PendingExec{
+		MessageID: 55, ExecID: "exec-mut", ConversationID: "conversation", ToolCallID: "tool-mut", LogicalShellID: "tool-mut",
+		ExecKind: "shell", ProviderPass: 1, ModelCallID: "model-call", ShellAttempt: 1,
+		ArgsJSON: []byte(`{"command":"git commit -m test"}`),
+	}
+	if !reserveForegroundShellDispatch(stream, &agentv1.AgentServerMessage{}, pending) {
+		t.Fatal("mutating shell was unexpectedly queued")
+	}
+	service := &Service{broker: broker, projector: NewHistoryProjector(), execBridge: execbridge.NewBridge(), debug: newDebugRecorder("", broker, nil)}
+	service.scheduleShellRecoveryCandidate(stream.RequestID, pending, shellRecoveryReasonSkipped)
+	if err := service.recoverShellWithoutTerminalIfNeeded(stream, pending.ExecID, pending.MessageID, shellRecoveryReasonSkipped); err != nil {
+		t.Fatal(err)
+	}
+	foundRejected := false
+	for _, entry := range stream.CheckpointConversation.Entries {
+		if entry.Kind == "tool_result" && entry.ToolCallID == pending.ToolCallID {
+			if strings.Contains(string(entry.Payload), `"rejected"`) || strings.Contains(string(entry.Payload), "status is unknown") {
+				foundRejected = true
+			}
+		}
+	}
+	if !foundRejected {
+		t.Fatal("mutating skipped shell should remain an explicit rejected/unknown terminal result")
 	}
 }

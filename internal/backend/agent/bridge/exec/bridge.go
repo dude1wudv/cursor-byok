@@ -2502,6 +2502,205 @@ func BuildShellRejectedToolCall(toolCallID string, argsJSON []byte, reason strin
 	return buildShellRejectedToolCall(toolCallID, argsJSON, &agentv1.ShellRejected{Reason: strings.TrimSpace(reason)})
 }
 
+// BuildShellSkippedBackgroundedToolCall 把客户端 Skipped 的只读 inspect 命令投影为
+// backgrounded success，避免 Cursor UI 以 "Skipped git/tasklist" 反复刷屏。
+// 模型侧仍能看到明确文本：命令未启动、结果未知，但不会渲染 Rejected 错误态。
+func BuildShellSkippedBackgroundedToolCall(toolCallID string, argsJSON []byte, reason string) *agentv1.ToolCall {
+	args := decodeShellArgsForResult(argsJSON)
+	description := strings.TrimSpace(args.Description)
+	if description == "" {
+		description = silentInspectShellLabel(args.Command)
+	}
+	shellArgs := &agentv1.ShellArgs{
+		Command:          args.Command,
+		WorkingDirectory: args.WorkingDirectory,
+		Timeout:          shellTimeoutFromArgs(args),
+		ToolCallId:       toolCallID,
+		Description:      stringPtr(description),
+	}
+	isBackground := true
+	successPayload := &agentv1.ShellSuccess{
+		Command:           strings.TrimSpace(args.Command),
+		WorkingDirectory:  strings.TrimSpace(args.WorkingDirectory),
+		ExitCode:          0,
+		InterleavedOutput: stringPtr(""),
+		ShellId:           uint32Ptr(0),
+	}
+	_ = reason
+	return &agentv1.ToolCall{
+		Tool: &agentv1.ToolCall_ShellToolCall{
+			ShellToolCall: &agentv1.ShellToolCall{
+				Args: shellArgs,
+				Result: &agentv1.ShellResult{
+					IsBackground: &isBackground,
+					Result: &agentv1.ShellResult_Success{
+						Success: successPayload,
+					},
+				},
+				Description: stringPtr(description),
+			},
+		},
+	}
+}
+
+// IsSafeInspectShellCommand 判断 shell 参数是否属于服务端可验证的只读 inspect 命令。
+// 与 forwarder 的 shellCommandSafeToRetry / readonly whitelist 语义对齐，覆盖 git status
+// 与 tasklist 等常见“Skipped by Cursor”刷屏来源。
+func IsSafeInspectShellCommand(argsJSON []byte) bool {
+	args, err := decodeArgsMap(argsJSON)
+	if err != nil {
+		return false
+	}
+	command := strings.TrimSpace(readStringArg(args, "command"))
+	tokens, simple := parseSafeInspectShellCommand(command)
+	if !simple || len(tokens) == 0 {
+		return false
+	}
+	return validateSafeInspectShellCommandTokens(tokens)
+}
+
+// parseSafeInspectShellCommand 是安全分类专用的引号感知分词器。
+// 引号外的 shell 元字符一律拒绝，绝不在解析失败后降级为 strings.Fields。
+func parseSafeInspectShellCommand(command string) ([]string, bool) {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return nil, false
+	}
+	var tokens []string
+	var current strings.Builder
+	inToken := false
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		switch {
+		case ch == '"' || ch == '\'':
+			quote := ch
+			inToken = true
+			closed := false
+			for i++; i < len(trimmed); i++ {
+				c := trimmed[i]
+				if quote == '"' && c == '\\' && i+1 < len(trimmed) && trimmed[i+1] == '"' {
+					current.WriteByte('"')
+					i++
+					continue
+				}
+				if c == quote {
+					closed = true
+					break
+				}
+				current.WriteByte(c)
+			}
+			if !closed {
+				return nil, false
+			}
+		case ch == ' ' || ch == '\t':
+			if inToken {
+				tokens = append(tokens, current.String())
+				current.Reset()
+				inToken = false
+			}
+		case strings.ContainsRune("$;|&`<>(){}[]^\r\n", rune(ch)):
+			return nil, false
+		default:
+			current.WriteByte(ch)
+			inToken = true
+		}
+	}
+	if inToken {
+		tokens = append(tokens, current.String())
+	}
+	if len(tokens) == 0 || strings.Contains(tokens[0], "=") {
+		return nil, false
+	}
+	return tokens, true
+}
+
+func validateSafeInspectShellCommandTokens(tokens []string) bool {
+	if len(tokens) == 0 || strings.ContainsAny(tokens[0], "/\\") {
+		return false
+	}
+	executable := strings.TrimSuffix(strings.ToLower(tokens[0]), ".exe")
+	switch executable {
+	case "tasklist", "netstat", "ps", "ss", "lsof", "sha256sum", "sha1sum", "md5sum", "shasum":
+		return true
+	case "certutil":
+		return len(tokens) >= 2 && strings.EqualFold(tokens[1], "-hashfile")
+	case "git":
+		subcommandIndex := 1
+		for subcommandIndex < len(tokens) {
+			switch strings.ToLower(tokens[subcommandIndex]) {
+			case "--no-pager", "--no-optional-locks":
+				subcommandIndex++
+			default:
+				goto subcommandFound
+			}
+		}
+	subcommandFound:
+		if subcommandIndex >= len(tokens) {
+			return false
+		}
+		subcommand := strings.ToLower(tokens[subcommandIndex])
+		rest := tokens[subcommandIndex+1:]
+		switch subcommand {
+		case "status", "diff", "log", "show", "blame", "rev-parse", "merge-base", "ls-tree", "ls-files",
+			"grep", "describe", "shortlog", "cherry", "count-objects":
+		case "tag", "branch", "remote":
+			for _, token := range rest {
+				if !strings.HasPrefix(token, "-") || !isSafeInspectGitListFlag(token) {
+					return false
+				}
+			}
+		case "stash":
+			if len(rest) == 0 || !strings.EqualFold(rest[0], "list") {
+				return false
+			}
+		case "reflog":
+			if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") && !strings.EqualFold(rest[0], "show") {
+				return false
+			}
+		default:
+			return false
+		}
+		for _, token := range rest {
+			lower := strings.ToLower(token)
+			if lower == "--output" || strings.HasPrefix(lower, "--output=") || lower == "--ext-diff" {
+				return false
+			}
+			if subcommand == "grep" && (token == "-O" || strings.HasPrefix(token, "-O") || strings.HasPrefix(lower, "--open-files-in-pager")) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func isSafeInspectGitListFlag(token string) bool {
+	lower := strings.ToLower(token)
+	switch lower {
+	case "-a", "-v", "-vv", "-l", "--all", "--list", "--verbose", "--show-current", "--merged", "--no-merged":
+		return true
+	}
+	for _, prefix := range []string{"--sort=", "--format=", "--points-at=", "--contains=", "--column"} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func silentInspectShellLabel(command string) string {
+	tokens := strings.Fields(strings.TrimSpace(command))
+	if len(tokens) == 0 {
+		return "inspect"
+	}
+	executable := strings.TrimSuffix(strings.ToLower(tokens[0]), ".exe")
+	if executable == "git" && len(tokens) > 1 {
+		return "git " + strings.ToLower(tokens[1])
+	}
+	return executable
+}
+
 // buildShellRejectedToolCall 构造 Shell 被拒绝时的完成态 ToolCall。
 func buildShellRejectedToolCall(toolCallID string, argsJSON []byte, rejected *agentv1.ShellRejected) *agentv1.ToolCall {
 	args := decodeShellArgsForResult(argsJSON)

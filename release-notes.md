@@ -1,5 +1,24 @@
 <!-- 发布约定：每次 Release 都保留“最近 5 个版本更新梗概”，覆盖当前版本和前 4 个版本。 -->
 
+# Cursor助手 v0.0.78
+
+本版本抑制新版 Cursor 对只读 inspect Shell 的 UI 刷屏：`git status` / `tasklist` 等安全命令被客户端 `Skipped by Cursor` 时，不再以 Rejected 错误态反复显示 “Skipped git/tasklist”。
+
+## Skipped git/tasklist UI 抑制
+
+- 扩展只读 inspect 白名单判定（`IsSafeInspectShellCommand`），覆盖 `git status --short`、`tasklist` 及常见只读 git 变体。
+- Shell recovery 对安全 inspect 的最终 Skipped 投影为 silent/backgrounded success（`shell_id=0`），模型仍收到 “status is unknown” 文本，但 live UI 不再渲染 Rejected。
+- Checkpoint 投影新增 `sanitizeSkippedGitTasklistEntries`：剥离 silent inspect 的 tool_call/tool_result，reconnect 后不再回放 “Skipped ...”。
+- 非安全命令（如 `git commit`/`git push`）的 Skipped 仍保持显式 Rejected/unknown，便于发现真实失败。
+
+# Cursor助手 v0.0.77
+
+本版本完成以下核心修复：
+- Invalid turn 原因分类：新增 turn_finalized.reason 字段，支持 cancelled/provider_error/client_disconnect/timeout 等分类，证明 791 个 invalid turn 中大部分为正常取消。
+- Lint 基线清理：fix 98 个 lint 问题（errcheck/staticcheck/unused 等）。
+- CI 覆盖增强：新增 Go 测试、go vet、golangci-lint、Cursor 3.13.21+ 端到端 invalid-turn 统计与协议兼容性验证。
+- Subagent 思考强度兼容新 Cursor：更新 thinking_effort 派发逻辑，支持 Cursor 3.13.21+ 的 effort 选择，避免 fallback 到 default minimum。
+
 # Cursor助手 v0.0.76
 
 本版本完成 Cursor 3.13.21 本地模式兼容性收口：支持 BidiAppend 二进制载荷与新版 exec/protocol 字段，区分 Shell 未启动、已运行和后端不可用终态，隔离子代理父代理唤醒与子代理完成，并收紧 Await、MCP structured content 与 latest-only prompt context 的处理边界。
@@ -95,6 +114,18 @@
 
 ## 最近 5 个版本更新梗概
 
+### v0.0.78
+
+- 只读 inspect Shell 被 Cursor 最终 Skipped 时改用 silent/backgrounded UI 投影，模型侧仍保留结果未知语义。
+- 安全分类严格拒绝管道、重定向、命令连接符等复杂语法，并识别服务端注入的 `git --no-pager --no-optional-locks`。
+- Checkpoint 仅剥离带显式 `shell_id=0` sentinel 的合成结果，避免误删真实无 ID 后台 Shell。
+
+### v0.0.77
+
+- 增加 invalid turn 原因分类，清理 lint 基线并扩展 Go/vet/golangci-lint 与 Cursor 3.13.21+ CI 覆盖。
+- 更新 Subagent `thinking_effort` 派发逻辑，兼容新版 Cursor 的思考强度选择。
+- 历史 Git 标签存在错误指向，本次仅保留版本变更梗概，不改写既有 v0.0.77 发布。
+
 ### v0.0.76
 
 - 兼容 Cursor 3.13.21 本地模式的 `data_binary`、exec oneof、Shell hook/sandbox、Await/SubagentAwait 与 checkpoint 扩展字段。
@@ -113,19 +144,9 @@
 - Shell 默认并发提升至 32；逻辑 tool call 与 transport attempt 解耦，pre-start `Skipped` 采用新 transport 身份有限退避重排队。
 - waiting 期间保持 started/checkpoint pending，旧 attempt 迟到事件被隔离；已启动命令禁止重派，避免重复执行。
 
-### v0.0.73
-
-- 修复 Task 子代理在 Cursor UI 错显 Stopped（客户端兼容投影 BACKGROUNDED，历史保持真实 RUNNING），硬化 Shell 确定性拒绝熔断并补齐 FIFO 排序证据。
-- 按端点能力发送 `parallel_tool_calls`、在有效派发点记录真实 `parallel_width`，统一 provider pass 指标契约并对全部 debug 日志脱敏；闭合 Grep applied 分页契约、固定多 workspace 截断顺序，自动压缩软阈值上调至 70%。
-
-### v0.0.72
-
-- 修复 inspect Shell 合法命令在 pre-dispatch 阶段被拒绝而导致的 “Skipped git” 刷屏，并通过指纹熔断阻止确定性错误无限重试。
-- 精简 Shell 调度与恢复状态机，加入 OpenAI Responses 并行工具调用、稳定回放预算、自动压缩软阈值和 provider pass 性能指标。
-
 ## 发布资产
 
-- `cursor-byok-0.0.76-windows-amd64.zip`
-- `cursor-byok-0.0.76-macos-arm64.tar.gz`
-- `cursor-byok-0.0.76-macos-amd64.tar.gz`
+- `cursor-byok-0.0.78-windows-amd64.zip`
+- `cursor-byok-0.0.78-macos-arm64.tar.gz`
+- `cursor-byok-0.0.78-macos-amd64.tar.gz`
 - `update.json`

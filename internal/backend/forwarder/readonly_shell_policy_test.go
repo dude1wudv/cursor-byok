@@ -126,6 +126,17 @@ func TestApplyReadonlyShellPolicyQuotedPathSurvivesGitRewrite(t *testing.T) {
 	}
 }
 
+func TestApplyReadonlyShellPolicyIsIdempotentForInjectedGitFlags(t *testing.T) {
+	argsJSON := `{"command":"git --no-pager --no-optional-locks status --short"}`
+	rewritten, err := applyReadonlyShellPolicy([]byte(argsJSON), nil)
+	if err != nil {
+		t.Fatalf("applyReadonlyShellPolicy() error = %v", err)
+	}
+	if string(rewritten) != argsJSON {
+		t.Fatalf("already protected git command changed: got %s want %s", rewritten, argsJSON)
+	}
+}
+
 func TestValidateReadonlyGitCommandWhitelist(t *testing.T) {
 	tests := []struct {
 		name    string

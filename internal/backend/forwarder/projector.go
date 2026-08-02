@@ -10,6 +10,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"cursor/gen/agentv1"
+	execbridge "cursor/internal/backend/agent/bridge/exec"
 	modeladapter "cursor/internal/backend/agent/model"
 	promptengine "cursor/internal/backend/agent/prompt"
 )
@@ -320,7 +321,7 @@ func replayablePromptProjectionEntries(entries []HistoryEntry) []HistoryEntry {
 }
 
 func checkpointProjectionEntries(entries []HistoryEntry) []HistoryEntry {
-	return sanitizeCanceledReplayEntries(entries)
+	return sanitizeSkippedGitTasklistEntries(sanitizeCanceledReplayEntries(entries))
 }
 
 const (
@@ -1186,6 +1187,130 @@ func shouldPersistToolResultName(toolName string) bool {
 	default:
 		return false
 	}
+}
+
+// isSilentInspectShellSkippedToolCall 仅用于兼容性测试和诊断。checkpoint 清理不使用
+// tool result 的形状推断来源，而只接受 shell_stream_recovered metadata 中的显式标记。
+func isSilentInspectShellSkippedToolCall(toolCall *agentv1.ToolCall) bool {
+	if toolCall == nil {
+		return false
+	}
+	shell := toolCall.GetShellToolCall()
+	if shell == nil {
+		return false
+	}
+	result := shell.GetResult()
+	if result == nil {
+		return false
+	}
+	command := ""
+	if shell.GetArgs() != nil {
+		command = shell.GetArgs().GetCommand()
+	}
+	if rejected := result.GetRejected(); rejected != nil {
+		reason := strings.ToLower(strings.TrimSpace(rejected.GetReason()))
+		if !strings.Contains(reason, "skip") {
+			return false
+		}
+		if command == "" {
+			command = rejected.GetCommand()
+		}
+		return isSafeInspectShellCommandText(command)
+	}
+	if !result.GetIsBackground() || result.GetSuccess() == nil {
+		return false
+	}
+	// 合成 silent skip 使用显式 shell_id=0 sentinel；真实“无 ID”后台结果的
+	// shell_id 字段为 nil，不能仅凭 GetShellId()==0 猜测。
+	success := result.GetSuccess()
+	if success.ShellId == nil || success.GetShellId() != 0 || result.GetPid() != 0 || success.GetPid() != 0 {
+		return false
+	}
+	if command == "" {
+		command = success.GetCommand()
+	}
+	return isSafeInspectShellCommandText(command)
+}
+
+func isSafeInspectShellCommandText(command string) bool {
+	payload, err := json.Marshal(map[string]string{"command": strings.TrimSpace(command)})
+	if err != nil {
+		return false
+	}
+	return execbridge.IsSafeInspectShellCommand(payload)
+}
+
+type silentInspectCheckpointKey struct {
+	turnSeq    int64
+	requestID  string
+	toolCallID string
+}
+
+// sanitizeSkippedGitTasklistEntries 从 checkpoint 投影条目中剥离明确标记为
+// silent_inspect_skip 的 Shell tool_call/tool_result，防止 reconnect 时重复回放。
+// 清理授权来自 recovery metadata，而不是 rejected reason 或零值结果形状；删除范围
+// 绑定 (TurnSeq, RequestID, ToolCallID)，避免跨轮次/请求复用 ID 时误删真实调用。
+func sanitizeSkippedGitTasklistEntries(entries []HistoryEntry) []HistoryEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	skipped := make(map[silentInspectCheckpointKey]struct{})
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var metadata metadataPayload
+		if json.Unmarshal(entry.Payload, &metadata) != nil || metadata.Type != "shell_stream_recovered" {
+			continue
+		}
+		raw, err := json.Marshal(metadata.Value)
+		if err != nil {
+			continue
+		}
+		var recovery struct {
+			ToolCallID    string `json:"tool_call_id"`
+			TerminalOwner string `json:"terminal_owner"`
+			SilentInspect bool   `json:"silent_inspect_skip"`
+		}
+		if json.Unmarshal(raw, &recovery) != nil ||
+			!recovery.SilentInspect ||
+			recovery.TerminalOwner != "silent_inspect_skip" ||
+			strings.TrimSpace(recovery.ToolCallID) == "" {
+			continue
+		}
+		skipped[silentInspectCheckpointKey{
+			turnSeq:    entry.TurnSeq,
+			requestID:  strings.TrimSpace(entry.RequestID),
+			toolCallID: strings.TrimSpace(recovery.ToolCallID),
+		}] = struct{}{}
+	}
+	if len(skipped) == 0 {
+		return entries
+	}
+	filtered := make([]HistoryEntry, 0, len(entries))
+	for _, entry := range entries {
+		id := strings.TrimSpace(entry.ToolCallID)
+		switch strings.TrimSpace(entry.Kind) {
+		case "tool_call", "tool_result":
+			if id == "" {
+				var payload struct {
+					ToolCallID string `json:"tool_call_id"`
+				}
+				_ = json.Unmarshal(entry.Payload, &payload)
+				id = strings.TrimSpace(payload.ToolCallID)
+			}
+			key := silentInspectCheckpointKey{
+				turnSeq:    entry.TurnSeq,
+				requestID:  strings.TrimSpace(entry.RequestID),
+				toolCallID: id,
+			}
+			if _, ok := skipped[key]; ok {
+				continue
+			}
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }
 
 func filterCheckpointTurns(rawTurns [][]byte) [][]byte {

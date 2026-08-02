@@ -425,12 +425,24 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 	if reason == shellRecoveryReasonForegroundDeadline {
 		result = "Shell timed out: no terminal result arrived before the foreground deadline and an abort was requested. The tool call was closed locally as a timeout; the command outcome is unknown."
 	}
+	silentInspectSkip := false
 	if reason == shellRecoveryReasonSkipped {
 		result = "Shell execution status is unknown: Cursor reported Skipped and no Start or output event was observed. The command was not automatically replayed unless it was classified as read-only; verify side effects before retrying."
+		// 只读 inspect（git status / tasklist 等）被 Cursor 跳过时，UI 用 Rejected 会刷 "Skipped git/tasklist"。
+		// 改投影为 backgrounded success，模型仍收到 unknown 文本，checkpoint 与 live UI 不再显示错误态。
+		silentInspectSkip = execbridge.IsSafeInspectShellCommand(pending.ArgsJSON)
 	}
 	toolCallID := pending.ToolCallID
-	completedToolCall := execbridge.BuildShellRejectedToolCall(toolCallID, pending.ArgsJSON, result)
+	var completedToolCall *agentv1.ToolCall
+	if silentInspectSkip {
+		completedToolCall = execbridge.BuildShellSkippedBackgroundedToolCall(toolCallID, pending.ArgsJSON, result)
+	} else {
+		completedToolCall = execbridge.BuildShellRejectedToolCall(toolCallID, pending.ArgsJSON, result)
+	}
 	terminalOwner := "local_recovery"
+	if silentInspectSkip {
+		terminalOwner = "silent_inspect_skip"
+	}
 	if reason == shellRecoveryReasonPersistenceFailed && pending.ShellTerminalSnapshotReady {
 		toolCallID = firstNonEmpty(strings.TrimSpace(pending.ShellTerminalToolCallID), strings.TrimSpace(pending.ToolCallID))
 		result = pending.ShellTerminalResultPayload
@@ -446,7 +458,8 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 		return err
 	}
 	pending = markShellTerminalPersisted(stream, pending)
-	if shellToolCallIsBackgrounded(completedToolCall) {
+	// silent inspect skip 的 backgrounded 是 UI 投影，不是真实后台 shell，不登记 background lease。
+	if !silentInspectSkip && shellToolCallIsBackgrounded(completedToolCall) {
 		if recordedToolCallID, recorded := recordBackgroundShellActionMemory(stream, toolCallID, time.Now().UTC()); recorded {
 			if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
 				newBackgroundShellActionMetadataEntry(stream.TurnSeq, stream.RequestID, recordedToolCallID, backgroundShellActionSourceLocalBackgrounded),
@@ -474,6 +487,7 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 			"chunk_count":         pending.ChunkCount,
 			"stdout_buffer_bytes": len(pending.StdoutBuffer),
 			"stderr_buffer_bytes": len(pending.StderrBuffer),
+			"silent_inspect_skip": silentInspectSkip,
 			"terminal":            true,
 		}),
 	}); err != nil {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	execbridge "cursor/internal/backend/agent/bridge/exec"
 	runtimecore "cursor/internal/backend/agent/core"
 )
 
@@ -209,11 +210,24 @@ func validateReadonlyGitCommand(tokens []string) ([]string, error) {
 	if len(tokens) < 2 {
 		return nil, fmt.Errorf("inspect Shell git requires a read-only subcommand")
 	}
-	subcommand := strings.ToLower(tokens[1])
-	if _, ok := gitReadonlySubcommands[subcommand]; !ok {
-		return nil, fmt.Errorf("inspect Shell git subcommand %q is not read-only", tokens[1])
+	subcommandIndex := 1
+	for subcommandIndex < len(tokens) {
+		switch strings.ToLower(tokens[subcommandIndex]) {
+		case "--no-pager", "--no-optional-locks":
+			subcommandIndex++
+		default:
+			goto subcommandFound
+		}
 	}
-	rest := tokens[2:]
+subcommandFound:
+	if subcommandIndex >= len(tokens) {
+		return nil, fmt.Errorf("inspect Shell git requires a read-only subcommand")
+	}
+	subcommand := strings.ToLower(tokens[subcommandIndex])
+	if _, ok := gitReadonlySubcommands[subcommand]; !ok {
+		return nil, fmt.Errorf("inspect Shell git subcommand %q is not read-only", tokens[subcommandIndex])
+	}
+	rest := tokens[subcommandIndex+1:]
 	if _, listOnly := gitListOnlySubcommands[subcommand]; listOnly {
 		for _, token := range rest {
 			if !strings.HasPrefix(token, "-") {
@@ -248,7 +262,7 @@ func validateReadonlyGitCommand(tokens []string) ([]string, error) {
 		}
 	}
 	// 注入 --no-pager --no-optional-locks，确保无分页器阻塞且不写 index 锁。
-	return append([]string{tokens[0], "--no-pager", "--no-optional-locks"}, tokens[1:]...), nil
+	return append([]string{tokens[0], "--no-pager", "--no-optional-locks"}, tokens[subcommandIndex:]...), nil
 }
 
 func isAllowedGitListFlag(token string) bool {
@@ -266,16 +280,7 @@ func isAllowedGitListFlag(token string) bool {
 }
 
 func shellCommandSafeToRetry(argsJSON []byte) bool {
-	args, err := runtimecore.DecodeArgsMap(argsJSON)
-	if err != nil {
-		return false
-	}
-	tokens, simple := parseReadonlyShellCommand(runtimecore.ReadStringArg(args, "command"))
-	if !simple || len(tokens) == 0 {
-		return false
-	}
-	_, err = validateReadonlyShellCommandTokens(tokens)
-	return err == nil
+	return execbridge.IsSafeInspectShellCommand(argsJSON)
 }
 
 // enforceReadonlyShellPolicy 在 pre-dispatch 阶段对 inspect child 的 Shell 调用强制白名单，

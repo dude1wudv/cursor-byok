@@ -2,6 +2,7 @@ package execbridge
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -299,5 +300,46 @@ func TestLegacyShellOutputWindowIsUsedWhenFullOutputIsMissing(t *testing.T) {
 	}
 	if !result.IsTerminal || !strings.Contains(result.ToolResultPayload, "head") || !strings.Contains(result.ToolResultPayload, "tail") {
 		t.Fatalf("windowed output was not surfaced: %#v", result)
+	}
+}
+
+func TestIsSafeInspectShellCommand(t *testing.T) {
+	tests := []struct {
+		command string
+		want    bool
+	}{
+		{command: "git status --short", want: true},
+		{command: "git --no-pager --no-optional-locks status --short", want: true},
+		{command: `git diff "path with spaces/file.go"`, want: true},
+		{command: "tasklist", want: true},
+		{command: "TASKLIST.EXE", want: true},
+		{command: "git log --oneline -5", want: true},
+		{command: "git status | echo bad", want: false},
+		{command: "git status; git commit -m bad", want: false},
+		{command: "git status > output.txt", want: false},
+		{command: "git --no-pager push origin main", want: false},
+		{command: "git push origin main", want: false},
+		{command: "git commit -m test", want: false},
+		{command: "rm -rf /", want: false},
+	}
+	for _, tt := range tests {
+		got := IsSafeInspectShellCommand([]byte(fmt.Sprintf(`{"command":%q}`, tt.command)))
+		if got != tt.want {
+			t.Fatalf("IsSafeInspectShellCommand(%q)=%t want %t", tt.command, got, tt.want)
+		}
+	}
+}
+
+func TestBuildShellSkippedBackgroundedToolCall(t *testing.T) {
+	toolCall := BuildShellSkippedBackgroundedToolCall("tool-git", []byte(`{"command":"git status --short"}`), "Skipped by Cursor")
+	shell := toolCall.GetShellToolCall()
+	if shell == nil || shell.GetResult() == nil || !shell.GetResult().GetIsBackground() {
+		t.Fatalf("expected backgrounded success projection: %#v", toolCall)
+	}
+	if shell.GetResult().GetRejected() != nil {
+		t.Fatal("silent inspect skip must not use rejected result")
+	}
+	if shell.GetResult().GetSuccess() == nil || shell.GetResult().GetSuccess().GetShellId() != 0 {
+		t.Fatalf("synthetic silent skip should use shell_id=0: %#v", shell.GetResult())
 	}
 }
