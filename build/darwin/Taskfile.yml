@@ -29,7 +29,8 @@ tasks:
     summary: 使用本机构建 macOS 程序
     internal: true
     deps:
-      - task: common:go:mod:tidy
+      - task: common:toolchain:check
+      - task: common:go:mod:check
       - task: common:build:frontend
         vars:
           BUILD_FLAGS:
@@ -42,7 +43,7 @@ tasks:
     cmds:
       - go build {{.BUILD_FLAGS}} -o {{.OUTPUT}}
     vars:
-      BUILD_FLAGS: '{{if eq .DEV "true"}}{{if .EXTRA_TAGS}}-tags {{.EXTRA_TAGS}} {{end}}-buildvcs=false -gcflags=all="-l" -ldflags="-X cursor/internal/buildinfo.Version={{.APP_VERSION}}"{{else}}-tags production{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s -X cursor/internal/buildinfo.Version={{.APP_VERSION}}"{{end}}'
+      BUILD_FLAGS: '{{if eq .DEV "true"}}{{if .EXTRA_TAGS}}-tags {{.EXTRA_TAGS}} {{end}}-buildvcs=false -gcflags=all="-l" -ldflags="-X cursor/internal/buildinfo.Version={{.APP_VERSION}} -X cursor/internal/buildinfo.Commit={{.APP_COMMIT}}"{{else}}-tags production{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s -X cursor/internal/buildinfo.Version={{.APP_VERSION}} -X cursor/internal/buildinfo.Commit={{.APP_COMMIT}}"{{end}}'
       BINARY_NAME: '{{.BINARY_NAME | default .APP_NAME}}'
       DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.BINARY_NAME}}'
       OUTPUT: '{{ .OUTPUT | default .DEFAULT_OUTPUT }}'
@@ -100,6 +101,8 @@ tasks:
             ref: .OUTPUT
           BINARY_NAME:
             ref: .BINARY_NAME
+          MACOS_SIGN_IDENTITY:
+            ref: .MACOS_SIGN_IDENTITY
 
   package:dmg:
     summary: 打包 macOS DMG（可通过 APP_BUNDLE/DMG_NAME 指定输出文件名）
@@ -115,6 +118,8 @@ tasks:
             ref: .BINARY_NAME
           APP_BUNDLE:
             ref: .APP_BUNDLE
+          MACOS_SIGN_IDENTITY:
+            ref: .MACOS_SIGN_IDENTITY
           BUILD_FLAGS:
             ref: .BUILD_FLAGS
           EXTRA_TAGS:
@@ -154,6 +159,8 @@ tasks:
             ref: .BINARY_NAME
           APP_BUNDLE:
             ref: .APP_BUNDLE
+          MACOS_SIGN_IDENTITY:
+            ref: .MACOS_SIGN_IDENTITY
           BUILD_FLAGS:
             ref: .BUILD_FLAGS
           EXTRA_TAGS:
@@ -199,10 +206,24 @@ tasks:
       - cp build/darwin/icons.icns "{{.BIN_DIR}}/{{.APP_BUNDLE}}/Contents/Resources"
       - cp "{{.BINARY_PATH}}" "{{.BIN_DIR}}/{{.APP_BUNDLE}}/Contents/MacOS/{{.EXECUTABLE_NAME}}"
       - cp build/darwin/Info.plist "{{.BIN_DIR}}/{{.APP_BUNDLE}}/Contents"
-      - task: codesign:adhoc
+      - task: '{{if .MACOS_SIGN_IDENTITY}}codesign:developer-id{{else}}codesign:adhoc{{end}}'
         vars:
           APP_BUNDLE:
             ref: .APP_BUNDLE
+          MACOS_SIGN_IDENTITY:
+            ref: .MACOS_SIGN_IDENTITY
+
+  codesign:developer-id:
+    summary: 使用 Developer ID 签名（CI 发布）
+    internal: true
+    vars:
+      APP_BUNDLE: '{{.APP_BUNDLE | default (printf "%s.app" .APP_NAME)}}'
+      MACOS_SIGN_IDENTITY: '{{.MACOS_SIGN_IDENTITY}}'
+    preconditions:
+      - sh: test -n "{{.MACOS_SIGN_IDENTITY}}"
+        msg: "MACOS_SIGN_IDENTITY is required for Developer ID signing."
+    cmds:
+      - codesign --force --deep --options runtime --timestamp --sign "{{.MACOS_SIGN_IDENTITY}}" "{{.BIN_DIR}}/{{.APP_BUNDLE}}"
 
   codesign:adhoc:
     summary: 使用临时签名（开发测试）

@@ -1,0 +1,64 @@
+name: Main build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-amd64:
+    name: Windows amd64 smoke build
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: '1.25.x'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.x'
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          npm install --global yarn@1.22.22
+          choco install protoc -y --no-progress
+          go install github.com/go-task/task/v3/cmd/task@v3.45.4
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.74
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
+          Add-Content $env:GITHUB_PATH "$(go env GOPATH)\bin"
+      - name: Generate and build frontend
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force frontend/dist | Out-Null
+          Set-Content -Path frontend/dist/wails-placeholder.txt -Value 'placeholder' -NoNewline
+          task common:generate:proto
+          task common:generate:bindings
+          yarn --cwd frontend install --frozen-lockfile
+          yarn --cwd frontend build
+          if (-not (Test-Path frontend/dist)) { throw 'frontend/dist was not created' }
+      - name: Build Windows archive
+        shell: pwsh
+        run: |
+          task release:clean
+          task release:build:windows:amd64
+          $assets = @(Get-ChildItem -Path bin/release -Recurse -Filter 'cursor-byok-*-windows-amd64.zip')
+          if ($assets.Count -ne 1 -or $assets[0].Length -eq 0) { throw 'Windows release archive is missing or empty' }
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: windows-amd64-main
+          path: bin/release/*/cursor-byok-*-windows-amd64.zip
+          if-no-files-found: error
+          retention-days: 1
