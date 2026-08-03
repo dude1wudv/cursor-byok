@@ -129,12 +129,6 @@ func Local(action HandlerFunc) RouteOption {
 	}
 }
 
-func Upstream(action HandlerFunc) RouteOption {
-	return func(route *Route) {
-		route.Upstream = action
-	}
-}
-
 func (app *App) registerRoute(route Route) {
 	handler := app.buildRouteHandler(route)
 	if route.Method == "" {
@@ -170,10 +164,7 @@ func (app *App) buildRouteHandler(route Route) http.HandlerFunc {
 
 func shouldUseUpstreamAction(ctx *Context, route Route) bool {
 	_ = route
-	if ctx == nil {
-		return false
-	}
-	return ctx.Mode == ModeUpstream
+	return ctx != nil && ctx.Mode == ModeUpstream
 }
 
 func Chain(middlewares ...Middleware) Middleware {
@@ -187,5 +178,11 @@ func Chain(middlewares ...Middleware) Middleware {
 			wrapped = current(wrapped)
 		}
 		return wrapped
+	}
+}
+
+func Upstream(action HandlerFunc) RouteOption {
+	return func(route *Route) {
+		route.Upstream = action
 	}
 }

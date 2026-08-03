@@ -1,5 +1,22 @@
 <!-- 发布约定：每次 Release 都保留“最近 5 个版本更新梗概”，覆盖当前版本和前 4 个版本。 -->
 
+# Cursor助手 v0.0.80
+
+本版本合并上游最新变更，并修复 Sub2API、DeepSeek 等 OpenAI-compatible Responses 渠道因不支持扩展缓存字段而返回 HTTP 400 的兼容性问题。
+
+## 上游合并与兼容性
+
+- 合并上游 `upstream/main@639c452`，保留本地 Shell、子代理、Await、BYOK、配置保护和缓存诊断逻辑。
+- 同步生成 Go proto、前端 bindings 与 dist，纳入 Cursor account、debugger、i18n 等上游能力。
+
+## Responses 缓存兼容修复
+
+- GPT 系列的 OpenAI-compatible 请求体和 User-Agent 回归 `upstream/main@639c452` 写法：保留工具原顺序，仅发送 `reasoning.effort`、`reasoning.encrypted_content` 与稳定的 `prompt_cache_key`，不再自动注入 `reasoning.summary`、`parallel_tool_calls`、`service_tier`、`prompt_cache_options` 或嵌套 `cache_control`。
+- DeepSeek、MiniMax、Grok 等非 GPT 模型不再携带 `prompt_cache_key`；历史 replay 或额外参数中的不兼容显式缓存扩展会在发往上游前被清理。
+- 保留稳定 replay 前缀和 `partial_cache_plateau` 诊断，用上游可接受的隐式前缀缓存继续解决缓存连续性问题。
+- 修复 `KvClientMessage.set_blob_result` 未路由到 checkpoint Blob ACK 处理器的问题；客户端已返回的 Blob 写入成功结果不再被忽略，第二次请求不会在 10 秒后误报 `checkpoint_sync_error: 2 checkpoint blob writes timed out` 并中断 provider。
+- 新增 GPT 上游请求形状、Sub2API/DeepSeek 缓存兼容和 checkpoint Blob ACK 路由回归测试。
+
 # Cursor助手 v0.0.79
 
 本版本修复新版 Cursor 子代理派发与并发收口兼容，增强 GPT Responses 缓存连续性诊断，并新增安全、可恢复的 Cursor 自动更新控制。

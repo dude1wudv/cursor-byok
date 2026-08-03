@@ -1,4 +1,5 @@
 import { computed, ref } from "vue";
+import { Events } from "@wailsio/runtime";
 import {
   DEFAULT_LOCALE,
   LOCALE_OPTIONS,
@@ -10,17 +11,20 @@ import {
 import zhCNMessages from "@/i18n/locales/zh-CN.json";
 import enUSMessages from "@/i18n/locales/en-US.json";
 import jaJPMessages from "@/i18n/locales/ja-JP.json";
+import ruRUMessages from "@/i18n/locales/ru-RU.json";
 
 const localeMessages = {
   "zh-CN": zhCNMessages,
   "en-US": enUSMessages,
   "ja-JP": jaJPMessages,
+  "ru-RU": ruRUMessages,
 };
 
 const languageLocaleMap = {
   zh: "zh-CN",
   en: "en-US",
   ja: "ja-JP",
+  ru: "ru-RU",
 };
 
 function isSupportedLocale(locale) {
@@ -143,6 +147,7 @@ class LocalizedText extends String {
 
 const currentLocale = ref(resolveInitialLocale());
 applyLocaleToDocument(currentLocale.value);
+Events.Emit("locale:changed", currentLocale.value);
 
 const localizedCache = new Map();
 
@@ -155,6 +160,7 @@ export function setLocale(locale) {
   currentLocale.value = nextLocale;
   persistManualLocale(nextLocale);
   applyLocaleToDocument(nextLocale);
+  Events.Emit("locale:changed", nextLocale);
   return nextLocale;
 }
 

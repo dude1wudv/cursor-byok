@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"cursor/gen/agentv1"
 	"cursor/gen/aiserverv1"
-	"cursor/internal/backend/server"
 	"cursor/internal/logger"
 	"cursor/internal/netproxy"
 	legacyruntime "cursor/internal/runtime"
@@ -88,7 +88,7 @@ func buildUpstreamRequest(reqCtx *RequestContext, body []byte, options ForwardOp
 	}
 	upstreamRequest.Host = reqCtx.TargetURL.Host
 
-	if reqCtx.Mode == server.ModeLocal && shouldRewriteHost(reqCtx.TargetURL.Hostname()) {
+	if shouldRewriteHost(reqCtx.TargetURL.Hostname()) {
 		auth := formatBearerAuthorization(legacyruntime.LocalRelayToken)
 		if auth == "" {
 			return nil, nil, legacyruntime.ErrInvalidSystemSetting
@@ -430,6 +430,28 @@ func newProtoMessage(typeName string) (proto.Message, error) {
 		return &aiserverv1.GetEffectiveUserPluginsResponse{}, nil
 	case "aiserver.v1.IsOnNewPricingResponse":
 		return &aiserverv1.IsOnNewPricingResponse{}, nil
+	case "aiserver.v1.GetTeamAdminSettingsResponse":
+		return &aiserverv1.GetTeamAdminSettingsResponse{}, nil
+	case "aiserver.v1.GetTeamReposResponse":
+		return &aiserverv1.GetTeamReposResponse{}, nil
+	case "aiserver.v1.ListMarketplacesResponse":
+		return &aiserverv1.ListMarketplacesResponse{}, nil
+	case "aiserver.v1.GetUsableModelsResponse":
+		return &agentv1.GetUsableModelsResponse{}, nil
+	case "aiserver.v1.GetDefaultModelForCliResponse":
+		return &agentv1.GetDefaultModelForCliResponse{}, nil
+	case "aiserver.v1.GetDefaultModelResponse":
+		return &aiserverv1.GetDefaultModelResponse{}, nil
+	case "aiserver.v1.GetGlobalCommandsResponse":
+		return &aiserverv1.GetGlobalCommandsResponse{}, nil
+	case "aiserver.v1.RegisterMarketplaceAndPluginsResponse":
+		return &aiserverv1.RegisterMarketplaceAndPluginsResponse{}, nil
+	case "aiserver.v1.GetCliDownloadUrlResponse":
+		return &aiserverv1.GetCliDownloadUrlResponse{}, nil
+	case "aiserver.v1.SubmitLogsResponse":
+		return &aiserverv1.SubmitLogsResponse{}, nil
+	case "aiserver.v1.TrackEventsResponse":
+		return &aiserverv1.TrackEventsResponse{}, nil
 	case "google.protobuf.Empty":
 		return &emptypb.Empty{}, nil
 	default:

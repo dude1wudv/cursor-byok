@@ -21,9 +21,11 @@ type ConversationFile struct {
 	RootConversationID              string                                `json:"root_conversation_id"`
 	ParentConversationID            string                                `json:"parent_conversation_id"`
 	ParentToolCallID                string                                `json:"parent_tool_call_id"`
+	ImportedTurnIDs                 [][]byte                              `json:"imported_turn_ids,omitempty"`
 	SubagentTypeName                string                                `json:"subagent_type_name,omitempty"`
 	SubagentRole                    string                                `json:"subagent_role,omitempty"`
 	SubagentDepth                   int                                   `json:"subagent_depth,omitempty"`
+	AgentTranscriptsFolder          string                                `json:"agent_transcripts_folder,omitempty"`
 	Mode                            string                                `json:"mode"`
 	SelectedModelAdapterID          string                                `json:"selected_model_adapter_id,omitempty"`
 	ContextVersion                  int64                                 `json:"context_version,omitempty"`
@@ -234,6 +236,11 @@ type shellExecTombstone struct {
 	CompletedAt    time.Time
 }
 
+type manualCompactionDirective struct {
+	Requested   bool
+	Instruction string
+}
+
 type ActiveStream struct {
 	mu sync.Mutex
 
@@ -244,6 +251,7 @@ type ActiveStream struct {
 	ModelName               string
 	Mode                    agentv1.AgentMode
 	LatestUserText          string
+	ManualCompaction        manualCompactionDirective
 	Status                  StreamStatus
 	RunAccepted             bool
 	ThinkingEffort          string
@@ -282,8 +290,17 @@ type ActiveStream struct {
 	ProviderSyntheticThinkingPublished          bool
 	ProviderFinishReason                        string
 	ProviderUsage                               turnUsageSnapshot
+	LastCacheReadTokens                         int64
+	LastCacheInputTokens                        int64
+	LastCachePrefixMatchBytes                   int64
+	CachePlateauPasses                          int
 	ProviderTerminalToolInvocation              bool
 	PendingCompaction                           *PendingCompaction
+	PendingCheckpointBlobWrites                 map[uint32]pendingCheckpointBlobWrite
+	PendingCheckpointBlobRequests               map[string]uint32
+	NextCheckpointBlobRequestID                 uint32
+	NextCheckpointRevision                      uint64
+	PendingCheckpoint                           *pendingCheckpointPublish
 
 	Backlog                     []StreamEvent
 	DeliveredCursor             int
@@ -351,6 +368,32 @@ type pendingTurnCompletion struct {
 	ProviderPass   int
 	Usage          turnUsageSnapshot
 	Disposition    pendingCompletionDisposition
+}
+
+type pendingCheckpointBlobWrite struct {
+	Key      string
+	Revision uint64
+}
+
+type checkpointTerminalActionKind uint8
+
+const (
+	checkpointTerminalActionNone checkpointTerminalActionKind = iota
+	checkpointTerminalActionComplete
+	checkpointTerminalActionCancel
+)
+
+type checkpointTerminalAction struct {
+	kind          checkpointTerminalActionKind
+	completion    pendingTurnCompletion
+	cancelMessage string
+}
+
+type pendingCheckpointPublish struct {
+	Revision       uint64
+	State          *agentv1.ConversationStateStructure
+	Required       map[string]struct{}
+	TerminalAction checkpointTerminalAction
 }
 
 type PendingCompaction struct {
@@ -578,6 +621,8 @@ type InboundIntent struct {
 	ClientSupportsSendToUserSet        bool
 	SuppressSubagentProgressUpdateTool bool
 	ConversationState                  *agentv1.ConversationStateStructure
+	PreFetchedBlobs                    []*agentv1.PreFetchedBlob
+	ManualCompaction                   manualCompactionDirective
 	UserMessage                        *agentv1.UserMessage
 	RequestContext                     *agentv1.RequestContext
 	ClientMessage                      *agentv1.AgentClientMessage

@@ -25,9 +25,10 @@ func (gateway *DefaultProviderGateway) StartStream(ctx context.Context, req Prov
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	requestKnobs := req.RequestKnobs
-	if requestKnobs == nil {
-		requestKnobs = make(map[string]any, 2)
+	defer releaseArtifactSession(req.Observer, req.RequestID, req.ModelCallID)
+	requestKnobs := make(map[string]any, len(req.RequestKnobs)+2)
+	for key, value := range req.RequestKnobs {
+		requestKnobs[key] = value
 	}
 	requestKnobs["stream"] = true
 	if req.MaxTokens > 0 {
@@ -60,4 +61,27 @@ func (gateway *DefaultProviderGateway) StartStream(ctx context.Context, req Prov
 		return providerTerminalError{cause: err}
 	}
 	return nil
+}
+
+type artifactSessionCleaner interface {
+	ClearActiveArtifacts(requestID string, modelCallID string)
+}
+
+func releaseArtifactSession(observer modeladapter.LLMArtifactObserver, requestID string, modelCallID string) {
+	cleaner, ok := observer.(artifactSessionCleaner)
+	if !ok {
+		return
+	}
+	cleaner.ClearActiveArtifacts(requestID, modelCallID)
+}
+
+func cloneStringAnyMap(input map[string]any) map[string]any {
+	if input == nil {
+		return nil
+	}
+	output := make(map[string]any, len(input))
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
 }

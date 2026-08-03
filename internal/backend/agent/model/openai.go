@@ -278,7 +278,7 @@ func NewOpenAIAdapter() *OpenAIAdapter {
 
 func openAIModelSupportsPromptCacheKey(modelID string) bool {
 	normalizedModelID := strings.ToLower(strings.TrimSpace(modelID))
-	return strings.Contains(normalizedModelID, "gpt") || strings.HasPrefix(normalizedModelID, "grok-")
+	return strings.Contains(normalizedModelID, "gpt")
 }
 
 func openAIPromptCacheKey(req StreamRequest, modelID string) string {
@@ -361,6 +361,44 @@ func applyOpenAIParallelToolCalls(body map[string]any, modelID string, endpoint 
 		return
 	}
 	body["parallel_tool_calls"] = true
+}
+
+// applyOpenAICompatiblePromptCaching keeps OpenAI-compatible requests on the
+// upstream-compatible cache shape: a stable prompt_cache_key only. Older local
+// builds could persist or replay prompt_cache_options/cache_control extensions;
+// strip them before sending because OpenAI-compatible relays such as Sub2API and
+// non-GPT Responses models reject those fields with HTTP 400.
+func applyOpenAICompatiblePromptCaching(body map[string]any, req StreamRequest) {
+	if len(body) == 0 {
+		return
+	}
+	delete(body, "prompt_cache_options")
+	stripOpenAICacheControl(body["tools"])
+	stripOpenAICacheControl(body["input"])
+	if req.RequestKnobs != nil {
+		req.RequestKnobs["prompt_cache_mode"] = "implicit"
+		req.RequestKnobs["explicit_cache_unsupported"] = true
+		req.RequestKnobs["cache_options_emitted"] = false
+		req.RequestKnobs["explicit_breakpoint_count"] = 0
+	}
+}
+
+func stripOpenAICacheControl(value any) {
+	switch current := value.(type) {
+	case map[string]any:
+		delete(current, "cache_control")
+		for _, nested := range current {
+			stripOpenAICacheControl(nested)
+		}
+	case []any:
+		for _, nested := range current {
+			stripOpenAICacheControl(nested)
+		}
+	case []map[string]any:
+		for _, nested := range current {
+			stripOpenAICacheControl(nested)
+		}
+	}
 }
 
 func shouldExposeOpenAIResponsesImageGeneration(req StreamRequest, tools []map[string]any) bool {
@@ -638,12 +676,16 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		recordEarlyFailure(err, false)
 		return err
 	}
-	applyOpenAIThinkingDisable(bodyMap, req, baseURL, modelID, req.OpenAIEndpoint)
+	if !openAIModelSupportsPromptCacheKey(modelID) {
+		applyOpenAIThinkingDisable(bodyMap, req, baseURL, modelID, req.OpenAIEndpoint)
+	}
 	if err := ApplyOpenAIExtraParams(bodyMap, req.OpenAIExtraParamsEnabled, req.OpenAIExtraParamsJSON); err != nil {
 		recordEarlyFailure(err, false)
 		return err
 	}
-	applyOpenAIFastMode(bodyMap, req.FastMode)
+	if !openAIModelSupportsPromptCacheKey(modelID) {
+		applyOpenAIFastMode(bodyMap, req.FastMode)
+	}
 	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 && shouldSendOpenAIMaxOutputTokens(modelID) {
 		bodyMap["max_output_tokens"] = req.MaxTokens
 	}
@@ -668,7 +710,11 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		}
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("User-Agent", CodexDesktopUserAgent())
+		if openAIModelSupportsPromptCacheKey(modelID) {
+			httpReq.Header.Set("User-Agent", ClaudeCodeUserAgent)
+		} else {
+			httpReq.Header.Set("User-Agent", CodexDesktopUserAgent())
+		}
 		if err := ApplyCustomHeaders(httpReq, req.CustomHeadersEnabled, req.CustomHeadersJSON); err != nil {
 			return nil, err
 		}
@@ -1236,9 +1282,11 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 				recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 				return err
 			}
-			sort.SliceStable(tools, func(i, j int) bool {
-				return openAIResponsesCanonicalToolName(tools[i]) < openAIResponsesCanonicalToolName(tools[j])
-			})
+			if !openAIModelSupportsPromptCacheKey(modelID) {
+				sort.SliceStable(tools, func(i, j int) bool {
+					return openAIResponsesCanonicalToolName(tools[i]) < openAIResponsesCanonicalToolName(tools[j])
+				})
+			}
 			if shouldExposeOpenAIResponsesImageGeneration(req, tools) {
 				tools = ensureOpenAIResponsesImageGenerationTool(tools)
 				if req.RequestKnobs != nil {
@@ -1248,7 +1296,10 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 			requestBody.Tools = tools
 		}
 		if effort := strings.TrimSpace(req.ReasoningEffort); effort != "" {
-			requestBody.Reasoning = &openAIResponsesReasoning{Effort: effort, Summary: "auto"}
+			requestBody.Reasoning = &openAIResponsesReasoning{Effort: effort}
+			if !openAIModelSupportsPromptCacheKey(modelID) {
+				requestBody.Reasoning.Summary = "auto"
+			}
 			requestBody.Include = []string{"reasoning.encrypted_content"}
 		}
 		body = requestBody
@@ -1261,15 +1312,20 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 		return err
 	}
-	applyOpenAIThinkingDisable(bodyMap, req, baseURL, modelID, req.OpenAIEndpoint)
+	if !openAIModelSupportsPromptCacheKey(modelID) {
+		applyOpenAIThinkingDisable(bodyMap, req, baseURL, modelID, req.OpenAIEndpoint)
+	}
 	if err := ApplyOpenAIExtraParams(bodyMap, req.OpenAIExtraParamsEnabled, req.OpenAIExtraParamsJSON); err != nil {
 		finishedAt = time.Now().UTC()
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 		return err
 	}
-	applyOpenAIResponsesReasoningSummary(bodyMap)
-	applyOpenAIFastMode(bodyMap, req.FastMode)
-	applyOpenAIParallelToolCalls(bodyMap, modelID, req.OpenAIEndpoint)
+	applyOpenAICompatiblePromptCaching(bodyMap, req)
+	if !openAIModelSupportsPromptCacheKey(modelID) {
+		applyOpenAIResponsesReasoningSummary(bodyMap)
+		applyOpenAIFastMode(bodyMap, req.FastMode)
+		applyOpenAIParallelToolCalls(bodyMap, modelID, req.OpenAIEndpoint)
+	}
 	if _, isResponsesRequest := bodyMap["input"]; isResponsesRequest && req.MaxTokens > 0 && shouldSendOpenAIMaxOutputTokens(modelID) {
 		bodyMap["max_output_tokens"] = req.MaxTokens
 	}
@@ -1296,7 +1352,11 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		}
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("User-Agent", CodexDesktopUserAgent())
+		if openAIModelSupportsPromptCacheKey(modelID) {
+			httpReq.Header.Set("User-Agent", ClaudeCodeUserAgent)
+		} else {
+			httpReq.Header.Set("User-Agent", CodexDesktopUserAgent())
+		}
 		if err := ApplyCustomHeaders(httpReq, req.CustomHeadersEnabled, req.CustomHeadersJSON); err != nil {
 			return nil, err
 		}
@@ -2358,10 +2418,15 @@ func openAIThinkingDisableKind(baseURL string, modelID string, endpoint string) 
 		strings.Contains(base, "bigmodel") ||
 		strings.Contains(base, "z.ai") ||
 		strings.Contains(base, "zhipu") ||
+		strings.Contains(base, "xiaomimimo") ||
+		strings.Contains(base, "mimo") ||
+		strings.Contains(base, "minimax") ||
 		strings.Contains(model, "deepseek") ||
 		strings.Contains(model, "glm") ||
 		strings.Contains(model, "zai") ||
-		strings.Contains(model, "zhipu"):
+		strings.Contains(model, "zhipu") ||
+		strings.Contains(model, "mimo") ||
+		strings.Contains(model, "minimax"):
 		return "thinking_type"
 	case openAIModelSupportsReasoningNone(model):
 		return "reasoning_none"

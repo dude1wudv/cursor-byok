@@ -261,6 +261,9 @@ func applyRunRewindMetadata(conversation *ConversationFile, source *Conversation
 		conversation.ParentToolCallID = strings.TrimSpace(source.ParentToolCallID)
 		conversation.SubagentTypeName = strings.TrimSpace(source.SubagentTypeName)
 		conversation.SubagentDepth = source.SubagentDepth
+		if folder := normalizeAgentTranscriptsFolder(source.AgentTranscriptsFolder); folder != "" {
+			conversation.AgentTranscriptsFolder = folder
+		}
 		if strings.TrimSpace(source.Mode) != "" {
 			conversation.Mode = strings.TrimSpace(source.Mode)
 		}
@@ -300,4 +303,18 @@ func (service *Service) logRunRewindDecision(requestID string, conversationID st
 		fields["client_turn_count"] = nil
 	}
 	service.debug.LogRuntime(context.Background(), requestID, conversationID, eventName, fields)
+}
+
+func rewindImportedTurnPrefix(importedTurnIDs [][]byte, decision runRewindDecision) [][]byte {
+	keep := decision.TargetTurnSeq - 1
+	if decision.HasClientTurnCount {
+		keep = int64(decision.ClientTurnCount)
+	}
+	if keep <= 0 || len(importedTurnIDs) == 0 {
+		return nil
+	}
+	if keep > int64(len(importedTurnIDs)) {
+		keep = int64(len(importedTurnIDs))
+	}
+	return cloneByteSlices(importedTurnIDs[:keep])
 }

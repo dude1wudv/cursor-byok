@@ -14,6 +14,8 @@ import (
 
 const (
 	codexDesktopUserAgentPrefix = "Codex Desktop/"
+	// ClaudeCodeUserAgent 与上游 OpenAI-compatible 请求保持一致。
+	ClaudeCodeUserAgent         = "claude-cli/2.1.19 (external, sdk-cli)"
 	fallbackCodexDesktopVersion = "0.146.0-alpha.3"
 	codexBackendURLMarker       = "https://chatgpt.com/backend-api/"
 	// AnthropicClaudeCodeUserAgent 用于 Anthropic provider 的 Claude Code UA 兼容。

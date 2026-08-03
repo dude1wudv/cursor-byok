@@ -30,11 +30,11 @@ type Context struct {
 	Request   *http.Request
 	RouteName string
 	Source    SourceKind
+	Mode      ExecutionMode
 	Protocol  ProtocolClass
 	StartedAt time.Time
 
 	UpstreamURL *url.URL
-	Mode        ExecutionMode
 	LastError   error
 
 	Logger *slog.Logger
@@ -48,7 +48,6 @@ func newContext(writer http.ResponseWriter, request *http.Request, route Route) 
 		Protocol:  route.Protocol,
 		StartedAt: time.Now(),
 		Logger:    slog.Default(),
-		Mode:      ModeLocal,
 	}
 }
 

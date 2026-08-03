@@ -312,6 +312,8 @@ type Service struct {
 	appendSeq          *appendSequenceTracker
 	subagentLaunchMu   sync.Mutex
 	pendingSubagents   []pendingSubagentLaunch
+	checkpointBlobMu   sync.Mutex
+	checkpointBlobs    map[string]*checkpointBlobCacheEntry
 }
 
 type agentModelMemory interface {
@@ -447,6 +449,7 @@ func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Serv
 		execBridge:         execbridge.NewBridge(),
 		interactionBridge:  interactionbridge.NewBridge(),
 		appendSeq:          newAppendSequenceTracker(),
+		checkpointBlobs:    make(map[string]*checkpointBlobCacheEntry),
 	}
 	service.startHistoryMaintenance()
 	return service
@@ -474,6 +477,7 @@ func newServiceWithDependencies(store *ConversationFileStore, projector *History
 		execBridge:         execbridge.NewBridge(),
 		interactionBridge:  interactionbridge.NewBridge(),
 		appendSeq:          newAppendSequenceTracker(),
+		checkpointBlobs:    make(map[string]*checkpointBlobCacheEntry),
 	}
 }
 
@@ -802,6 +806,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		intent.SubagentTypeName = strings.TrimSpace(prewarmRequest.GetSubagentTypeName())
 		intent.ConversationState = prewarmRequest.GetConversationState()
 		populateRunRequestCapabilities(&intent, prewarmRequest, prewarmRequest.GetRequestedModel())
+		intent.PreFetchedBlobs = prewarmRequest.GetPreFetchedBlobs()
 		intent.Mode, intent.ModeSource, intent.HasExplicitMode, err = extractPrewarmMode(prewarmRequest)
 		if err != nil {
 			return InboundIntent{}, err
@@ -1035,6 +1040,11 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	if strings.TrimSpace(intent.ThinkingEffort) == "" && isChildConversationSubagentTypeName(conversation.SubagentTypeName) {
 		intent.ThinkingEffort = service.resolveSubagentDispatchThinkingEffort(conversation)
 	}
+	if intent.RequestContext != nil {
+		if folder := normalizeAgentTranscriptsFolder(intent.RequestContext.GetEnv().GetAgentTranscriptsFolder()); folder != "" {
+			conversation.AgentTranscriptsFolder = folder
+		}
+	}
 	rewindDecision := service.decideRunRewind(intent, conversation)
 	if rewindDecision.Evaluated && !rewindDecision.Apply {
 		service.logRunRewindDecision(intent.RequestID, intent.ConversationID, "rewind_skipped", rewindDecision)
@@ -1107,6 +1117,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	}
 	stream.LatestRequestContext = cloneRequestContext(intent.RequestContext)
 	stream.TransientPromptContexts = nil
+	stream.ManualCompaction = intent.ManualCompaction
 	stream.PendingProviderAction = providerActionNone
 	stream.PendingCompaction = nil
 	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
@@ -1165,6 +1176,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		"execute_plan_hash":             strings.TrimSpace(intent.ExecutePlanHash),
 		"execute_plan_file_uri":         strings.TrimSpace(intent.ExecutePlanFileURI),
 		"execute_plan_file_path":        strings.TrimSpace(intent.ExecutePlanFilePath),
+		"manual_compaction_requested":   intent.ManualCompaction.Requested,
 	})
 	if err := service.publishCheckpoint(intent.RequestID, intent.ConversationID); err != nil {
 		return err
@@ -1241,19 +1253,6 @@ func (service *Service) handleCancelIntent(intent InboundIntent) error {
 		return fmt.Errorf("request is not active: %s", intent.RequestID)
 	}
 	hasCheckpoint := checkpointConversationInitialized(stream)
-	if hasCheckpoint {
-		cancelReason := firstNonEmpty(intent.CancelReason, "user aborted")
-		_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
-			newMetadataEntry(stream.TurnSeq, intent.RequestID, "control", map[string]any{
-				"status":        "canceled",
-				"reason":        cancelReason,
-				"replay_policy": cancelReplayPolicyForReason(cancelReason),
-			}),
-		})
-		if err != nil {
-			return err
-		}
-	}
 	stream.mu.Lock()
 	pendingExecs := make([]runtimecore.PendingExec, 0, len(stream.PendingExecs)+len(stream.SubagentFinalizations))
 	seenExecIDs := make(map[string]struct{}, len(stream.PendingExecs))
@@ -1270,7 +1269,31 @@ func (service *Service) handleCancelIntent(intent InboundIntent) error {
 		}
 		pendingExecs = append(pendingExecs, state.Pending)
 	}
+	if stream.ProviderCancel != nil {
+		stream.ProviderCancel()
+		stream.ProviderCancel = nil
+	}
+	stream.ProviderActive = false
+	stream.CurrentProviderToken++
+	stream.CurrentCompactionToken++
+	stream.PendingProviderAction = providerActionNone
+	stream.PendingCompaction = nil
+	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
+	if hasCheckpoint {
+		cancelReason := firstNonEmpty(intent.CancelReason, "user aborted")
+		cancelEntry := newMetadataEntry(stream.TurnSeq, intent.RequestID, "control", map[string]any{
+			"status":        "canceled",
+			"reason":        cancelReason,
+			"replay_policy": cancelReplayPolicyForReason(cancelReason),
+		})
+		if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{cancelEntry}); err != nil {
+			log.Printf("forwarder cancellation metadata persistence failed request_id=%s conversation_id=%s err=%v", stream.RequestID, stream.ConversationID, err)
+			if memoryErr := service.appendCheckpointEntries(stream, []HistoryEntry{cancelEntry}); memoryErr != nil {
+				return memoryErr
+			}
+		}
+	}
 	for _, pending := range pendingExecs {
 		if strings.TrimSpace(pending.ExecKind) == "subagent" && hasCheckpoint {
 			if err := service.recordSubagentRunState(stream, pending, agentv1.SubagentRunStatus_SUBAGENT_RUN_STATUS_ABORTED, pending.SubagentResumeID, firstNonEmpty(intent.CancelReason, "user aborted")); err != nil {
@@ -1286,18 +1309,25 @@ func (service *Service) handleCancelIntent(intent InboundIntent) error {
 			Message: buildExecAbortMessage(pending),
 		})
 	}
-	if hasCheckpoint {
-		if err := service.publishCheckpoint(stream.RequestID, stream.ConversationID); err != nil {
-			return err
-		}
-	}
 	clearPendingProviderCompletion(stream)
+	terminalMessage := firstNonEmpty(intent.CancelReason, "[canceled] User aborted request")
 	stream.mu.Lock()
-	stream.PendingProviderAction = providerActionNone
+	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
+	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
-	service.setTurnPhase(stream, TurnPhaseCanceled)
-	return service.broker.Cancel(intent.RequestID, firstNonEmpty(intent.CancelReason, "[canceled] User aborted request"))
+	service.discardPendingCheckpoint(stream, fmt.Errorf("checkpoint superseded by cancellation"))
+	if hasCheckpoint {
+		if err := service.publishCheckpointWithTerminalAction(
+			stream.RequestID,
+			stream.ConversationID,
+			checkpointCancellationAction(terminalMessage),
+		); err != nil {
+			return service.failTerminalCheckpointSync(stream, err)
+		}
+		return nil
+	}
+	return service.finishCanceledTurnAfterCheckpoint(stream, terminalMessage)
 }
 
 // handleExecResult 处理客户端返回的执行桥结果，并在终态时把 tool_result 写回 history。
@@ -2598,6 +2628,9 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 			return fmt.Errorf("metadata intent requires active request context: %s", intent.RequestID)
 		}
 		return nil
+	}
+	if intent.KVClientMessage != nil {
+		return service.handleCheckpointBlobResult(stream, intent.KVClientMessage)
 	}
 	backgroundShellToolCallID, backgroundShellActionWasNew := observeBackgroundShellAction(stream, intent.ClientMessage)
 	canceledSubagent, subagentCanceled := observeExplicitSubagentCancellation(stream, intent.ClientMessage)
@@ -4021,8 +4054,34 @@ func (service *Service) rewriteCheckpointTaskModelsForDisplay(state *agentv1.Con
 	}
 }
 
+func (service *Service) finishSuccessfulTurnAfterCheckpoint(stream *ActiveStream, completion pendingTurnCompletion) error {
+	if stream == nil {
+		return nil
+	}
+	requestID := firstNonEmpty(strings.TrimSpace(completion.RequestID), strings.TrimSpace(stream.RequestID))
+	usage := completion.Usage
+	if err := service.broker.Publish(requestID, StreamEvent{
+		Message: buildTurnEndedMessage(usage.InputTokens, usage.OutputTokens, usage.CacheReadTokens, usage.CacheWriteTokens),
+	}); err != nil {
+		return err
+	}
+	if err := service.broker.Complete(requestID, "", ""); err != nil {
+		return err
+	}
+	service.setTurnPhase(stream, TurnPhaseCompleted)
+	return nil
+}
+
 // publishCheckpoint 按当前内存会话镜像投影出 checkpoint，并广播给所有 RunSSE 订阅者。
-func (service *Service) publishCheckpoint(requestID string, _ string) error {
+func (service *Service) publishCheckpoint(requestID string, conversationID string) error {
+	return service.publishCheckpointWithCompletion(requestID, conversationID, nil)
+}
+
+func (service *Service) publishCheckpointWithCompletion(requestID string, conversationID string, completion *pendingTurnCompletion) error {
+	return service.publishCheckpointWithTerminalAction(requestID, conversationID, checkpointCompletionAction(completion))
+}
+
+func (service *Service) publishCheckpointWithTerminalAction(requestID string, conversationID string, terminalAction checkpointTerminalAction) error {
 	stream, ok := service.broker.Get(requestID)
 	if !ok || stream == nil {
 		return fmt.Errorf("request is not active: %s", requestID)
@@ -4031,21 +4090,18 @@ func (service *Service) publishCheckpoint(requestID string, _ string) error {
 	if err != nil {
 		return err
 	}
-	state, err := service.projector.ProjectLegacyCheckpoint(conversation)
+	projection, err := service.projector.ProjectCheckpointProjection(conversation)
 	if err != nil {
 		return err
 	}
-	service.rewriteCheckpointTaskModelsForDisplay(state)
-	rewriteCheckpointSubagentStatusForClient(state)
-	state.PendingToolCalls = buildPendingToolCalls(pendingExecs, pendingInteractions)
-	service.rewriteCheckpointTokenDetailsForClient(stream, conversation, state)
-	message := buildCheckpointMessage(state)
-	service.debug.LogRuntime(context.Background(), requestID, conversation.ConversationID, "checkpoint_payload_size", map[string]any{
-		"proto_bytes": proto.Size(message),
-	})
-	return service.broker.Publish(requestID, StreamEvent{
-		Message: message,
-	})
+	if projection == nil || projection.State == nil {
+		return fmt.Errorf("checkpoint projection is empty")
+	}
+	service.rewriteCheckpointTaskModelsForDisplay(projection.State)
+	rewriteCheckpointSubagentStatusForClient(projection.State)
+	projection.State.PendingToolCalls = buildPendingToolCalls(pendingExecs, pendingInteractions)
+	service.rewriteCheckpointTokenDetailsForClient(stream, conversation, projection.State)
+	return service.queueCheckpointProjection(stream, projection, terminalAction)
 }
 
 func (service *Service) rewriteCheckpointTokenDetailsForClient(stream *ActiveStream, conversation *ConversationFile, state *agentv1.ConversationStateStructure) {
@@ -4263,7 +4319,7 @@ func buildRunRequestMetadata(intent InboundIntent) map[string]any {
 			metadata["max_mode"] = maxMode
 		}
 		if parameters, ok := requestedModel["parameters"]; ok {
-			metadata["requested_model_parameters"] = parameters
+			metadata["requested_model_parameters"] = normalizeAnySlice(parameters)
 		}
 	}
 	if rawSlug := strings.TrimSpace(intent.DevRawModelSlug); rawSlug != "" {
@@ -5714,4 +5770,29 @@ func buildRunSSEStructuredErrorWithDetail(code connect.Code, title string, detai
 		result.AddDetail(detail)
 	}
 	return result
+}
+
+func normalizeAnySlice(value any) []any {
+	switch items := value.(type) {
+	case []any:
+		return items
+	case []map[string]string:
+		out := make([]any, 0, len(items))
+		for _, item := range items {
+			mapped := make(map[string]any, len(item))
+			for key, value := range item {
+				mapped[key] = value
+			}
+			out = append(out, mapped)
+		}
+		return out
+	case []map[string]any:
+		out := make([]any, 0, len(items))
+		for _, item := range items {
+			out = append(out, item)
+		}
+		return out
+	default:
+		return nil
+	}
 }

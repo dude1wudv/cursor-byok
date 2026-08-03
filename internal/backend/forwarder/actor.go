@@ -26,6 +26,7 @@ const (
 	TurnPhaseWaitingExternal TurnPhase = "waiting_external"
 	TurnPhaseAwaitingUser    TurnPhase = "awaiting_user"
 	TurnPhaseCompacting      TurnPhase = "compacting"
+	TurnPhaseCheckpointing   TurnPhase = "checkpointing"
 	TurnPhaseCompleted       TurnPhase = "completed"
 	TurnPhaseFailed          TurnPhase = "failed"
 	TurnPhaseCanceled        TurnPhase = "canceled"
@@ -75,6 +76,7 @@ const (
 	streamTimerSubagentResult    streamTimerKind = "subagent_result"
 	streamTimerExecResult        streamTimerKind = "exec_result"
 	streamTimerInteractionResult streamTimerKind = "interaction_result"
+	streamTimerCheckpointBlobs   streamTimerKind = "checkpoint_blobs"
 	streamTimerOrphanCancel      streamTimerKind = "orphan_cancel"
 )
 
@@ -1075,9 +1077,13 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 		if passMetrics.RequestKnobs != nil {
 			frontier, _ = passMetrics.RequestKnobs["cache_frontier"].(map[string]any)
 		}
+		prefixMatchBytes := readInt64Value(frontier["prefix_match_bytes"])
+		cacheReadDelta, cacheRatio, plateauPasses := updateProviderCachePlateauState(stream, usage, prefixMatchBytes, passMetrics.ExpectedCacheRead)
 		cacheBreakReason := ""
-		if usage.CacheReadTokens > 0 {
-			cacheBreakReason = "cache_hit"
+		if plateauPasses >= 3 {
+			cacheBreakReason = "partial_cache_plateau"
+		} else if usage.CacheReadTokens > 0 {
+			cacheBreakReason = "full_or_advancing_cache_hit"
 		} else if passMetrics.ModeChanged {
 			cacheBreakReason = "mode_changed"
 		} else if passMetrics.ToolCatalogChanged {
@@ -1090,36 +1096,42 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 			cacheBreakReason = firstNonEmpty(strings.TrimSpace(readStringValue(frontier["first_changed_path"])), "no_previous_frontier")
 		}
 		service.debug.LogRuntime(context.Background(), requestID, conversationID, "provider_pass_metrics", map[string]any{
-			"provider_pass":            passMetrics.Pass,
-			"model_call_id":            strings.TrimSpace(modelCallID),
-			"compile_ms":               passMetrics.CompileMillis,
-			"replay_message_count":     passMetrics.ReplayMessageCount,
-			"tool_count":               passMetrics.ToolCount,
-			"estimated_input_tokens":   passMetrics.EstimatedInputTokens,
-			"tool_result_bytes":        passMetrics.ToolResultBytes,
-			"external_wait_ms":         passMetrics.ExternalWaitMillis,
-			"pass_duration_ms":         now.Sub(passMetrics.StartedAt).Milliseconds(),
-			"ttft_ms":                  ttftMillis,
-			"tool_invocations":         toolInvocationCount,
-			"parallel_width":           passMetrics.ParallelWidth(),
-			"finish_reason":            strings.TrimSpace(finishReason),
-			"incomplete":               providerIncomplete,
-			"usage_present":            usage.UsagePresent,
-			"input_tokens":             usage.InputTokens,
-			"output_tokens":            usage.OutputTokens,
-			"cache_read_tokens":        usage.CacheReadTokens,
-			"cache_write_tokens":       usage.CacheWriteTokens,
-			"expected_cache_read":      passMetrics.ExpectedCacheRead,
-			"frontier_hint_present":    passMetrics.FrontierHintPresent,
-			"cache_break_reason":       cacheBreakReason,
-			"prefix_match_bytes":       readInt64Value(frontier["prefix_match_bytes"]),
-			"prefix_match_messages":    readInt64Value(frontier["prefix_match_messages"]),
-			"prefix_match_tools":       readInt64Value(frontier["prefix_match_tools"]),
-			"mode_changed":             passMetrics.ModeChanged,
-			"tool_catalog_changed":     passMetrics.ToolCatalogChanged,
-			"replay_boundary_advanced": passMetrics.ReplayBoundaryAdvanced,
-			"provider_error_present":   payload.Err != nil,
-			"terminal_state":           strings.TrimSpace(terminalState),
+			"provider_pass":                 passMetrics.Pass,
+			"model_call_id":                 strings.TrimSpace(modelCallID),
+			"compile_ms":                    passMetrics.CompileMillis,
+			"replay_message_count":          passMetrics.ReplayMessageCount,
+			"tool_count":                    passMetrics.ToolCount,
+			"estimated_input_tokens":        passMetrics.EstimatedInputTokens,
+			"tool_result_bytes":             passMetrics.ToolResultBytes,
+			"external_wait_ms":              passMetrics.ExternalWaitMillis,
+			"pass_duration_ms":              now.Sub(passMetrics.StartedAt).Milliseconds(),
+			"ttft_ms":                       ttftMillis,
+			"tool_invocations":              toolInvocationCount,
+			"parallel_width":                passMetrics.ParallelWidth(),
+			"finish_reason":                 strings.TrimSpace(finishReason),
+			"incomplete":                    providerIncomplete,
+			"usage_present":                 usage.UsagePresent,
+			"input_tokens":                  usage.InputTokens,
+			"output_tokens":                 usage.OutputTokens,
+			"cache_read_tokens":             usage.CacheReadTokens,
+			"cache_write_tokens":            usage.CacheWriteTokens,
+			"cache_read_delta":              cacheReadDelta,
+			"cache_ratio":                   cacheRatio,
+			"cache_plateau_passes":          plateauPasses,
+			"prompt_cache_mode":             readStringValue(passMetrics.RequestKnobs["prompt_cache_mode"]),
+			"explicit_breakpoint_count":     readInt64Value(passMetrics.RequestKnobs["explicit_breakpoint_count"]),
+			"relay_cache_options_forwarded": readBoolValue(passMetrics.RequestKnobs["cache_options_emitted"]),
+			"expected_cache_read":           passMetrics.ExpectedCacheRead,
+			"frontier_hint_present":         passMetrics.FrontierHintPresent,
+			"cache_break_reason":            cacheBreakReason,
+			"prefix_match_bytes":            prefixMatchBytes,
+			"prefix_match_messages":         readInt64Value(frontier["prefix_match_messages"]),
+			"prefix_match_tools":            readInt64Value(frontier["prefix_match_tools"]),
+			"mode_changed":                  passMetrics.ModeChanged,
+			"tool_catalog_changed":          passMetrics.ToolCatalogChanged,
+			"replay_boundary_advanced":      passMetrics.ReplayBoundaryAdvanced,
+			"provider_error_present":        payload.Err != nil,
+			"terminal_state":                strings.TrimSpace(terminalState),
 		})
 	}
 
@@ -1496,6 +1508,8 @@ func (service *Service) handleTimerEvent(stream *ActiveStream, payload *streamTi
 			return nil
 		}
 		return service.recordSubagentResultUnknown(stream, current, payload.Reason)
+	case streamTimerCheckpointBlobs:
+		return service.handleCheckpointBlobTimeout(stream)
 	case streamTimerOrphanCancel:
 		stream.mu.Lock()
 		subscriberCount := len(stream.Subscribers)
@@ -1644,4 +1658,27 @@ func clearPendingProviderCompletion(stream *ActiveStream) {
 	stream.PendingProviderCompletion = nil
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
+}
+
+func updateProviderCachePlateauState(stream *ActiveStream, usage turnUsageSnapshot, prefixMatchBytes int64, expectedCacheRead bool) (int64, float64, int) {
+	if stream == nil {
+		return 0, 0, 0
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	delta := usage.CacheReadTokens - stream.LastCacheReadTokens
+	ratio := float64(0)
+	if usage.InputTokens > 0 {
+		ratio = float64(usage.CacheReadTokens) / float64(usage.InputTokens)
+	}
+	plateau := expectedCacheRead && usage.CacheReadTokens > 0 && delta == 0 && prefixMatchBytes > stream.LastCachePrefixMatchBytes && usage.InputTokens > stream.LastCacheInputTokens
+	if plateau {
+		stream.CachePlateauPasses++
+	} else {
+		stream.CachePlateauPasses = 0
+	}
+	stream.LastCacheReadTokens = usage.CacheReadTokens
+	stream.LastCacheInputTokens = usage.InputTokens
+	stream.LastCachePrefixMatchBytes = prefixMatchBytes
+	return delta, ratio, stream.CachePlateauPasses
 }

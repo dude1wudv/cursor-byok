@@ -280,6 +280,7 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "anthropic", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 		return err
 	}
+	applyAnthropicThinkingConfig(body, req)
 	stripAnthropicThinkingIncompatibleParams(body)
 	recordLLMRequestArtifact(req, "anthropic", modelID, "POST", requestURL, body)
 
@@ -1536,6 +1537,31 @@ func shouldRetryWithLegacyAnthropicThinking(err error, body map[string]any) bool
 func applyLegacyAnthropicThinkingDowngrade(body map[string]any, req StreamRequest) {
 	body["thinking"] = legacyAnthropicThinkingConfig(req)
 	delete(body, "output_config")
+}
+
+// applyAnthropicThinkingConfig applies the effective thinking mode after request-body
+// overrides and extra parameters have been merged, while preserving the local
+// adaptive-to-legacy compatibility path.
+func applyAnthropicThinkingConfig(body map[string]any, req StreamRequest) {
+	if len(body) == 0 {
+		return
+	}
+	if normalizeRuntimeThinkingEffort(req.ThinkingEffort) == "disabled" {
+		body["thinking"] = map[string]any{"type": "disabled"}
+		delete(body, "output_config")
+		setRequestKnob(req, "thinking_disabled_provider_param", "thinking.type")
+		return
+	}
+	thinkingConfig := buildAnthropicThinkingConfig(req)
+	if thinkingConfig == nil {
+		return
+	}
+	body["thinking"] = thinkingConfig
+	if thinkingType, _ := thinkingConfig["type"].(string); thinkingType == "adaptive" {
+		body["output_config"] = buildAnthropicOutputConfig(req)
+	} else {
+		delete(body, "output_config")
+	}
 }
 
 func buildAnthropicOutputConfig(req StreamRequest) map[string]any {

@@ -27,10 +27,11 @@ const healthPath = "/healthz"
 const tabServerBaseURL = "https://tab.leokun.cn"
 
 type Host struct {
-	store      *serverconfig.Store
-	listenAddr string
-	configs    *serverconfig.Manager
-	healthHTTP *http.Client
+	store            *serverconfig.Store
+	listenAddr       string
+	configs          *serverconfig.Manager
+	healthHTTP       *http.Client
+	controlPlaneAuth upstream.AuthorizationProvider
 
 	runMu      sync.RWMutex
 	httpServer *http.Server
@@ -40,7 +41,7 @@ type Host struct {
 	mux http.Handler
 }
 
-func NewHost(store *serverconfig.Store) (*Host, error) {
+func NewHost(store *serverconfig.Store, auth ...upstream.AuthorizationProvider) (*Host, error) {
 	if store == nil {
 		return nil, fmt.Errorf("backend config store is required")
 	}
@@ -49,11 +50,16 @@ func NewHost(store *serverconfig.Store) (*Host, error) {
 		return nil, err
 	}
 	cfg := configs.Current()
+	var controlPlaneAuth upstream.AuthorizationProvider
+	if len(auth) > 0 {
+		controlPlaneAuth = auth[0]
+	}
 	host := &Host{
-		store:      store,
-		listenAddr: cfg.BackendListenAddr,
-		configs:    configs,
-		healthHTTP: newLoopbackHTTPClient(),
+		controlPlaneAuth: controlPlaneAuth,
+		store:            store,
+		listenAddr:       cfg.BackendListenAddr,
+		configs:          configs,
+		healthHTTP:       newLoopbackHTTPClient(),
 	}
 	if err := host.rebuild(cfg); err != nil {
 		return nil, err
@@ -611,18 +617,24 @@ func (host *Host) rebuildLocked(cfg serverconfig.Config) error {
 				Name: "dashboard_is_on_new_pricing",
 			})),
 		),
-		server.POST("/aiserver.v1.DashboardService/GetEffectiveUserPlugins",
-			server.Name("dashboard_get_effective_user_plugins"),
-			server.ConnectUnary(),
-			server.Local(upstream.MockProtoAction(routeDeps, upstream.CompatRouteConfig{
-				Name:          "dashboard_get_effective_user_plugins",
-				StatusCode:    http.StatusOK,
-				MockProtoType: "aiserver.v1.GetEffectiveUserPluginsResponse",
-			})),
-			server.Upstream(upstream.DirectAction(routeDeps, upstream.CompatRouteConfig{
-				Name: "dashboard_get_effective_user_plugins",
-			})),
-		),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/AddMarketplace", "dashboard_add_marketplace", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/AddMcpServersFromPlugin", "dashboard_add_mcp_servers_from_plugin", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/BatchGetPluginMcpConfig", "dashboard_batch_get_plugin_mcp_config", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/GetAvailableMcpServers", "dashboard_get_available_mcp_servers", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/GetEffectiveUserPlugins", "dashboard_get_effective_user_plugins", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/GetPlugin", "dashboard_get_plugin", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/GetPluginMcpConfig", "dashboard_get_plugin_mcp_config", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/InstallUserPlugin", "dashboard_install_user_plugin", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/ListMarketplacePlugins", "dashboard_list_marketplace_plugins", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/ListMarketplaces", "dashboard_list_marketplaces", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/ListUserPluginInstalls", "dashboard_list_user_plugin_installs", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/RefreshMarketplace", "dashboard_refresh_marketplace", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/RegisterMarketplaceAndPlugins", "dashboard_register_marketplace_and_plugins", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/RemoveMarketplace", "dashboard_remove_marketplace", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/ResolvePluginsByRef", "dashboard_resolve_plugins_by_ref", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/UninstallUserPlugin", "dashboard_uninstall_user_plugin", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.DashboardService/UpdateUserPluginInstall", "dashboard_update_user_plugin_install", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
+		cursorControlPlaneProcedure("/aiserver.v1.MCPRegistryService/GetKnownServers", "mcp_registry_get_known_servers", server.ConnectUnary(), host.controlPlaneAuth, routeDeps),
 		server.Any("/aiserver.v1.DashboardService/*",
 			server.Name("dashboard"),
 			server.HTTP(),
@@ -804,4 +816,44 @@ func (settings *serverSystemSettings) ResolveModelAdapters(ctx context.Context) 
 		return nil, err
 	}
 	return snapshot.ModelAdapters, nil
+}
+
+func cursorControlPlaneProcedure(
+	pattern string,
+	name string,
+	protocol server.RouteOption,
+	authorizationProvider upstream.AuthorizationProvider,
+	deps upstream.Dependencies,
+) server.Option {
+	notFound := func(ctx *server.Context) error {
+		http.NotFound(ctx.Writer, ctx.Request)
+		return nil
+	}
+	return server.POST(pattern,
+		server.Name(name),
+		protocol,
+		server.Local(cursorControlPlaneAction(authorizationProvider, deps, name, notFound)),
+	)
+}
+
+func cursorControlPlaneAction(
+	authorizationProvider upstream.AuthorizationProvider,
+	deps upstream.Dependencies,
+	name string,
+	fallback server.HandlerFunc,
+) server.HandlerFunc {
+	forward := upstream.AuthenticatedForwardAction(deps, upstream.CompatRouteConfig{Name: name}, authorizationProvider)
+	return func(ctx *server.Context) error {
+		if authorizationProvider == nil || !authorizationProvider.SignedIn() {
+			return fallback(ctx)
+		}
+		if ctx == nil || ctx.Request == nil || ctx.Request.URL == nil {
+			return fmt.Errorf("Cursor 控制面请求上下文无效")
+		}
+		targetURL := *ctx.Request.URL
+		targetURL.Scheme = "https"
+		targetURL.Host = "api2.cursor.sh:443"
+		ctx.UpstreamURL = &targetURL
+		return forward(ctx)
+	}
 }
