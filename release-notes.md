@@ -174,7 +174,7 @@
 
 ## 发布资产
 
-- `cursor-byok-0.0.78-windows-amd64.zip`
-- `cursor-byok-0.0.78-macos-arm64.tar.gz`
-- `cursor-byok-0.0.78-macos-amd64.tar.gz`
+- `cursor-byok-0.0.79-windows-amd64.zip`
+- `cursor-byok-0.0.79-macos-arm64.tar.gz`
+- `cursor-byok-0.0.79-macos-amd64.tar.gz`
 - `update.json`
