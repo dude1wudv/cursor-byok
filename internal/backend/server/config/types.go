@@ -87,6 +87,7 @@ type HomeMetricsConfig struct {
 
 type Config struct {
 	Log                       bool                 `json:"log" yaml:"log"`
+	DisableCursorAutoUpdate   bool                 `json:"disableCursorAutoUpdate" yaml:"disableCursorAutoUpdate"`
 	ProviderStreamIdleTimeout int                  `json:"providerStreamIdleTimeout" yaml:"providerStreamIdleTimeout"`
 	ShellMaxConcurrentPerRun  int                  `json:"shellMaxConcurrentPerRun" yaml:"shellMaxConcurrentPerRun"`
 	BackendListenAddr         string               `json:"backendListenAddr" yaml:"backendListenAddr"`
@@ -115,6 +116,7 @@ func DefaultConfig() Config {
 func NormalizeConfig(input Config) (Config, error) {
 	output := DefaultConfig()
 	output.Log = input.Log
+	output.DisableCursorAutoUpdate = input.DisableCursorAutoUpdate
 	output.ProviderStreamIdleTimeout = normalizeProviderStreamIdleTimeout(input.ProviderStreamIdleTimeout)
 	if input.ShellMaxConcurrentPerRun != 0 {
 		if input.ShellMaxConcurrentPerRun < MinShellMaxConcurrentPerRun || input.ShellMaxConcurrentPerRun > MaxShellMaxConcurrentPerRun {

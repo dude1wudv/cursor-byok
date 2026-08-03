@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -114,5 +115,41 @@ func TestOpenAIResponsesOmitsUnsupportedGPTMaxOutputTokens(t *testing.T) {
 	body := <-requestBody
 	if _, ok := body["max_output_tokens"]; ok {
 		t.Fatalf("request contains unsupported max_output_tokens: %#v", body["max_output_tokens"])
+	}
+}
+
+func TestOpenAIResponsesCacheFrontierTracksStablePrefix(t *testing.T) {
+	body1 := map[string]any{"model": "gpt-5.6-sol", "prompt_cache_key": "cursor:root", "instructions": "stable", "input": []any{map[string]any{"role": "user", "content": "hello"}}, "tools": []any{map[string]any{"type": "function", "name": "Read"}}, "reasoning": map[string]any{"effort": "medium"}}
+	knobs1 := annotateOpenAIResponsesCacheFrontier(map[string]any{}, body1, "/v1/responses")
+	frontier1 := knobs1["cache_frontier"].(map[string]any)
+	body2 := map[string]any{"model": "gpt-5.6-sol", "prompt_cache_key": "cursor:root", "instructions": "stable", "input": []any{map[string]any{"role": "user", "content": "hello"}, map[string]any{"type": "function_call_output", "call_id": "c1", "output": "ok"}}, "tools": []any{map[string]any{"type": "function", "name": "Read"}}, "reasoning": map[string]any{"effort": "medium"}}
+	knobs2 := annotateOpenAIResponsesCacheFrontier(map[string]any{"previous_cache_frontier": map[string]any{"segment_hashes": frontier1["segment_hashes"]}}, body2, "/v1/responses")
+	frontier2 := knobs2["cache_frontier"].(map[string]any)
+	if frontier2["first_changed_path"] != "input[1]" {
+		t.Fatalf("first_changed_path=%v", frontier2["first_changed_path"])
+	}
+	if frontier2["expected_cache_read"] != true {
+		t.Fatalf("expected_cache_read=%v", frontier2["expected_cache_read"])
+	}
+	if frontier2["prefix_match_bytes"].(int) <= 0 {
+		t.Fatalf("prefix bytes=%v", frontier2["prefix_match_bytes"])
+	}
+}
+
+func TestOpenAIResponsesCanonicalToolOrder(t *testing.T) {
+	tools := []map[string]any{{"type": "function", "name": "Write"}, {"type": "function", "name": "Read"}}
+	sort.SliceStable(tools, func(i, j int) bool {
+		return openAIResponsesCanonicalToolName(tools[i]) < openAIResponsesCanonicalToolName(tools[j])
+	})
+	if got := openAIResponsesCanonicalToolName(tools[0]); got != "Read" {
+		t.Fatalf("first tool=%q", got)
+	}
+}
+
+func TestOpenAIPromptCacheKeyExplicitOverrideWins(t *testing.T) {
+	body := map[string]any{"prompt_cache_key": "custom:key"}
+	applyOpenAIPromptCacheKeyOverride(body, StreamRequest{ConversationID: "conversation"}, "gpt-5.6-sol")
+	if body["prompt_cache_key"] != "custom:key" {
+		t.Fatalf("override lost: %#v", body)
 	}
 }

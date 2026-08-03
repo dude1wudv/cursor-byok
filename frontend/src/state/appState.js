@@ -553,6 +553,7 @@ function normalizeConfig(source) {
   const homeMetrics = raw.homeMetrics && typeof raw.homeMetrics === "object" ? raw.homeMetrics : {};
   return {
     log: asBoolean(raw.log),
+    disableCursorAutoUpdate: asBoolean(raw.disableCursorAutoUpdate),
     providerStreamIdleTimeout: asPositiveInteger(raw.providerStreamIdleTimeout),
     backendListenAddr: asString(raw.configBackendListenAddr) || asString(raw.backendListenAddr),
     proxyListenAddr: asString(raw.configProxyListenAddr) || asString(raw.proxyListenAddr),
@@ -599,6 +600,7 @@ function buildConfigPayload(source = appState) {
   const normalized = normalizeConfig(source);
   return {
     log: normalized.log,
+    disableCursorAutoUpdate: normalized.disableCursorAutoUpdate,
     providerStreamIdleTimeout: normalized.providerStreamIdleTimeout,
     backendListenAddr: normalized.backendListenAddr,
     proxyListenAddr: normalized.proxyListenAddr,
@@ -621,6 +623,7 @@ function applyConfigToState(config, { modelAdaptersOnly = false } = {}) {
   appState.longContextReadChannelID = normalized.longContextReadChannelID;
   appState.configBackendListenAddr = normalized.backendListenAddr;
   appState.configProxyListenAddr = normalized.proxyListenAddr;
+  appState.disableCursorAutoUpdate = normalized.disableCursorAutoUpdate;
   appState.routingMode = normalized.routing.mode;
   appState.includeCacheWriteInHitRate = normalized.homeMetrics.includeCacheWriteInHitRate;
   return normalized;
@@ -854,6 +857,7 @@ export const appState = reactive({
   configBackendListenAddr: cachedConfig.backendListenAddr,
   configProxyListenAddr: cachedConfig.proxyListenAddr,
   routingMode: cachedConfig.routing.mode,
+  disableCursorAutoUpdate: cachedConfig.disableCursorAutoUpdate,
   includeCacheWriteInHitRate: cachedConfig.homeMetrics.includeCacheWriteInHitRate,
 
   serviceRunning: asBoolean(cachedState.serviceRunning),

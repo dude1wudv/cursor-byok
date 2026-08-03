@@ -2642,10 +2642,27 @@ func validateSafeInspectShellCommandTokens(tokens []string) bool {
 		rest := tokens[subcommandIndex+1:]
 		switch subcommand {
 		case "status", "diff", "log", "show", "blame", "rev-parse", "merge-base", "ls-tree", "ls-files",
-			"grep", "describe", "shortlog", "cherry", "count-objects":
+			"grep", "describe", "shortlog", "cherry", "count-objects", "show-ref", "for-each-ref", "rev-list", "name-rev":
 		case "tag", "branch", "remote":
 			for _, token := range rest {
 				if !strings.HasPrefix(token, "-") || !isSafeInspectGitListFlag(token) {
+					return false
+				}
+			}
+		case "symbolic-ref":
+			positional := 0
+			for _, token := range rest {
+				if !strings.HasPrefix(token, "-") {
+					positional++
+				}
+			}
+			if positional > 1 {
+				return false
+			}
+		case "cat-file":
+			for _, token := range rest {
+				lower := strings.ToLower(token)
+				if lower == "--filters" || strings.HasPrefix(lower, "--filters=") || lower == "--textconv" {
 					return false
 				}
 			}
@@ -2662,7 +2679,7 @@ func validateSafeInspectShellCommandTokens(tokens []string) bool {
 		}
 		for _, token := range rest {
 			lower := strings.ToLower(token)
-			if lower == "--output" || strings.HasPrefix(lower, "--output=") || lower == "--ext-diff" {
+			if lower == "--output" || strings.HasPrefix(lower, "--output=") || lower == "--ext-diff" || lower == "--no-index" || lower == "--textconv" || lower == "-c" || strings.HasPrefix(lower, "-c=") || lower == "--config-env" || strings.HasPrefix(lower, "--config-env=") {
 				return false
 			}
 			if subcommand == "grep" && (token == "-O" || strings.HasPrefix(token, "-O") || strings.HasPrefix(lower, "--open-files-in-pager")) {
@@ -2752,15 +2769,7 @@ func buildShellPermissionDeniedToolCall(toolCallID string, argsJSON []byte, deni
 // ParseSimpleShellCommand 把不含 shell 元字符的单条命令拆成词元；复杂语法返回 false。
 // 该判定是 Cursor 兼容解析与 inspect 白名单策略的共同真相。
 func ParseSimpleShellCommand(command string) ([]string, bool) {
-	trimmed := strings.TrimSpace(command)
-	if trimmed == "" || strings.ContainsAny(trimmed, "$;|&'\"`<>(){}[]^\r\n") {
-		return nil, false
-	}
-	parts := strings.Fields(trimmed)
-	if len(parts) == 0 || strings.Contains(parts[0], "=") {
-		return nil, false
-	}
-	return parts, true
+	return parseSafeInspectShellCommand(command)
 }
 
 // buildShellParsingMetadata keeps Cursor's required parsing_result present

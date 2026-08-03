@@ -1,5 +1,33 @@
 <!-- 发布约定：每次 Release 都保留“最近 5 个版本更新梗概”，覆盖当前版本和前 4 个版本。 -->
 
+# Cursor助手 v0.0.79
+
+本版本修复新版 Cursor 子代理派发与并发收口兼容，增强 GPT Responses 缓存连续性诊断，并新增安全、可恢复的 Cursor 自动更新控制。
+
+## 子代理派发与并发隔离
+
+- Task 派发记录显式区分 requested/effective thinking effort 及来源；子会话启动时以父 Task 的有效值覆盖 Cursor 模型默认值，覆盖 disabled/low/medium/high/xhigh/max、角色默认和父级继承。
+- 父会话屏障由“最新 batch”提升为同一父请求全部 live child：跨 provider pass 的兄弟子代理全部 terminal 或明确 background-detach 后才允许父代理恢复。
+- 子代理 finalization key 加入 provider generation；取消记录 user_cancel/new_message_supersede/explicit_cancel_subagent/orphan_disconnect 等来源，迟到或错代结果只幂等收口对应成员。
+
+## 只读 Git 与 Skipped 恢复
+
+- policy 与 Cursor exec bridge 统一使用引号感知的单命令解析，带空格 Windows 路径和 `--` pathspec 不再被桥接层误标为 `ParsingFailed`。
+- 新增严格只读的 `show-ref`、`for-each-ref`、`rev-list`、`name-rev`、`symbolic-ref`、`cat-file`；继续拒绝网络/写操作、`-c`/`--config-env`、external diff/textconv、`diff --no-index`、管道和重定向。
+- 安全命令的有限 Skip recovery 与 bridge 分类保持一致，真实失败和未知执行状态仍保持可见。
+
+## GPT Responses 缓存连续性
+
+- OpenAI Responses 请求新增低敏 cache frontier：按 instructions 段、input、tools、reasoning/include 和额外参数记录哈希、字节数、最长稳定前缀及首个变化路径，不记录正文、密钥或图片内容。
+- `prompt_cache_key` 继续稳定为 root/child conversation 各自的 `cursor:<conversation_id>`，显式 override 优先；工具定义按名称确定性排序。
+- Plan 与 Agent 使用相同的 provider 工具 superset，真实权限仍由 pre-dispatch gate 强制，Plan 中 Write/Patch/Delete 继续被拒绝。`provider_pass_metrics` 新增 cache break、mode/tools/replay boundary 和 prefix match 诊断。
+
+## Cursor 自动更新开关
+
+- 新增 `disableCursorAutoUpdate` 配置和设置页开关；启用后写入 `update.mode=manual`，Windows 同时写入 `update.enableWindowsBackgroundUpdates=false`，保留手动更新入口。
+- Cursor `settings.json` 改为串行原子补丁：无效 JSONC 直接报错并保留原文件；关闭开关或停止代理时只恢复仍等于本程序最后写入值的键，不覆盖用户后续修改。
+- 代理设置与更新策略分组保存、独立恢复；停止本地代理不会改变自动更新策略。
+
 # Cursor助手 v0.0.78
 
 本版本抑制新版 Cursor 对只读 inspect Shell 的 UI 刷屏：`git status` / `tasklist` 等安全命令被客户端 `Skipped by Cursor` 时，不再以 Rejected 错误态反复显示 “Skipped git/tasklist”。

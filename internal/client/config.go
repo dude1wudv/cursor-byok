@@ -5,6 +5,7 @@ import (
 
 	"cursor/internal/appdata"
 	serverconfig "cursor/internal/backend/server/config"
+	"cursor/internal/cursor"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
@@ -22,13 +23,22 @@ func (s *ProxyService) LoadUserConfig() (UserConfig, error) {
 	if app != nil {
 		ctx = app.Context()
 	}
+	var cfg UserConfig
+	var err error
 	if s.backendHost != nil {
-		return s.backendHost.LoadConfig(ctx)
+		cfg, err = s.backendHost.LoadConfig(ctx)
+	} else if s.store == nil {
+		cfg = serverconfig.DefaultConfig()
+	} else {
+		cfg, err = s.store.Load(ctx)
 	}
-	if s.store == nil {
-		return serverconfig.DefaultConfig(), nil
+	if err != nil {
+		return cfg, err
 	}
-	return s.store.Load(ctx)
+	if err := cursor.ApplyCursorAutoUpdatePolicy(cfg.DisableCursorAutoUpdate); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
 
 // SaveUserConfig 用于处理与 SaveUserConfig 相关的逻辑。
@@ -53,6 +63,9 @@ func (s *ProxyService) SaveUserConfig(cfg UserConfig) error {
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err := cursor.ApplyCursorAutoUpdatePolicy(normalized.DisableCursorAutoUpdate); err != nil {
 		return err
 	}
 	s.emitUserConfigChanged(normalized)

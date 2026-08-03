@@ -824,6 +824,7 @@ func cloneConversationRequestPrefix(prefix *ConversationRequestPrefix) *Conversa
 		return nil
 	}
 	cloned := *prefix
+	cloned.SegmentHashes = append([]string(nil), prefix.SegmentHashes...)
 	return &cloned
 }
 

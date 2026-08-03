@@ -4,6 +4,7 @@ package forwarder
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"cursor/gen/agentv1"
@@ -62,7 +63,7 @@ func (compiler *DefaultPromptCompiler) CompileWithOptions(conversation *Conversa
 	if err != nil {
 		return CompiledConversation{}, err
 	}
-	tools, _, err := loadToolCatalogForConversation(compiler.catalog, normalizedMode, conversation)
+	tools, _, err := loadStableProviderToolCatalogForConversation(compiler.catalog, normalizedMode, conversation)
 	if err != nil {
 		return CompiledConversation{}, err
 	}
@@ -138,6 +139,40 @@ func (compiler *DefaultPromptCompiler) CompileWithOptions(conversation *Conversa
 		Tools:              tools,
 		CompileSummary:     fmt.Sprintf("mode=%s asset_mode=%s child=%t messages=%d tools=%d shared_rules_total=%d shared_rules_deduped=%d exclude_workspace_context=%t inline_images=%t suppress_subagent_progress_update_tool=%t", normalizedMode.String(), string(assetMode), isChildConversationSubagentTypeName(subagentTypeName), len(messages), len(tools), sharedRuleTotal, sharedRuleCount, options.ExcludeWorkspaceContext, options.ClientSupportsInlineImages, options.SuppressSubagentProgressUpdateTool),
 	}, nil
+}
+
+func loadStableProviderToolCatalogForConversation(catalog ToolCatalog, mode agentv1.AgentMode, conversation *ConversationFile) ([]json.RawMessage, []string, error) {
+	if catalog == nil || conversation != nil && isChildConversationSubagentTypeName(conversation.SubagentTypeName) {
+		return loadToolCatalogForConversation(catalog, mode, conversation)
+	}
+	normalized := normalizeMode(mode)
+	if normalized != agentv1.AgentMode_AGENT_MODE_PLAN && normalized != agentv1.AgentMode_AGENT_MODE_AGENT {
+		return loadToolCatalogForConversation(catalog, mode, conversation)
+	}
+	byName := make(map[string]json.RawMessage)
+	for _, candidateMode := range []agentv1.AgentMode{agentv1.AgentMode_AGENT_MODE_AGENT, agentv1.AgentMode_AGENT_MODE_PLAN} {
+		items, names, err := catalog.Load(candidateMode, "")
+		if err != nil {
+			return nil, nil, err
+		}
+		for index, name := range names {
+			if index < len(items) {
+				if _, exists := byName[name]; !exists {
+					byName[name] = items[index]
+				}
+			}
+		}
+	}
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	items := make([]json.RawMessage, 0, len(names))
+	for _, name := range names {
+		items = append(items, byName[name])
+	}
+	return items, names, nil
 }
 
 func (compiler *DefaultPromptCompiler) DerivePromptContexts(conversation *ConversationFile, mode agentv1.AgentMode, latestUserText string) ([]PromptContextMessage, error) {

@@ -82,6 +82,22 @@ onMounted(async () => {
       </div>
     </Card>
 
+
+    <Card>
+      <div class="flex items-center justify-between gap-4">
+        <div>
+          <h2 class="text-base font-medium text-white">禁用 Cursor 自动更新</h2>
+          <div class="text-sm text-[#a3a3a3]">
+            启用后将 Cursor 更新模式设为手动；Windows 同时关闭后台更新。仍可从 Cursor 菜单手动检查更新。
+          </div>
+        </div>
+        <label class="relative inline-flex cursor-pointer items-center">
+          <input v-model="appState.disableCursorAutoUpdate" type="checkbox" class="peer sr-only" />
+          <span class="h-6 w-11 rounded-full bg-[#404040] transition peer-checked:bg-[#2563eb] after:absolute after:left-1 after:top-1 after:h-4 after:w-4 after:rounded-full after:bg-white after:transition peer-checked:after:translate-x-5"></span>
+        </label>
+      </div>
+    </Card>
+
     <Card>
       <div class="flex items-center justify-between gap-4">
         <div>

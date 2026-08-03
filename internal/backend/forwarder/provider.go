@@ -25,9 +25,9 @@ func (gateway *DefaultProviderGateway) StartStream(ctx context.Context, req Prov
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	requestKnobs := make(map[string]any, len(req.RequestKnobs)+2)
-	for key, value := range req.RequestKnobs {
-		requestKnobs[key] = value
+	requestKnobs := req.RequestKnobs
+	if requestKnobs == nil {
+		requestKnobs = make(map[string]any, 2)
 	}
 	requestKnobs["stream"] = true
 	if req.MaxTokens > 0 {

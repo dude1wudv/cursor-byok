@@ -11,20 +11,36 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 
 	"cursor/internal/appdata"
 	"cursor/internal/logger"
 )
 
-// injectedCursorSettingsKeys 表示当前模块中的 injectedCursorSettingsKeys 状态值。
-var injectedCursorSettingsKeys = []string{
-	"http.proxy",
-	"http.proxyKerberosServicePrincipal",
-	"http.proxySupport",
-	"cursor.general.disableHttp2",
-	"http.experimental.systemCertificatesV2",
+const (
+	cursorSettingsPatchGroupProxy  = "proxy"
+	cursorSettingsPatchGroupUpdate = "update"
+)
+
+var cursorSettingsPatchMu sync.Mutex
+
+var injectedCursorProxySettings = map[string]any{
+	"http.proxySupport":                      "on",
+	"cursor.general.disableHttp2":            true,
+	"http.experimental.systemCertificatesV2": true,
+}
+
+type cursorSettingBackup struct {
+	Present     bool `json:"present"`
+	Original    any  `json:"original,omitempty"`
+	LastWritten any  `json:"lastWritten,omitempty"`
+}
+
+type cursorSettingsPatchState struct {
+	Groups map[string]map[string]cursorSettingBackup `json:"groups"`
 }
 
 // EnsureCACertFile 用于处理与 EnsureCACertFile 相关的逻辑。
@@ -117,125 +133,223 @@ func ClearSystemNodeExtraCACerts() error {
 	return nil
 }
 
-// WriteUserProxySettings 用于处理与 WriteUserProxySettings 相关的逻辑。
+// WriteUserProxySettings 通过统一补丁层写入代理设置，并保留用户原值以便精确恢复。
 func WriteUserProxySettings(proxyURL string) error {
 	proxyURL = strings.TrimSpace(proxyURL)
 	if proxyURL == "" {
 		return errors.New("代理地址为空")
 	}
+	updates := make(map[string]any, len(injectedCursorProxySettings)+2)
+	for key, value := range injectedCursorProxySettings {
+		updates[key] = value
+	}
+	updates["http.proxy"] = proxyURL
+	updates["http.proxyKerberosServicePrincipal"] = proxyURL
+	return applyCursorSettingsPatch(cursorSettingsPatchGroupProxy, updates)
+}
 
+// ClearUserProxySettings 仅恢复仍等于本程序最后写入值的代理键，避免覆盖用户随后修改。
+func ClearUserProxySettings() error { return restoreCursorSettingsPatch(cursorSettingsPatchGroupProxy) }
+
+// ApplyCursorAutoUpdatePolicy 应用或恢复 Cursor 自动更新策略。关闭策略不会影响代理设置。
+func ApplyCursorAutoUpdatePolicy(disable bool) error {
+	if !disable {
+		return restoreCursorSettingsPatch(cursorSettingsPatchGroupUpdate)
+	}
+	updates := map[string]any{"update.mode": "manual"}
+	if runtime.GOOS == "windows" {
+		updates["update.enableWindowsBackgroundUpdates"] = false
+	}
+	return applyCursorSettingsPatch(cursorSettingsPatchGroupUpdate, updates)
+}
+
+func applyCursorSettingsPatch(group string, updates map[string]any) error {
+	cursorSettingsPatchMu.Lock()
+	defer cursorSettingsPatchMu.Unlock()
 	settingsPath, err := resolveCursorSettingsPath()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
-		return fmt.Errorf("创建 Cursor 配置目录失败: %w", err)
+	settings, originalData, err := readCursorSettings(settingsPath)
+	if err != nil {
+		return err
 	}
+	statePath := cursorSettingsPatchStatePath(settingsPath)
+	state, err := readCursorSettingsPatchState(statePath)
+	if err != nil {
+		return err
+	}
+	if state.Groups == nil {
+		state.Groups = make(map[string]map[string]cursorSettingBackup)
+	}
+	backups := state.Groups[group]
+	if backups == nil {
+		backups = make(map[string]cursorSettingBackup)
+		state.Groups[group] = backups
+	}
+	for key, desired := range updates {
+		backup, tracked := backups[key]
+		if !tracked {
+			original, present := settings[key]
+			backup = cursorSettingBackup{Present: present, Original: original}
+		}
+		backup.LastWritten = desired
+		backups[key] = backup
+		settings[key] = desired
+	}
+	if err := writeCursorSettingsIfChanged(settingsPath, settings, originalData); err != nil {
+		return err
+	}
+	return writeCursorSettingsPatchState(statePath, state)
+}
 
-	settings := make(map[string]any)
+func restoreCursorSettingsPatch(group string) error {
+	cursorSettingsPatchMu.Lock()
+	defer cursorSettingsPatchMu.Unlock()
+	settingsPath, err := resolveCursorSettingsPath()
+	if err != nil {
+		return err
+	}
+	statePath := cursorSettingsPatchStatePath(settingsPath)
+	state, err := readCursorSettingsPatchState(statePath)
+	if err != nil {
+		return err
+	}
+	backups := state.Groups[group]
+	if len(backups) == 0 {
+		return nil
+	}
+	settings, originalData, err := readCursorSettings(settingsPath)
+	if err != nil {
+		return err
+	}
+	for key, backup := range backups {
+		current, present := settings[key]
+		if !present || !reflect.DeepEqual(current, backup.LastWritten) {
+			continue
+		}
+		if backup.Present {
+			settings[key] = backup.Original
+		} else {
+			delete(settings, key)
+		}
+	}
+	delete(state.Groups, group)
+	if err := writeCursorSettingsIfChanged(settingsPath, settings, originalData); err != nil {
+		return err
+	}
+	return writeCursorSettingsPatchState(statePath, state)
+}
+
+func readCursorSettings(settingsPath string) (map[string]any, []byte, error) {
 	data, err := os.ReadFile(settingsPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("读取 Cursor 配置失败: %w", err)
+			return nil, nil, fmt.Errorf("读取 Cursor 配置失败: %w", err)
 		}
-	} else if len(bytes.TrimSpace(data)) > 0 {
-		parsed, err := decodeCursorSettingsJSONC(data)
-		if err != nil {
-			if removeErr := os.Remove(settingsPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-				return fmt.Errorf("解析 Cursor 配置失败，且删除损坏配置失败: %w", removeErr)
-			}
-			logger.Infof("writeCursorUserProxySettings: removed invalid settings path=%s err=%v", settingsPath, err)
-			data = nil
-		} else {
-			settings = parsed
-		}
+		return make(map[string]any), nil, nil
 	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return make(map[string]any), data, nil
+	}
+	settings, err := decodeCursorSettingsJSONC(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("解析 Cursor 配置失败，已保留原文件: %w", err)
+	}
+	return settings, data, nil
+}
 
-	settings["http.proxy"] = proxyURL
-	settings["http.proxyKerberosServicePrincipal"] = proxyURL
-	settings["http.proxySupport"] = "on"
-	settings["cursor.general.disableHttp2"] = true
-	settings["http.experimental.systemCertificatesV2"] = true
-
+func writeCursorSettingsIfChanged(settingsPath string, settings map[string]any, originalData []byte) error {
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		return fmt.Errorf("创建 Cursor 配置目录失败: %w", err)
+	}
 	encoded, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return fmt.Errorf("序列化 Cursor 配置失败: %w", err)
 	}
 	encoded = append(encoded, '\n')
-
-	if len(bytes.TrimSpace(data)) > 0 && bytes.Equal(data, encoded) {
-		logger.Infof("writeCursorUserProxySettings: unchanged path=%s proxy=%s", settingsPath, proxyURL)
+	if len(originalData) > 0 && bytes.Equal(originalData, encoded) {
 		return nil
 	}
-
-	tempPath := settingsPath + ".tmp"
-	if err := os.WriteFile(tempPath, encoded, 0o644); err != nil {
-		return fmt.Errorf("写入 Cursor 配置临时文件失败: %w", err)
-	}
-	if err := os.Rename(tempPath, settingsPath); err != nil {
-		return fmt.Errorf("保存 Cursor 配置失败: %w", err)
-	}
-
-	logger.Infof("writeCursorUserProxySettings: path=%s proxy=%s", settingsPath, proxyURL)
-	return nil
+	return atomicWriteCursorFile(settingsPath, encoded, 0o644)
 }
 
-// ClearUserProxySettings 用于处理与 ClearUserProxySettings 相关的逻辑。
-func ClearUserProxySettings() error {
-	settingsPath, err := resolveCursorSettingsPath()
+func cursorSettingsPatchStatePath(settingsPath string) string {
+	return settingsPath + ".cursor-byok-state.json"
+}
+
+func readCursorSettingsPatchState(path string) (cursorSettingsPatchState, error) {
+	state := cursorSettingsPatchState{Groups: make(map[string]map[string]cursorSettingBackup)}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return state, nil
+		}
+		return state, fmt.Errorf("读取 Cursor 设置补丁状态失败: %w", err)
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return state, nil
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return state, fmt.Errorf("解析 Cursor 设置补丁状态失败: %w", err)
+	}
+	if state.Groups == nil {
+		state.Groups = make(map[string]map[string]cursorSettingBackup)
+	}
+	return state, nil
+}
+
+func writeCursorSettingsPatchState(path string, state cursorSettingsPatchState) error {
+	if len(state.Groups) == 0 {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("清理 Cursor 设置补丁状态失败: %w", err)
+		}
+		return nil
+	}
+	encoded, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化 Cursor 设置补丁状态失败: %w", err)
+	}
+	encoded = append(encoded, '\n')
+	return atomicWriteCursorFile(path, encoded, 0o600)
+}
+
+func atomicWriteCursorFile(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("读取 Cursor 配置失败: %w", err)
+	tempPath := temp.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if err := temp.Chmod(mode); err != nil {
+		_ = temp.Close()
+		return err
 	}
-	if len(bytes.TrimSpace(data)) == 0 {
-		return nil
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return err
 	}
-
-	settings := make(map[string]any)
-	parsed, err := decodeCursorSettingsJSONC(data)
-	if err != nil {
-		return fmt.Errorf("解析 Cursor 配置失败: %w", err)
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
 	}
-	settings = parsed
-
-	changed := false
-	for _, key := range injectedCursorSettingsKeys {
-		if _, exists := settings[key]; exists {
-			delete(settings, key)
-			changed = true
-		}
+	if err := temp.Close(); err != nil {
+		return err
 	}
-	if !changed {
-		return nil
-	}
-
-	encoded, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return fmt.Errorf("序列化 Cursor 配置失败: %w", err)
-	}
-	encoded = append(encoded, '\n')
-
-	tempPath := settingsPath + ".tmp"
-	if err := os.WriteFile(tempPath, encoded, 0o644); err != nil {
-		return fmt.Errorf("写入 Cursor 配置临时文件失败: %w", err)
-	}
-	if err := os.Rename(tempPath, settingsPath); err != nil {
+	if err := replaceCursorSettingsFile(tempPath, path); err != nil {
 		return fmt.Errorf("保存 Cursor 配置失败: %w", err)
 	}
-
-	logger.Infof("clearCursorUserProxySettings: path=%s", settingsPath)
 	return nil
 }
 
 // resolveCursorSettingsPath 用于处理与 resolveCursorSettingsPath 相关的逻辑。
 func resolveCursorSettingsPath() (string, error) {
+	if override := strings.TrimSpace(os.Getenv("CURSOR_SETTINGS_PATH")); override != "" {
+		return filepath.Clean(override), nil
+	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("获取用户目录失败: %w", err)

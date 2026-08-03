@@ -41,9 +41,10 @@ func TestOpenShellBuildsCursorCompatibleParsingMetadata(t *testing.T) {
 			wantParsingFailed: true,
 		},
 		{
-			name:              "quoted gofmt command",
-			command:           `gofmt -w "internal/backend/agent/bridge/exec/bridge.go"`,
-			wantParsingFailed: true,
+			name:               "quoted gofmt command",
+			command:            `gofmt -w "internal/backend/agent/bridge/exec/bridge.go"`,
+			wantSimpleCommands: []string{"gofmt"},
+			wantExecutable:     "gofmt",
 		},
 	}
 
@@ -314,6 +315,14 @@ func TestIsSafeInspectShellCommand(t *testing.T) {
 		{command: "tasklist", want: true},
 		{command: "TASKLIST.EXE", want: true},
 		{command: "git log --oneline -5", want: true},
+		{command: "git show-ref --heads", want: true},
+		{command: `git for-each-ref --format="%(refname)" refs/heads`, want: true},
+		{command: "git rev-list --max-count=3 HEAD -- path/file.go", want: true},
+		{command: "git symbolic-ref HEAD", want: true},
+		{command: "git symbolic-ref HEAD refs/heads/main", want: false},
+		{command: "git cat-file -p HEAD", want: true},
+		{command: "git cat-file --textconv HEAD:file", want: false},
+		{command: "git diff --no-index a b", want: false},
 		{command: "git status | echo bad", want: false},
 		{command: "git status; git commit -m bad", want: false},
 		{command: "git status > output.txt", want: false},

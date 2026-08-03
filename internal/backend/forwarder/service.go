@@ -1003,9 +1003,10 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 			intent.ModelID,
 			userMessageText(intent.UserMessage),
 		)
-		if hasMatchedLaunch && strings.TrimSpace(intent.ThinkingEffort) == "" {
-			intent.ThinkingEffort = matchedLaunch.ThinkingEffort
-		}
+		// The dispatch reservation is authoritative. Newer Cursor builds may send the
+		// model default (for example max) on the child RunRequest; do not let that
+		// overwrite the explicit/role/parent effort selected by the parent Task.
+		intent.ThinkingEffort = applyMatchedSubagentThinkingEffort(intent.ThinkingEffort, matchedLaunch, hasMatchedLaunch)
 	}
 	conversation, effectiveMode, turnSeq, initialEntries, err := service.bootstrapRuntimeConversation(intent)
 	if err != nil {
@@ -1219,6 +1220,20 @@ func (service *Service) snapshotVisibleTurns(conversation *ConversationFile) ([]
 	return cloneByteSlices(state.GetTurns()), nil
 }
 
+func subagentCancelOrigin(reason string) string {
+	normalized := strings.ToLower(strings.TrimSpace(reason))
+	switch {
+	case strings.Contains(normalized, "superseded") || strings.Contains(normalized, "newer request"):
+		return "new_message_supersede"
+	case strings.Contains(normalized, "disconnect") || strings.Contains(normalized, "orphan"):
+		return "orphan_disconnect"
+	case strings.Contains(normalized, "parent") && strings.Contains(normalized, "cleanup"):
+		return "parent_end_cleanup"
+	default:
+		return "user_cancel"
+	}
+}
+
 // handleCancelIntent 处理取消请求，并向客户端发送执行桥 abort。
 func (service *Service) handleCancelIntent(intent InboundIntent) error {
 	stream, ok := service.broker.Get(intent.RequestID)
@@ -1263,6 +1278,7 @@ func (service *Service) handleCancelIntent(intent InboundIntent) error {
 			}
 			updateSubagentFinalization(stream, pending, func(item *SubagentFinalizationState) {
 				item.ExplicitlyCanceled = true
+				item.CancelOrigin = subagentCancelOrigin(intent.CancelReason)
 				item.ReconcileRequested = true
 			})
 		}
@@ -2112,7 +2128,7 @@ func shellTerminalResultSource(message *agentv1.ExecClientMessage) string {
 }
 
 func subagentFinalizationKey(pending runtimecore.PendingExec) string {
-	return fmt.Sprintf("%s|%s|%d", strings.TrimSpace(pending.ToolCallID), strings.TrimSpace(pending.ExecID), pending.MessageID)
+	return fmt.Sprintf("%s|%s|%d|%d", strings.TrimSpace(pending.ToolCallID), strings.TrimSpace(pending.ExecID), pending.MessageID, pending.ProviderPass)
 }
 
 func subagentFinalizationSnapshot(stream *ActiveStream, pending runtimecore.PendingExec) SubagentFinalizationState {
@@ -2675,6 +2691,7 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 		}
 		updateSubagentFinalization(stream, canceledSubagent, func(item *SubagentFinalizationState) {
 			item.ExplicitlyCanceled = true
+			item.CancelOrigin = "explicit_cancel_subagent"
 			item.ResultReceived = true
 			item.ToolResultPersisted = true
 			item.TaskBatchTerminal = true
@@ -2862,6 +2879,9 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 	stream.mu.Unlock()
 	service.setTurnPhase(stream, TurnPhaseProviderRunning)
 
+	requestKnobs["conversation_mode"] = compiled.Mode.String()
+	requestKnobs["tool_count"] = len(compiled.Tools)
+	requestKnobs["replay_boundary_seq"] = latestReplayBudgetBoundarySeq(conversation)
 	providerRequest := ProviderRequest{
 		RequestID:          requestID,
 		ConversationID:     conversationID,
@@ -2896,10 +2916,14 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		ToolCount:            len(compiled.Tools),
 		EstimatedInputTokens: estimateCompiledPromptTokens(compiled),
 		ToolResultBytes:      toolResultBytes,
+		RequestKnobs:         requestKnobs,
 	}
 	if conversation != nil && conversation.LatestRequestPrefix != nil {
 		passMetrics.FrontierHintPresent = strings.TrimSpace(conversation.LatestRequestPrefix.FrontierHash) != ""
 		passMetrics.ExpectedCacheRead = conversation.LatestRequestPrefix.ExpectedCacheRead
+		passMetrics.ModeChanged = strings.TrimSpace(conversation.LatestRequestPrefix.Mode) != "" && strings.TrimSpace(conversation.LatestRequestPrefix.Mode) != compiled.Mode.String()
+		passMetrics.ToolCatalogChanged = conversation.LatestRequestPrefix.ToolCount > 0 && conversation.LatestRequestPrefix.ToolCount != len(compiled.Tools)
+		passMetrics.ReplayBoundaryAdvanced = latestReplayBudgetBoundarySeq(conversation) > conversation.LatestRequestPrefix.ReplayBoundarySeq
 	}
 	stream.mu.Lock()
 	if !stream.LastProviderDoneAt.IsZero() {
@@ -2981,8 +3005,32 @@ func withPreviousCacheFrontierHint(requestKnobs map[string]any, conversation *Co
 		"breakpoint_count":    prefix.BreakpointCount,
 		"request_id":          strings.TrimSpace(prefix.RequestID),
 		"model_call_id":       strings.TrimSpace(prefix.ModelCallID),
+		"segment_hashes":      append([]string(nil), prefix.SegmentHashes...),
+		"mode":                strings.TrimSpace(prefix.Mode),
+		"tool_count":          prefix.ToolCount,
+		"replay_boundary_seq": prefix.ReplayBoundarySeq,
 	}
 	return requestKnobs
+}
+
+func latestReplayBudgetBoundarySeq(conversation *ConversationFile) int64 {
+	if conversation == nil {
+		return 0
+	}
+	var latest int64
+	for _, entry := range conversation.Entries {
+		if strings.TrimSpace(entry.Kind) != "metadata" {
+			continue
+		}
+		var payload metadataPayload
+		if json.Unmarshal(entry.Payload, &payload) != nil || strings.TrimSpace(payload.Type) != "replay_budget_boundary" {
+			continue
+		}
+		if seq := readInt64Value(payload.Value["boundary_seq"]); seq > latest {
+			latest = seq
+		}
+	}
+	return latest
 }
 
 func (service *Service) resolveConfiguredProviderMaxOutputTokens(modelID string) int {

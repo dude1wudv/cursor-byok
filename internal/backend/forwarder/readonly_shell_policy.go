@@ -21,6 +21,7 @@ var gitReadonlySubcommands = map[string]struct{}{
 	"status": {}, "diff": {}, "log": {}, "show": {}, "blame": {}, "rev-parse": {},
 	"merge-base": {}, "tag": {}, "branch": {}, "remote": {}, "ls-tree": {}, "ls-files": {},
 	"grep": {}, "describe": {}, "shortlog": {}, "cherry": {}, "count-objects": {},
+	"show-ref": {}, "for-each-ref": {}, "rev-list": {}, "name-rev": {}, "symbolic-ref": {}, "cat-file": {},
 	"stash": {}, "reflog": {},
 }
 
@@ -97,56 +98,7 @@ func applyReadonlyShellPolicy(argsJSON []byte, workspacePaths []string) ([]byte,
 // 路径加引号，因此 "..." 与 '...' 必须被接受；引号外仍拒绝管道、重定向、变量与命令替换。
 // 不改动 execbridge.ParseSimpleShellCommand——那是发给 Cursor 客户端 parsing_result 的通用视图。
 func parseReadonlyShellCommand(command string) ([]string, bool) {
-	trimmed := strings.TrimSpace(command)
-	if trimmed == "" {
-		return nil, false
-	}
-	var tokens []string
-	var current strings.Builder
-	inToken := false
-	for i := 0; i < len(trimmed); i++ {
-		ch := trimmed[i]
-		switch {
-		case ch == '"' || ch == '\'':
-			quote := ch
-			inToken = true
-			closed := false
-			for i++; i < len(trimmed); i++ {
-				c := trimmed[i]
-				if quote == '"' && c == '\\' && i+1 < len(trimmed) && trimmed[i+1] == '"' {
-					current.WriteByte('"')
-					i++
-					continue
-				}
-				if c == quote {
-					closed = true
-					break
-				}
-				current.WriteByte(c)
-			}
-			if !closed {
-				return nil, false
-			}
-		case ch == ' ' || ch == '\t':
-			if inToken {
-				tokens = append(tokens, current.String())
-				current.Reset()
-				inToken = false
-			}
-		case strings.ContainsRune("$;|&`<>(){}[]^\r\n", rune(ch)):
-			return nil, false
-		default:
-			current.WriteByte(ch)
-			inToken = true
-		}
-	}
-	if inToken {
-		tokens = append(tokens, current.String())
-	}
-	if len(tokens) == 0 || strings.Contains(tokens[0], "=") {
-		return nil, false
-	}
-	return tokens, true
+	return execbridge.ParseSimpleShellCommand(command)
 }
 
 // joinReadonlyShellTokens 重组改写后的命令行，并为含空白的词元恢复双引号，
@@ -210,6 +162,12 @@ func validateReadonlyGitCommand(tokens []string) ([]string, error) {
 	if len(tokens) < 2 {
 		return nil, fmt.Errorf("inspect Shell git requires a read-only subcommand")
 	}
+	for _, token := range tokens[1:] {
+		lower := strings.ToLower(token)
+		if lower == "-c" || strings.HasPrefix(lower, "-c=") || lower == "--config-env" || strings.HasPrefix(lower, "--config-env=") {
+			return nil, fmt.Errorf("inspect Shell git configuration overrides are not allowed")
+		}
+	}
 	subcommandIndex := 1
 	for subcommandIndex < len(tokens) {
 		switch strings.ToLower(tokens[subcommandIndex]) {
@@ -244,6 +202,23 @@ subcommandFound:
 			if len(rest) == 0 || !strings.EqualFold(rest[0], "list") {
 				return nil, fmt.Errorf(`inspect Shell git stash only allows "git stash list"`)
 			}
+		case "symbolic-ref":
+			positional := 0
+			for _, token := range rest {
+				if !strings.HasPrefix(token, "-") {
+					positional++
+				}
+			}
+			if positional > 1 {
+				return nil, fmt.Errorf("inspect Shell git symbolic-ref only allows reading one ref")
+			}
+		case "cat-file":
+			for _, token := range rest {
+				lower := strings.ToLower(token)
+				if lower == "--filters" || strings.HasPrefix(lower, "--filters=") || lower == "--textconv" {
+					return nil, fmt.Errorf("inspect Shell git cat-file flag %q is not allowed", token)
+				}
+			}
 		case "reflog":
 			// 裸 reflog 等价于 show；expire/delete 会修改引用日志。
 			if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") && !strings.EqualFold(rest[0], "show") {
@@ -252,7 +227,7 @@ subcommandFound:
 		}
 		for _, token := range rest {
 			lower := strings.ToLower(token)
-			if lower == "--output" || strings.HasPrefix(lower, "--output=") || lower == "--ext-diff" {
+			if lower == "--output" || strings.HasPrefix(lower, "--output=") || lower == "--ext-diff" || lower == "--no-index" || lower == "--textconv" {
 				return nil, fmt.Errorf("inspect Shell git flag %q is not allowed", token)
 			}
 			// git grep -O / --open-files-in-pager 会启动任意 pager 进程，等价命令执行。

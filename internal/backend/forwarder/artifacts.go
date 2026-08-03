@@ -41,6 +41,10 @@ type requestArtifactPrefix struct {
 	BreakpointCount         int
 	ExpectedCacheRead       bool
 	PreviousFrontierMatched bool
+	SegmentHashes           []string
+	Mode                    string
+	ToolCount               int
+	ReplayBoundarySeq       int64
 }
 
 func newArtifactRecorder(store *ConversationFileStore, broker *StreamBroker, debug *debugRecorder) *artifactRecorder {
@@ -122,6 +126,10 @@ func (recorder *artifactRecorder) persistLatestRequestPrefix(conversationID stri
 			BreakpointCount:         prefix.BreakpointCount,
 			ExpectedCacheRead:       prefix.ExpectedCacheRead,
 			PreviousFrontierMatched: prefix.PreviousFrontierMatched,
+			SegmentHashes:           append([]string(nil), prefix.SegmentHashes...),
+			Mode:                    strings.TrimSpace(prefix.Mode),
+			ToolCount:               prefix.ToolCount,
+			ReplayBoundarySeq:       prefix.ReplayBoundarySeq,
 			UpdatedAt:               time.Now().UTC(),
 		}
 		return nil
@@ -196,6 +204,10 @@ func decodeRequestPrefixPayload(payload map[string]any) (*requestArtifactPrefix,
 		BreakpointCount:         frontier.BreakpointCount,
 		ExpectedCacheRead:       frontier.ExpectedCacheRead,
 		PreviousFrontierMatched: frontier.PreviousFrontierMatched,
+		SegmentHashes:           append([]string(nil), frontier.SegmentHashes...),
+		Mode:                    strings.TrimSpace(readStringValue(requestKnobValue(payload, "conversation_mode"))),
+		ToolCount:               int(readInt64Value(requestKnobValue(payload, "tool_count"))),
+		ReplayBoundarySeq:       readInt64Value(requestKnobValue(payload, "replay_boundary_seq")),
 	}, true, nil
 }
 
@@ -206,6 +218,7 @@ type requestCacheFrontierPayload struct {
 	BreakpointCount         int
 	ExpectedCacheRead       bool
 	PreviousFrontierMatched bool
+	SegmentHashes           []string
 }
 
 func cacheFrontierFromRequestPayload(payload map[string]any) requestCacheFrontierPayload {
@@ -224,7 +237,32 @@ func cacheFrontierFromRequestPayload(payload map[string]any) requestCacheFrontie
 	frontier.BreakpointCount = int(readInt64Value(rawFrontier["breakpoint_count"]))
 	frontier.ExpectedCacheRead = readBoolValue(rawFrontier["expected_cache_read"])
 	frontier.PreviousFrontierMatched = readBoolValue(rawFrontier["previous_frontier_matched"])
+	frontier.SegmentHashes = readStringSliceValue(rawFrontier["segment_hashes"])
 	return frontier
+}
+
+func requestKnobValue(payload map[string]any, key string) any {
+	if knobs, ok := payload["request_knobs"].(map[string]any); ok {
+		return knobs[key]
+	}
+	return nil
+}
+
+func readStringSliceValue(value any) []string {
+	switch items := value.(type) {
+	case []string:
+		return append([]string(nil), items...)
+	case []any:
+		result := make([]string, 0, len(items))
+		for _, item := range items {
+			if text := strings.TrimSpace(readStringValue(item)); text != "" {
+				result = append(result, text)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
 }
 
 func replayMessageCountFromRequestPayload(payload map[string]any) int {

@@ -36,6 +36,7 @@ type pendingSubagentLaunch struct {
 	ModelID              string
 	PromptHash           string
 	ThinkingEffort       string
+	ThinkingEffortSource string
 	PlanText             string
 	Plans                map[string]*agentv1.PlanRegistryEntry
 	Todos                []*agentv1.TodoItem
@@ -59,6 +60,7 @@ type subagentDispatchDecision struct {
 	SubagentType            string
 	SubagentRole            string
 	EffectiveThinkingEffort string
+	ThinkingEffortSource    string
 	EffectiveModelID        string
 	Resume                  bool
 	Duplicate               bool
@@ -314,14 +316,9 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		}
 		return decision, fmt.Errorf("Task limit reached: %d direct subagents per subagent conversation", decision.Limit)
 	}
-	effectiveThinkingEffort := requestedThinkingEffort
-	if effectiveThinkingEffort == "" {
-		effectiveThinkingEffort = defaultTaskThinkingEffort(decision.SubagentRole)
-		if effectiveThinkingEffort == "" {
-			effectiveThinkingEffort = parentThinkingEffort
-		}
-	}
+	effectiveThinkingEffort, effortSource := resolveTaskThinkingEffort(requestedThinkingEffort, decision.SubagentRole, parentThinkingEffort)
 	decision.EffectiveThinkingEffort = effectiveThinkingEffort
+	decision.ThinkingEffortSource = effortSource
 	planHash := subagentParentPlanHash(conversation)
 	parentTodoID := matchSubagentParentTodo(conversation.CurrentTodos, args)
 	planVersion := conversation.ContextVersion
@@ -357,6 +354,7 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 			"requested_model_id":        readStringMapValue(args, "model", "model_id", "modelId"),
 			"requested_thinking_effort": requestedThinkingEffort,
 			"effective_thinking_effort": effectiveThinkingEffort,
+			"thinking_effort_source":    effortSource,
 			"quota_scope":               decision.QuotaScope,
 		}),
 	}); err != nil {
@@ -371,6 +369,7 @@ func (service *Service) validateAndReserveSubagentDispatch(stream *ActiveStream,
 		ModelID:              firstNonEmpty(decision.EffectiveModelID, readStringMapValue(args, "model", "model_id", "modelId")),
 		PromptHash:           planContentHash(readStringMapValue(args, "prompt")),
 		ThinkingEffort:       effectiveThinkingEffort,
+		ThinkingEffortSource: effortSource,
 		PlanText:             strings.TrimSpace(conversation.CurrentPlanText),
 		Plans:                clonePlanRegistryEntries(conversation.CurrentPlans),
 		Todos:                cloneTodoItems(conversation.CurrentTodos),
@@ -695,6 +694,28 @@ func containsTaskIdentifier(text string, id string) bool {
 
 func isTaskIdentifierRune(value rune) bool {
 	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9' || value == '_' || value == '-'
+}
+
+func resolveTaskThinkingEffort(requested string, role string, parent string) (string, string) {
+	if effort := normalizeTaskThinkingEffort(requested); effort != "" {
+		return effort, "explicit"
+	}
+	if effort := defaultTaskThinkingEffort(role); effort != "" {
+		return effort, "role_default"
+	}
+	if effort := normalizeTaskThinkingEffort(parent); effort != "" {
+		return effort, "parent_inherited"
+	}
+	return "", "unset"
+}
+
+func applyMatchedSubagentThinkingEffort(current string, matched pendingSubagentLaunch, ok bool) string {
+	if ok {
+		if effort := normalizeTaskThinkingEffort(matched.ThinkingEffort); effort != "" {
+			return effort
+		}
+	}
+	return normalizeTaskThinkingEffort(current)
 }
 
 func normalizeTaskThinkingEffort(raw string) string {
@@ -1591,25 +1612,26 @@ func taskBatchAllowsParentNotification(stream *ActiveStream) (int, bool) {
 	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	var selected *TaskBatch
+	maxGeneration := 0
+	ready := make([]*TaskBatch, 0, len(stream.TaskBatches))
 	for _, batch := range stream.TaskBatches {
 		if batch == nil || len(batch.Members) == 0 || batch.ParentNotified {
 			continue
 		}
-		if selected == nil || batch.Generation > selected.Generation {
-			selected = batch
+		if batch.Generation > maxGeneration {
+			maxGeneration = batch.Generation
 		}
-	}
-	if selected == nil {
-		return 0, true
-	}
-	for _, member := range selected.Members {
-		if member == nil || (!member.Terminal && !member.ParentReleased) {
-			return selected.Generation, false
+		for _, member := range batch.Members {
+			if member == nil || (!member.Terminal && !member.ParentReleased) {
+				return maxGeneration, false
+			}
 		}
+		ready = append(ready, batch)
 	}
-	selected.ParentNotified = true
-	return selected.Generation, true
+	for _, batch := range ready {
+		batch.ParentNotified = true
+	}
+	return maxGeneration, true
 }
 
 func singleMultitaskWorkerCompletedSuccessfully(stream *ActiveStream) bool {

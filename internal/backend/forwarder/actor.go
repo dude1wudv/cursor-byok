@@ -1071,30 +1071,55 @@ func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *s
 		if !passMetrics.FirstOutputAt.IsZero() {
 			ttftMillis = passMetrics.FirstOutputAt.Sub(passMetrics.StartedAt).Milliseconds()
 		}
+		frontier := map[string]any{}
+		if passMetrics.RequestKnobs != nil {
+			frontier, _ = passMetrics.RequestKnobs["cache_frontier"].(map[string]any)
+		}
+		cacheBreakReason := ""
+		if usage.CacheReadTokens > 0 {
+			cacheBreakReason = "cache_hit"
+		} else if passMetrics.ModeChanged {
+			cacheBreakReason = "mode_changed"
+		} else if passMetrics.ToolCatalogChanged {
+			cacheBreakReason = "tool_catalog_changed"
+		} else if passMetrics.ReplayBoundaryAdvanced {
+			cacheBreakReason = "replay_boundary_advanced"
+		} else if readBoolValue(frontier["previous_frontier_matched"]) {
+			cacheBreakReason = "upstream_cache_miss"
+		} else {
+			cacheBreakReason = firstNonEmpty(strings.TrimSpace(readStringValue(frontier["first_changed_path"])), "no_previous_frontier")
+		}
 		service.debug.LogRuntime(context.Background(), requestID, conversationID, "provider_pass_metrics", map[string]any{
-			"provider_pass":          passMetrics.Pass,
-			"model_call_id":          strings.TrimSpace(modelCallID),
-			"compile_ms":             passMetrics.CompileMillis,
-			"replay_message_count":   passMetrics.ReplayMessageCount,
-			"tool_count":             passMetrics.ToolCount,
-			"estimated_input_tokens": passMetrics.EstimatedInputTokens,
-			"tool_result_bytes":      passMetrics.ToolResultBytes,
-			"external_wait_ms":       passMetrics.ExternalWaitMillis,
-			"pass_duration_ms":       now.Sub(passMetrics.StartedAt).Milliseconds(),
-			"ttft_ms":                ttftMillis,
-			"tool_invocations":       toolInvocationCount,
-			"parallel_width":         passMetrics.ParallelWidth(),
-			"finish_reason":          strings.TrimSpace(finishReason),
-			"incomplete":             providerIncomplete,
-			"usage_present":          usage.UsagePresent,
-			"input_tokens":           usage.InputTokens,
-			"output_tokens":          usage.OutputTokens,
-			"cache_read_tokens":      usage.CacheReadTokens,
-			"cache_write_tokens":     usage.CacheWriteTokens,
-			"expected_cache_read":    passMetrics.ExpectedCacheRead,
-			"frontier_hint_present":  passMetrics.FrontierHintPresent,
-			"provider_error_present": payload.Err != nil,
-			"terminal_state":         strings.TrimSpace(terminalState),
+			"provider_pass":            passMetrics.Pass,
+			"model_call_id":            strings.TrimSpace(modelCallID),
+			"compile_ms":               passMetrics.CompileMillis,
+			"replay_message_count":     passMetrics.ReplayMessageCount,
+			"tool_count":               passMetrics.ToolCount,
+			"estimated_input_tokens":   passMetrics.EstimatedInputTokens,
+			"tool_result_bytes":        passMetrics.ToolResultBytes,
+			"external_wait_ms":         passMetrics.ExternalWaitMillis,
+			"pass_duration_ms":         now.Sub(passMetrics.StartedAt).Milliseconds(),
+			"ttft_ms":                  ttftMillis,
+			"tool_invocations":         toolInvocationCount,
+			"parallel_width":           passMetrics.ParallelWidth(),
+			"finish_reason":            strings.TrimSpace(finishReason),
+			"incomplete":               providerIncomplete,
+			"usage_present":            usage.UsagePresent,
+			"input_tokens":             usage.InputTokens,
+			"output_tokens":            usage.OutputTokens,
+			"cache_read_tokens":        usage.CacheReadTokens,
+			"cache_write_tokens":       usage.CacheWriteTokens,
+			"expected_cache_read":      passMetrics.ExpectedCacheRead,
+			"frontier_hint_present":    passMetrics.FrontierHintPresent,
+			"cache_break_reason":       cacheBreakReason,
+			"prefix_match_bytes":       readInt64Value(frontier["prefix_match_bytes"]),
+			"prefix_match_messages":    readInt64Value(frontier["prefix_match_messages"]),
+			"prefix_match_tools":       readInt64Value(frontier["prefix_match_tools"]),
+			"mode_changed":             passMetrics.ModeChanged,
+			"tool_catalog_changed":     passMetrics.ToolCatalogChanged,
+			"replay_boundary_advanced": passMetrics.ReplayBoundaryAdvanced,
+			"provider_error_present":   payload.Err != nil,
+			"terminal_state":           strings.TrimSpace(terminalState),
 		})
 	}
 

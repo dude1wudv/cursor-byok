@@ -5,9 +5,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1042,6 +1045,168 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 	return nil
 }
 
+type openAICacheSegment struct {
+	Path  string
+	Hash  string
+	Bytes int
+}
+
+func openAIResponsesCanonicalToolName(tool map[string]any) string {
+	if name := strings.TrimSpace(fmt.Sprint(tool["name"])); name != "" {
+		return name
+	}
+	if function, ok := tool["function"].(map[string]any); ok {
+		return strings.TrimSpace(fmt.Sprint(function["name"]))
+	}
+	return strings.TrimSpace(fmt.Sprint(tool["type"]))
+}
+
+func openAICanonicalHash(value any) (string, int) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return "", 0
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:]), len(payload)
+}
+
+func appendOpenAICacheSegment(segments []openAICacheSegment, path string, value any) []openAICacheSegment {
+	hash, size := openAICanonicalHash(value)
+	return append(segments, openAICacheSegment{Path: path, Hash: hash, Bytes: size})
+}
+
+func openAIResponsesCacheSegments(body map[string]any, endpoint string) []openAICacheSegment {
+	segments := make([]openAICacheSegment, 0, 16)
+	segments = appendOpenAICacheSegment(segments, "request.identity", map[string]any{
+		"endpoint": endpoint, "model": body["model"], "prompt_cache_key": body["prompt_cache_key"],
+	})
+	instructions := strings.TrimSpace(fmt.Sprint(body["instructions"]))
+	if instructions == "" {
+		segments = appendOpenAICacheSegment(segments, "instructions", "")
+	} else {
+		for index, part := range strings.Split(instructions, "\n\n") {
+			segments = appendOpenAICacheSegment(segments, fmt.Sprintf("instructions[%d]", index), part)
+		}
+	}
+	if input, ok := body["input"].([]any); ok {
+		for i, item := range input {
+			segments = appendOpenAICacheSegment(segments, fmt.Sprintf("input[%d]", i), item)
+		}
+	} else if input, ok := body["input"].([]map[string]any); ok {
+		for i, item := range input {
+			segments = appendOpenAICacheSegment(segments, fmt.Sprintf("input[%d]", i), item)
+		}
+	}
+	if tools, ok := body["tools"].([]any); ok {
+		for i, item := range tools {
+			segments = appendOpenAICacheSegment(segments, fmt.Sprintf("tools[%d]", i), item)
+		}
+	} else if tools, ok := body["tools"].([]map[string]any); ok {
+		for i, item := range tools {
+			segments = appendOpenAICacheSegment(segments, fmt.Sprintf("tools[%d]", i), item)
+		}
+	}
+	segments = appendOpenAICacheSegment(segments, "reasoning", body["reasoning"])
+	segments = appendOpenAICacheSegment(segments, "include", body["include"])
+	keys := make([]string, 0, len(body))
+	for key := range body {
+		switch key {
+		case "model", "prompt_cache_key", "instructions", "input", "tools", "reasoning", "include", "stream", "store", "max_output_tokens":
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		segments = appendOpenAICacheSegment(segments, "extra."+key, body[key])
+	}
+	return segments
+}
+
+func readOpenAIStringSlice(value any) []string {
+	switch items := value.(type) {
+	case []string:
+		return append([]string(nil), items...)
+	case []any:
+		result := make([]string, 0, len(items))
+		for _, item := range items {
+			result = append(result, strings.TrimSpace(fmt.Sprint(item)))
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func annotateOpenAIResponsesCacheFrontier(requestKnobs map[string]any, body map[string]any, endpoint string) map[string]any {
+	if requestKnobs == nil {
+		requestKnobs = map[string]any{}
+	}
+	segments := openAIResponsesCacheSegments(body, endpoint)
+	previous := []string(nil)
+	if raw, ok := requestKnobs["previous_cache_frontier"].(map[string]any); ok {
+		previous = readOpenAIStringSlice(raw["segment_hashes"])
+	}
+	matched := 0
+	for matched < len(segments) && matched < len(previous) && segments[matched].Hash == previous[matched] {
+		matched++
+	}
+	firstChanged := ""
+	if matched < len(segments) {
+		firstChanged = segments[matched].Path
+	} else if matched < len(previous) {
+		firstChanged = "request.truncated"
+	}
+	hashes := make([]string, len(segments))
+	totalBytes := 0
+	for i, segment := range segments {
+		hashes[i] = segment.Hash
+		totalBytes += segment.Bytes
+	}
+	canonicalHash, _ := openAICanonicalHash(hashes)
+	frontierHash := ""
+	frontierPath := ""
+	if len(segments) > 0 {
+		frontierHash = canonicalHash
+		frontierPath = segments[len(segments)-1].Path
+	}
+	requestKnobs["cache_frontier"] = map[string]any{
+		"canonical_body_hash": canonicalHash, "frontier_hash": frontierHash, "frontier_path": frontierPath,
+		"breakpoint_count": len(segments), "segment_hashes": hashes, "segment_count": len(segments), "canonical_bytes": totalBytes,
+		"prefix_match_segments": matched, "prefix_match_bytes": func() int {
+			n := 0
+			for i := 0; i < matched; i++ {
+				n += segments[i].Bytes
+			}
+			return n
+		}(),
+		"prefix_match_messages": min(matched, 1+openAIInputItemCount(body)), "prefix_match_tools": openAIMatchedToolCount(segments, matched),
+		"first_changed_path": firstChanged, "previous_frontier_matched": len(previous) > 0 && matched == len(previous),
+		"expected_cache_read": len(previous) > 0 && matched > 0,
+	}
+	return requestKnobs
+}
+
+func openAIInputItemCount(body map[string]any) int {
+	switch v := body["input"].(type) {
+	case []any:
+		return len(v)
+	case []map[string]any:
+		return len(v)
+	default:
+		return 0
+	}
+}
+func openAIMatchedToolCount(segments []openAICacheSegment, matched int) int {
+	n := 0
+	for i := 0; i < matched && i < len(segments); i++ {
+		if strings.HasPrefix(segments[i].Path, "tools[") {
+			n++
+		}
+	}
+	return n
+}
+
 func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamRequest, baseURL string, apiKey string, modelID string, sink func(ModelEvent) error) error {
 	startedAt := time.Now().UTC()
 	finishedAt := time.Time{}
@@ -1071,6 +1236,9 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 				recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "openai", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
 				return err
 			}
+			sort.SliceStable(tools, func(i, j int) bool {
+				return openAIResponsesCanonicalToolName(tools[i]) < openAIResponsesCanonicalToolName(tools[j])
+			})
 			if shouldExposeOpenAIResponsesImageGeneration(req, tools) {
 				tools = ensureOpenAIResponsesImageGenerationTool(tools)
 				if req.RequestKnobs != nil {
@@ -1106,6 +1274,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 		bodyMap["max_output_tokens"] = req.MaxTokens
 	}
 	body = bodyMap
+	req.RequestKnobs = annotateOpenAIResponsesCacheFrontier(req.RequestKnobs, bodyMap, req.OpenAIEndpoint)
 
 	requestURL := OpenAIEndpointURL(baseURL, req.OpenAIEndpoint)
 	recordLLMRequestArtifact(req, "openai", modelID, "POST", requestURL, body)

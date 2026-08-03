@@ -65,6 +65,10 @@ type ConversationRequestPrefix struct {
 	BreakpointCount         int       `json:"breakpoint_count,omitempty"`
 	ExpectedCacheRead       bool      `json:"expected_cache_read,omitempty"`
 	PreviousFrontierMatched bool      `json:"previous_frontier_matched,omitempty"`
+	SegmentHashes           []string  `json:"segment_hashes,omitempty"`
+	Mode                    string    `json:"mode,omitempty"`
+	ToolCount               int       `json:"tool_count,omitempty"`
+	ReplayBoundarySeq       int64     `json:"replay_boundary_seq,omitempty"`
 	UpdatedAt               time.Time `json:"updated_at,omitempty"`
 }
 
@@ -140,6 +144,7 @@ type SubagentFinalizationState struct {
 	Pending                  runtimecore.PendingExec
 	BackgroundAcknowledged   bool
 	ExplicitlyCanceled       bool
+	CancelOrigin             string
 	ResultReceived           bool
 	ResultOutcome            string
 	ToolResultPersisted      bool
@@ -178,17 +183,21 @@ type shellDispatchObservation struct {
 // providerPassMetrics 收集单个 provider pass 的低敏结构化性能指标；
 // 只含计数、字节数、耗时与哈希级诊断，不含提示词、工具正文或密钥。
 type providerPassMetrics struct {
-	Pass                 int
-	StartedAt            time.Time
-	FirstOutputAt        time.Time
-	CompileMillis        int64
-	ReplayMessageCount   int
-	ToolCount            int
-	EstimatedInputTokens int64
-	ToolResultBytes      int64
-	ExternalWaitMillis   int64
-	ExpectedCacheRead    bool
-	FrontierHintPresent  bool
+	Pass                   int
+	StartedAt              time.Time
+	FirstOutputAt          time.Time
+	CompileMillis          int64
+	ReplayMessageCount     int
+	ToolCount              int
+	EstimatedInputTokens   int64
+	ToolResultBytes        int64
+	ExternalWaitMillis     int64
+	ExpectedCacheRead      bool
+	FrontierHintPresent    bool
+	RequestKnobs           map[string]any
+	ModeChanged            bool
+	ToolCatalogChanged     bool
+	ReplayBoundaryAdvanced bool
 	// DispatchedToolCallIDs 记录本 provider pass 成功接受并派发的唯一外部工具
 	// tool_call_id；len 即真实 parallel_width。在有效派发点累计、pass 结束冻结，
 	// 不得用 provider 结束瞬间的 pending 数量推算，预派发拒绝不计入。
