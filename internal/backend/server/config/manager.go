@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	modeladapter "cursor/internal/backend/agent/model"
 	legacyruntime "cursor/internal/runtime"
 )
 
@@ -85,6 +86,27 @@ func (manager *Manager) Save(ctx context.Context, cfg Config) (Config, error) {
 	return normalized, nil
 }
 
+func (manager *Manager) EnabledSubagentModels(ctx context.Context) []modeladapter.SubagentModel {
+	if manager == nil {
+		return nil
+	}
+	manager.reloadIfChanged(ctx)
+	models := make([]modeladapter.SubagentModel, 0)
+	for _, adapter := range manager.currentConfig().ModelAdapters {
+		if !adapter.SubagentEnabled || len(adapter.SubagentRoles) == 0 {
+			continue
+		}
+		models = append(models, modeladapter.SubagentModel{
+			ID:          adapter.ID,
+			DisplayName: adapter.DisplayName,
+			ModelID:     adapter.ModelID,
+			TooltipData: adapter.TooltipData,
+			Roles:       append([]string(nil), adapter.SubagentRoles...),
+		})
+	}
+	return models
+}
+
 func (manager *Manager) LastAgentModelHash() string {
 	if manager == nil {
 		return ""
@@ -152,9 +174,12 @@ func (manager *Manager) LegacyRuntimeSnapshot(_ context.Context) (legacyruntime.
 			BaseURL:                  item.BaseURL,
 			APIKey:                   item.APIKey,
 			TooltipData:              item.TooltipData,
+			SubagentEnabled:          item.SubagentEnabled,
+			SubagentRoles:            append([]string(nil), item.SubagentRoles...),
 			ModelID:                  item.ModelID,
 			ReasoningEffort:          item.ReasoningEffort,
 			OpenAIEndpoint:           item.OpenAIEndpoint,
+			OpenAIEndpointPath:       item.OpenAIEndpointPath,
 			OpenAIExtraParamsEnabled: item.OpenAIExtraParamsEnabled,
 			OpenAIExtraParamsJSON:    item.OpenAIExtraParamsJSON,
 			ContextWindowTokens:      item.ContextWindowTokens,

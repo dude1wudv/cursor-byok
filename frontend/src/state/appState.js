@@ -22,6 +22,7 @@ import {
 const APP_STATE_STORAGE_KEY = "cursor-client:runtime-state:v2";
 const GENERIC_SERVICE_ERROR = "服务错误";
 const SUPPORTED_MODEL_ADAPTER_TYPES = new Set(["openai", "anthropic"]);
+const SUPPORTED_SUBAGENT_ROLES = new Set(["simple_explore", "medium_explore", "complex_debug"]);
 const SUPPORTED_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const SUPPORTED_ANTHROPIC_THINKING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 export const ANTHROPIC_THINKING_EFFORT_DEFAULT = "xhigh";
@@ -146,6 +147,7 @@ function buildModelAdapterIdentityKey(adapter) {
     asString(adapter.apiKey),
     asString(adapter.displayName),
     adapter.type === "openai" ? normalizeOpenAIEndpoint(adapter.openAIEndpoint) : "",
+    adapter.type === "openai" ? normalizeOpenAIEndpointPath(adapter.openAIEndpointPath) : "",
   ].join("\n");
 }
 
@@ -167,6 +169,7 @@ export function buildModelAdapterTestRequestHash(source) {
     asString(adapter.modelID),
     adapter.type === "openai" ? asString(adapter.reasoningEffort || "medium") : "",
     adapter.type === "openai" ? normalizeOpenAIEndpoint(adapter.openAIEndpoint) : "",
+    adapter.type === "openai" ? normalizeOpenAIEndpointPath(adapter.openAIEndpointPath) : "",
     adapter.type === "openai" ? String(Boolean(adapter.openAIExtraParamsEnabled)) : "false",
     adapter.type === "openai" && adapter.openAIExtraParamsEnabled ? asString(adapter.openAIExtraParamsJSON) : "",
     String(Boolean(adapter.customHeadersEnabled)),
@@ -252,9 +255,12 @@ export function createEmptyModelAdapter() {
     baseURL: "",
     apiKey: "",
     tooltipData: "备注",
+    subagentEnabled: false,
+    subagentRoles: [],
     modelID: "",
     reasoningEffort: "medium",
     openAIEndpoint: OPENAI_ENDPOINT_RESPONSES,
+    openAIEndpointPath: "",
     openAIExtraParamsEnabled: false,
     openAIExtraParamsJSON: OPENAI_EXTRA_PARAMS_DEFAULT_JSON,
     customHeadersEnabled: false,
@@ -278,6 +284,14 @@ function normalizeOpenAIEndpoint(value) {
     return OPENAI_ENDPOINT_RESPONSES;
   }
   return SUPPORTED_OPENAI_ENDPOINTS.has(text) ? text : "";
+}
+
+function normalizeOpenAIEndpointPath(value) {
+  const path = asString(value);
+  if (!path) return "";
+  if (!path.startsWith("/") || path.includes("..") || path.includes("?") || path.includes("#") || path.includes("://")) return "";
+  const lower = path.toLowerCase();
+  return lower.endsWith("/responses") || lower.endsWith("/chat/completions") ? path : "";
 }
 
 function isValidOpenAIEndpoint(value) {
@@ -352,6 +366,14 @@ export function normalizeModelAdapter(source) {
   const anthropicExtraParamsJSON = normalizedType === "anthropic"
     ? asString(raw.anthropicExtraParamsJSON ?? raw.anthropic_extra_params_json) || EXTRA_PARAMS_DEFAULT_JSON
     : "";
+  const configuredRoles = asArray(raw.subagentRoles ?? raw.subagent_roles)
+    .map((role) => asString(role).toLowerCase())
+    .filter((role, index, roles) => SUPPORTED_SUBAGENT_ROLES.has(role) && roles.indexOf(role) === index);
+  const subagentRoles = configuredRoles.length > 0
+    ? configuredRoles
+    : (raw.subagentRoles === undefined && raw.subagent_roles === undefined && asBoolean(raw.subagentEnabled ?? raw.subagent_enabled)
+      ? ["simple_explore", "medium_explore", "complex_debug"]
+      : []);
   return {
     id: asString(raw.id),
     displayName: asString(raw.displayName || raw.name),
@@ -359,11 +381,16 @@ export function normalizeModelAdapter(source) {
     baseURL: normalizeBaseURL(raw.baseURL || raw.url),
     apiKey: asString(raw.apiKey || raw.key),
     tooltipData: asString(raw.tooltipData),
+    subagentEnabled: subagentRoles.length > 0,
+    subagentRoles,
     modelID: asString(raw.modelID),
     reasoningEffort: SUPPORTED_REASONING_EFFORTS.has(normalizedReasoningEffort)
       ? normalizedReasoningEffort
       : "medium",
     openAIEndpoint: normalizedType === "openai" ? normalizedOpenAIEndpoint : "",
+    openAIEndpointPath: normalizedType === "openai" && normalizedOpenAIEndpoint === OPENAI_ENDPOINT_CUSTOM
+      ? normalizeOpenAIEndpointPath(raw.openAIEndpointPath ?? raw.openaiEndpointPath ?? raw.open_ai_endpoint_path)
+      : "",
     openAIExtraParamsEnabled,
     openAIExtraParamsJSON,
     customHeadersEnabled,
@@ -422,6 +449,9 @@ export function validateModelAdapters(source) {
     }
     if (adapter.type === "openai" && !isValidOpenAIEndpoint(adapter.openAIEndpoint)) {
       return `${prefix} 的 OpenAI 端点仅支持 /v1/responses、/v1/chat/completions 或以 / 开头的自定义路径`;
+    }
+    if (adapter.type === "openai" && adapter.openAIEndpoint === OPENAI_ENDPOINT_CUSTOM && !adapter.openAIEndpointPath) {
+      return `${prefix} 的自定义 OpenAI endpoint path 必须以 / 开头，并以 /responses 或 /chat/completions 结尾`;
     }
     if (adapter.type === "openai" && adapter.openAIExtraParamsEnabled) {
       const extraParamsError = validateOpenAIExtraParamsJSON(adapter.openAIExtraParamsJSON);

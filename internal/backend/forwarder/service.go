@@ -1656,6 +1656,86 @@ func (service *Service) runProviderStream(stream *ActiveStream, token uint64, ct
 	})
 }
 
+func (service *Service) resolveTaskModel(invocation runtimecore.ToolInvocation) (runtimecore.ToolInvocation, error) {
+	if strings.TrimSpace(invocation.ToolName) != "Task" {
+		return invocation, nil
+	}
+	var args map[string]any
+	if err := json.Unmarshal(invocation.ArgsJSON, &args); err != nil {
+		return invocation, fmt.Errorf("decode Task args failed: %w", err)
+	}
+	requested := readStringMapValue(args, "model", "model_id", "modelId")
+	role := readStringMapValue(args, "task_role", "taskRole")
+	if role == "" {
+		return invocation, fmt.Errorf("task_role is required")
+	}
+	directory, ok := service.resolver.(modeladapter.SubagentModelDirectory)
+	if !ok {
+		return invocation, fmt.Errorf("subagent model directory is unavailable")
+	}
+	models := directory.EnabledSubagentModels(context.Background())
+	selected := ""
+	for _, model := range models {
+		if requested != "" && strings.TrimSpace(model.ID) == requested {
+			selected = requested
+			break
+		}
+		if requested == "" {
+			for _, candidateRole := range model.Roles {
+				if strings.TrimSpace(candidateRole) == role {
+					selected = strings.TrimSpace(model.ID)
+					break
+				}
+			}
+			if selected != "" {
+				break
+			}
+		}
+	}
+	if selected == "" {
+		if requested != "" {
+			return invocation, fmt.Errorf("subagent model %q is not enabled", requested)
+		}
+		return invocation, nil
+	}
+	args["model"] = selected
+	rewritten, err := json.Marshal(args)
+	if err != nil {
+		return invocation, err
+	}
+	invocation.ArgsJSON = rewritten
+	return invocation, nil
+}
+
+func reserveTaskDispatch(stream *ActiveStream, invocation runtimecore.ToolInvocation) error {
+	if strings.TrimSpace(invocation.ToolName) != "Task" {
+		return nil
+	}
+	callID := strings.TrimSpace(invocation.CallID)
+	if callID == "" {
+		return fmt.Errorf("Task call ID is required for dispatch limiting")
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if stream.TaskDispatchReservations == nil {
+		stream.TaskDispatchReservations = make(map[int]map[string]struct{})
+	}
+	pass := stream.ProviderPassCount
+	reservations := stream.TaskDispatchReservations[pass]
+	if reservations == nil {
+		reservations = make(map[string]struct{})
+		stream.TaskDispatchReservations[pass] = reservations
+	}
+	if _, exists := reservations[callID]; exists {
+		return nil
+	}
+	if len(reservations) >= 4 {
+		return fmt.Errorf("at most 4 direct subagents may be dispatched in one provider pass")
+	}
+	reservations[callID] = struct{}{}
+	return nil
+}
+
 // handleToolInvocation 把模型产生的工具意图转成 exec/interaction 请求并下发给客户端。
 func (service *Service) handleToolInvocation(stream *ActiveStream, invocation runtimecore.ToolInvocation) error {
 	if err := providerLoopInterruptErr(nil, stream, invocation.ModelCallID); err != nil {
@@ -1683,6 +1763,15 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			return service.completePreDispatchToolError(stream, invocation, nil, false, false, cause)
 		}
 		return err
+	}
+	if trimmedToolName == "Task" {
+		invocation, err = service.resolveTaskModel(invocation)
+		if err != nil {
+			return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
+		}
+		if err := reserveTaskDispatch(stream, invocation); err != nil {
+			return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
+		}
 	}
 	if isPatchEditToolName(trimmedToolName) {
 		if err := service.handlePatchEditToolInvocation(stream, invocation); err != nil {

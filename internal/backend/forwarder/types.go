@@ -173,6 +173,7 @@ type ActiveStream struct {
 	Backlog                     []StreamEvent
 	Subscribers                 map[string]*StreamSubscriber
 	CheckpointConversation      *ConversationFile
+	TaskDispatchReservations    map[int]map[string]struct{}
 	PendingExecs                map[string]runtimecore.PendingExec
 	PendingInteractions         map[string]runtimecore.PendingInteraction
 	PartialToolCallIDs          map[string]struct{}

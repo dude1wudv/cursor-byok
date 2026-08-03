@@ -512,9 +512,15 @@
             "type": "string"
           },
           "model": {
-            "description": "Optional model to use for this agent. If not specified, inherits from parent. Prefer fast for quick, straightforward tasks to minimize cost and latency. Only select a different model when the task specifically benefits from it (e.g., deep reasoning, high-quality code review, multimodal input)",
+            "description": "Optional enabled subagent model adapter ID. If omitted, the first enabled model for task_role is used.",
+            "type": "string"
+          },
+          "task_role": {
+            "description": "Role used to route the task to an enabled subagent model.",
             "enum": [
-              "fast"
+              "simple_explore",
+              "medium_explore",
+              "complex_debug"
             ],
             "type": "string"
           },
@@ -543,7 +549,8 @@
         },
         "required": [
           "description",
-          "prompt"
+          "prompt",
+          "task_role"
         ],
         "type": "object"
       }

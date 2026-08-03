@@ -20,26 +20,29 @@ const (
 )
 
 type ModelAdapterConfig struct {
-	ID                          string `json:"id,omitempty" yaml:"-"`
-	DisplayName                 string `json:"displayName" yaml:"displayName"`
-	Type                        string `json:"type" yaml:"type"`
-	BaseURL                     string `json:"baseURL" yaml:"baseURL"`
-	APIKey                      string `json:"apiKey" yaml:"apiKey"`
-	TooltipData                 string `json:"tooltipData" yaml:"tooltipData"`
-	ModelID                     string `json:"modelID" yaml:"modelID"`
-	ReasoningEffort             string `json:"reasoningEffort" yaml:"reasoningEffort"`
-	OpenAIEndpoint              string `json:"openAIEndpoint" yaml:"openAIEndpoint"`
-	OpenAIExtraParamsEnabled    bool   `json:"openAIExtraParamsEnabled" yaml:"openAIExtraParamsEnabled"`
-	OpenAIExtraParamsJSON       string `json:"openAIExtraParamsJSON" yaml:"openAIExtraParamsJSON"`
-	CustomHeadersEnabled        bool   `json:"customHeadersEnabled" yaml:"customHeadersEnabled"`
-	CustomHeadersJSON           string `json:"customHeadersJSON" yaml:"customHeadersJSON"`
-	AnthropicExtraParamsEnabled bool   `json:"anthropicExtraParamsEnabled" yaml:"anthropicExtraParamsEnabled"`
-	AnthropicExtraParamsJSON    string `json:"anthropicExtraParamsJSON" yaml:"anthropicExtraParamsJSON"`
-	ContextWindowTokens         int    `json:"contextWindowTokens" yaml:"contextWindowTokens"`
-	MaxCompletionTokens         int    `json:"maxCompletionTokens" yaml:"maxCompletionTokens"`
-	AnthropicMaxTokens          int    `json:"anthropicMaxTokens" yaml:"anthropicMaxTokens"`
-	AnthropicThinkingEffort     string `json:"anthropicThinkingEffort,omitempty" yaml:"anthropicThinkingEffort,omitempty"`
-	ThinkingBudgetTokens        int    `json:"thinkingBudgetTokens" yaml:"thinkingBudgetTokens"`
+	ID                          string   `json:"id,omitempty" yaml:"-"`
+	DisplayName                 string   `json:"displayName" yaml:"displayName"`
+	Type                        string   `json:"type" yaml:"type"`
+	BaseURL                     string   `json:"baseURL" yaml:"baseURL"`
+	APIKey                      string   `json:"apiKey" yaml:"apiKey"`
+	TooltipData                 string   `json:"tooltipData" yaml:"tooltipData"`
+	SubagentEnabled             bool     `json:"subagentEnabled" yaml:"subagentEnabled"`
+	SubagentRoles               []string `json:"subagentRoles,omitempty" yaml:"subagentRoles,omitempty"`
+	ModelID                     string   `json:"modelID" yaml:"modelID"`
+	ReasoningEffort             string   `json:"reasoningEffort" yaml:"reasoningEffort"`
+	OpenAIEndpoint              string   `json:"openAIEndpoint" yaml:"openAIEndpoint"`
+	OpenAIEndpointPath          string   `json:"openAIEndpointPath,omitempty" yaml:"openAIEndpointPath,omitempty"`
+	OpenAIExtraParamsEnabled    bool     `json:"openAIExtraParamsEnabled" yaml:"openAIExtraParamsEnabled"`
+	OpenAIExtraParamsJSON       string   `json:"openAIExtraParamsJSON" yaml:"openAIExtraParamsJSON"`
+	CustomHeadersEnabled        bool     `json:"customHeadersEnabled" yaml:"customHeadersEnabled"`
+	CustomHeadersJSON           string   `json:"customHeadersJSON" yaml:"customHeadersJSON"`
+	AnthropicExtraParamsEnabled bool     `json:"anthropicExtraParamsEnabled" yaml:"anthropicExtraParamsEnabled"`
+	AnthropicExtraParamsJSON    string   `json:"anthropicExtraParamsJSON" yaml:"anthropicExtraParamsJSON"`
+	ContextWindowTokens         int      `json:"contextWindowTokens" yaml:"contextWindowTokens"`
+	MaxCompletionTokens         int      `json:"maxCompletionTokens" yaml:"maxCompletionTokens"`
+	AnthropicMaxTokens          int      `json:"anthropicMaxTokens" yaml:"anthropicMaxTokens"`
+	AnthropicThinkingEffort     string   `json:"anthropicThinkingEffort,omitempty" yaml:"anthropicThinkingEffort,omitempty"`
+	ThinkingBudgetTokens        int      `json:"thinkingBudgetTokens" yaml:"thinkingBudgetTokens"`
 }
 
 type HomeMetricsConfig struct {
@@ -102,6 +105,10 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 		if err != nil {
 			return nil, err
 		}
+		endpointPath, err := modelchannel.NormalizeOpenAIEndpointPath(item.OpenAIEndpointPath)
+		if err != nil {
+			return nil, err
+		}
 		nextType := normalizeModelAdapterType(item.Type)
 		next := ModelAdapterConfig{
 			DisplayName:          strings.TrimSpace(item.DisplayName),
@@ -109,13 +116,18 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 			BaseURL:              baseURL,
 			APIKey:               strings.TrimSpace(item.APIKey),
 			TooltipData:          strings.TrimSpace(item.TooltipData),
+			SubagentRoles:        normalizeSubagentRoles(item.SubagentRoles, item.SubagentEnabled),
 			ModelID:              strings.TrimSpace(item.ModelID),
 			ReasoningEffort:      normalizeReasoningEffort(item.ReasoningEffort),
 			OpenAIEndpoint:       modelchannel.NormalizeOpenAIEndpoint(item.Type, item.OpenAIEndpoint),
+			OpenAIEndpointPath:   endpointPath,
 			ContextWindowTokens:  normalizeMaxCompletionTokens(item.ContextWindowTokens),
 			MaxCompletionTokens:  normalizeMaxCompletionTokens(item.MaxCompletionTokens),
 			AnthropicMaxTokens:   normalizeMaxCompletionTokens(item.AnthropicMaxTokens),
 			ThinkingBudgetTokens: normalizeMaxCompletionTokens(item.ThinkingBudgetTokens),
+		}
+		if next.OpenAIEndpoint != modelchannel.OpenAIEndpointCustom {
+			next.OpenAIEndpointPath = ""
 		}
 		if next.Type == "openai" {
 			next.OpenAIExtraParamsEnabled = item.OpenAIExtraParamsEnabled
@@ -125,6 +137,7 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 			next.AnthropicExtraParamsEnabled = item.AnthropicExtraParamsEnabled
 			next.AnthropicExtraParamsJSON = strings.TrimSpace(item.AnthropicExtraParamsJSON)
 		}
+		next.SubagentEnabled = len(next.SubagentRoles) > 0
 		next.CustomHeadersEnabled = item.CustomHeadersEnabled
 		next.CustomHeadersJSON = strings.TrimSpace(item.CustomHeadersJSON)
 		switch {
@@ -157,7 +170,7 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 		case next.Type == "anthropic" && next.AnthropicThinkingEffort == "":
 			return nil, errors.New("模型适配器 anthropicThinkingEffort 仅支持 low、medium、high、xhigh、max")
 		}
-		next.ID = modelchannel.BuildChannelID(next.BaseURL, next.ModelID, next.APIKey, next.DisplayName, next.OpenAIEndpoint)
+		next.ID = modelchannel.BuildChannelIDWithPath(next.BaseURL, next.ModelID, next.APIKey, next.DisplayName, next.OpenAIEndpoint, next.OpenAIEndpointPath)
 		if _, exists := seenChannelIDs[next.ID]; exists {
 			return nil, errors.New("模型适配器渠道不能重复，请检查 url、modelID、apiKey、displayName、endpoint 组合")
 		}
@@ -197,6 +210,31 @@ func validateHeadersJSON(value string) error {
 		}
 	}
 	return nil
+}
+
+func normalizeSubagentRoles(input []string, legacyEnabled bool) []string {
+	if len(input) == 0 && legacyEnabled {
+		return []string{"simple_explore", "medium_explore", "complex_debug"}
+	}
+	allowed := map[string]struct{}{
+		"simple_explore": {},
+		"medium_explore": {},
+		"complex_debug":  {},
+	}
+	roles := make([]string, 0, len(input))
+	seen := make(map[string]struct{}, len(input))
+	for _, raw := range input {
+		role := strings.ToLower(strings.TrimSpace(raw))
+		if _, ok := allowed[role]; !ok {
+			continue
+		}
+		if _, ok := seen[role]; ok {
+			continue
+		}
+		seen[role] = struct{}{}
+		roles = append(roles, role)
+	}
+	return roles
 }
 
 func normalizeReasoningEffort(value string) string {

@@ -46,12 +46,18 @@ type ModelAdapterConfig struct {
 	APIKey string `json:"apiKey"`
 	// TooltipData 表示当前声明中的 TooltipData。
 	TooltipData string `json:"tooltipData"`
+	// SubagentEnabled 表示该模型是否可供父代理选择。
+	SubagentEnabled bool `json:"subagentEnabled"`
+	// SubagentRoles 表示该模型可承担的子代理角色。
+	SubagentRoles []string `json:"subagentRoles,omitempty"`
 	// ModelID 表示当前声明中的 ModelID。
 	ModelID string `json:"modelID"`
 	// ReasoningEffort 表示当前声明中的 ReasoningEffort。
 	ReasoningEffort string `json:"reasoningEffort"`
 	// OpenAIEndpoint 表示 OpenAI 兼容适配器使用的 API 端点。
 	OpenAIEndpoint string `json:"openAIEndpoint"`
+	// OpenAIEndpointPath 表示 OpenAI 兼容适配器使用的自定义相对路径。
+	OpenAIEndpointPath string `json:"openAIEndpointPath,omitempty"`
 	// OpenAIExtraParamsEnabled 表示是否启用 OpenAI 额外请求参数。
 	OpenAIExtraParamsEnabled bool `json:"openAIExtraParamsEnabled"`
 	// OpenAIExtraParamsJSON 表示 OpenAI 额外请求参数 JSON 对象。
@@ -102,19 +108,29 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 		if err != nil {
 			return nil, err
 		}
+		endpointPath, err := modelchannel.NormalizeOpenAIEndpointPath(item.OpenAIEndpointPath)
+		if err != nil {
+			return nil, err
+		}
 		next := ModelAdapterConfig{
 			DisplayName:          strings.TrimSpace(item.DisplayName),
 			Type:                 normalizeModelAdapterType(item.Type),
 			BaseURL:              baseURL,
 			APIKey:               strings.TrimSpace(item.APIKey),
 			TooltipData:          strings.TrimSpace(item.TooltipData),
+			SubagentEnabled:      item.SubagentEnabled,
+			SubagentRoles:        append([]string(nil), item.SubagentRoles...),
 			ModelID:              strings.TrimSpace(item.ModelID),
 			ReasoningEffort:      normalizeReasoningEffort(item.ReasoningEffort),
 			OpenAIEndpoint:       modelchannel.NormalizeOpenAIEndpoint(item.Type, item.OpenAIEndpoint),
+			OpenAIEndpointPath:   endpointPath,
 			ContextWindowTokens:  normalizeMaxCompletionTokens(item.ContextWindowTokens),
 			MaxCompletionTokens:  normalizeMaxCompletionTokens(item.MaxCompletionTokens),
 			AnthropicMaxTokens:   normalizeMaxCompletionTokens(item.AnthropicMaxTokens),
 			ThinkingBudgetTokens: normalizeMaxCompletionTokens(item.ThinkingBudgetTokens),
+		}
+		if next.OpenAIEndpoint != modelchannel.OpenAIEndpointCustom {
+			next.OpenAIEndpointPath = ""
 		}
 		if next.Type == "openai" {
 			next.OpenAIExtraParamsEnabled = item.OpenAIExtraParamsEnabled
@@ -156,7 +172,7 @@ func NormalizeModelAdapterConfigs(input []ModelAdapterConfig) ([]ModelAdapterCon
 		case next.Type == "anthropic" && next.AnthropicThinkingEffort == "":
 			return nil, errors.New("模型适配器 anthropicThinkingEffort 仅支持 low、medium、high、xhigh、max")
 		}
-		next.ID = modelchannel.BuildChannelID(next.BaseURL, next.ModelID, next.APIKey, next.DisplayName, next.OpenAIEndpoint)
+		next.ID = modelchannel.BuildChannelIDWithPath(next.BaseURL, next.ModelID, next.APIKey, next.DisplayName, next.OpenAIEndpoint, next.OpenAIEndpointPath)
 		if _, exists := seenChannelIDs[next.ID]; exists {
 			return nil, errors.New("模型适配器渠道不能重复，请检查 url、modelID、apiKey、displayName、endpoint 组合")
 		}
@@ -267,6 +283,8 @@ type ResolvedChannel struct {
 	ReasoningEffort string
 	// OpenAIEndpoint 表示 OpenAI 兼容适配器使用的 API 端点。
 	OpenAIEndpoint string
+	// OpenAIEndpointPath 表示 OpenAI 兼容适配器使用的自定义相对路径。
+	OpenAIEndpointPath string
 	// OpenAIExtraParamsEnabled 表示是否启用 OpenAI 额外请求参数。
 	OpenAIExtraParamsEnabled bool
 	// OpenAIExtraParamsJSON 表示 OpenAI 额外请求参数 JSON 对象。
@@ -399,6 +417,7 @@ func (s *FixedChannelService) SelectChannelForModel(ctx context.Context, modelID
 			MaxTokens:                   configurableChannelMaxTokens,
 			ReasoningEffort:             strings.TrimSpace(adapter.ReasoningEffort),
 			OpenAIEndpoint:              strings.TrimSpace(adapter.OpenAIEndpoint),
+			OpenAIEndpointPath:          strings.TrimSpace(adapter.OpenAIEndpointPath),
 			OpenAIExtraParamsEnabled:    adapter.OpenAIExtraParamsEnabled,
 			OpenAIExtraParamsJSON:       strings.TrimSpace(adapter.OpenAIExtraParamsJSON),
 			CustomHeadersEnabled:        adapter.CustomHeadersEnabled,

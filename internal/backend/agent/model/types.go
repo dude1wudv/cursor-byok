@@ -94,6 +94,8 @@ type StreamRequest struct {
 	ReasoningEffort string
 	// OpenAIEndpoint 表示 OpenAI 兼容 provider 使用的 API 端点。
 	OpenAIEndpoint string
+	// OpenAIEndpointPath 表示 OpenAI 兼容 provider 使用的自定义相对路径。
+	OpenAIEndpointPath string
 	// OpenAIExtraParamsEnabled 表示是否启用 OpenAI 额外请求参数。
 	OpenAIExtraParamsEnabled bool
 	// OpenAIExtraParamsJSON 表示 OpenAI 额外请求参数 JSON 对象。

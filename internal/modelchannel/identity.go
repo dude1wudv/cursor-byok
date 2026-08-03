@@ -71,6 +71,28 @@ func OpenAIEndpointShape(endpoint string) string {
 	}
 }
 
+func NormalizeOpenAIEndpointPath(raw string) (string, error) {
+	path := strings.TrimSpace(raw)
+	if path == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(path)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("OpenAI 自定义 endpoint path 必须是不含 query 或 fragment 的相对路径")
+	}
+	if !strings.HasPrefix(parsed.Path, "/") || strings.Contains(parsed.Path, "../") || strings.HasSuffix(parsed.Path, "/..") {
+		return "", fmt.Errorf("OpenAI 自定义 endpoint path 必须以 / 开头且不能包含目录穿越")
+	}
+	shape := OpenAIEndpointShape(parsed.Path)
+	if shape == "responses" {
+		return parsed.EscapedPath(), nil
+	}
+	if strings.HasSuffix(strings.ToLower(parsed.Path), "/chat/completions") {
+		return parsed.EscapedPath(), nil
+	}
+	return "", fmt.Errorf("OpenAI 自定义 endpoint path 必须以 /responses 或 /chat/completions 结尾")
+}
+
 func BuildLegacyChannelID(baseURL string, modelID string, apiKey string, name string) string {
 	return buildChannelID([]string{
 		strings.TrimSpace(baseURL),
@@ -91,6 +113,20 @@ func BuildChannelID(baseURL string, modelID string, apiKey string, name string, 
 		strings.TrimSpace(apiKey),
 		strings.TrimSpace(name),
 		endpoint,
+	})
+}
+
+func BuildChannelIDWithPath(baseURL string, modelID string, apiKey string, name string, openAIEndpoint string, openAIEndpointPath string) string {
+	if strings.TrimSpace(openAIEndpointPath) == "" {
+		return BuildChannelID(baseURL, modelID, apiKey, name, openAIEndpoint)
+	}
+	return buildChannelID([]string{
+		strings.TrimSpace(baseURL),
+		strings.TrimSpace(modelID),
+		strings.TrimSpace(apiKey),
+		strings.TrimSpace(name),
+		strings.TrimSpace(openAIEndpoint),
+		strings.TrimSpace(openAIEndpointPath),
 	})
 }
 

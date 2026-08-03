@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -295,7 +296,18 @@ func openAITextLooksLikeImageGenerationRequest(text string) bool {
 	return false
 }
 
-func OpenAIEndpointURL(baseURL string, endpoint string) string {
+func OpenAIEndpointURL(baseURL string, endpoint string, endpointPath ...string) string {
+	if len(endpointPath) > 0 && strings.TrimSpace(endpointPath[0]) != "" {
+		base, err := url.Parse(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
+		if err == nil {
+			relative, relativeErr := url.Parse(strings.TrimSpace(endpointPath[0]))
+			if relativeErr == nil {
+				base.Path = strings.TrimRight(base.Path, "/") + relative.Path
+				base.RawPath = ""
+				return base.String()
+			}
+		}
+	}
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	normalizedEndpoint := strings.TrimSpace(endpoint)
 	if normalizedEndpoint == "" {
@@ -423,6 +435,9 @@ func (adapter *OpenAIAdapter) Stream(ctx context.Context, req StreamRequest, sin
 	}
 
 	endpoint := ResolveOpenAIEndpoint(baseURL, req.OpenAIEndpoint)
+	if strings.TrimSpace(req.OpenAIEndpointPath) != "" {
+		endpoint = OpenAIEndpointFromBaseURL(req.OpenAIEndpointPath)
+	}
 	if endpoint == "" {
 		return fmt.Errorf("openai endpoint is unsupported: %s", strings.TrimSpace(req.OpenAIEndpoint))
 	}
@@ -486,7 +501,7 @@ func (adapter *OpenAIAdapter) streamChatCompletions(ctx context.Context, req Str
 		return err
 	}
 	body = bodyMap
-	requestURL := OpenAIEndpointURL(baseURL, req.OpenAIEndpoint)
+	requestURL := OpenAIEndpointURL(baseURL, req.OpenAIEndpoint, req.OpenAIEndpointPath)
 	recordLLMRequestArtifact(req, "openai", modelID, "POST", requestURL, body)
 
 	payload, err := json.Marshal(body)
@@ -965,7 +980,7 @@ func (adapter *OpenAIAdapter) streamResponses(ctx context.Context, req StreamReq
 	}
 	body = bodyMap
 
-	requestURL := OpenAIEndpointURL(baseURL, req.OpenAIEndpoint)
+	requestURL := OpenAIEndpointURL(baseURL, req.OpenAIEndpoint, req.OpenAIEndpointPath)
 	recordLLMRequestArtifact(req, "openai", modelID, "POST", requestURL, body)
 
 	payload, err := json.Marshal(body)

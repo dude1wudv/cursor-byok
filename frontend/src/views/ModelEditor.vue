@@ -49,6 +49,12 @@ const anthropicThinkingEffortOptions = [
   { label: "Max", value: "max", icon: "icon-[mdi--brain]" },
 ];
 
+const subagentRoleOptions = [
+  { label: "简单探索", value: "simple_explore" },
+  { label: "中等探索", value: "medium_explore" },
+  { label: "复杂调试", value: "complex_debug" },
+];
+
 const openAIEndpointOptions = [
   { label: "/v1/responses", value: OPENAI_ENDPOINT_RESPONSES, icon: "icon-[mdi--api]" },
   { label: "/v1/chat/completions", value: OPENAI_ENDPOINT_CHAT_COMPLETIONS, icon: "icon-[mdi--message-text-outline]" },
@@ -131,7 +137,8 @@ const fieldTips = {
   contextWindowTokens: "模型单次可接受的最大上下文 Token 数。留空时使用默认值。",
   reasoningEffort: "推理强度仅对部分支持 reasoning_effort 的模型生效，并不是所有模型都支持。越高通常越稳，但也可能更慢。",
   maxCompletionTokens: "单次回复允许生成的最大 Token 数。留空时使用默认值。",
-  openAIEndpoint: "选择接口协议端点。选“自定义路径”时，请在接口地址栏填写完整请求地址（含 /chat/completions 或 /responses 路径后缀），系统会根据末段自动判断协议形态。",
+  openAIEndpoint: "选择接口协议端点。自定义模式使用 Base URL 加下方独立 endpoint path。",
+  openAIEndpointPath: "必须以 / 开头，并以 /responses 或 /chat/completions 结尾。",
   openAIExtraParams: "开启后会把 JSON 对象覆盖到 OpenAI 请求体。同名字段以这里为准。OpenAI service_tier 支持 auto、default、flex、scale、priority。",
   customHeaders: "开启后会把 JSON 对象覆盖到最终请求头。同名请求头以这里为准，值必须是字符串。",
   anthropicExtraParams: "开启后会把 JSON 对象覆盖到 Anthropic 请求体。同名字段以这里为准。",
@@ -158,7 +165,10 @@ async function loadContext() {
 }
 
 async function persistDraft() {
-  const adapter = normalizeModelAdapter(draft);
+  const adapter = normalizeModelAdapter({
+    ...draft,
+    subagentRoles: draft.subagentEnabled ? draft.subagentRoles : [],
+  });
 
   const singleCheck = validateModelAdapters([adapter]);
   if (singleCheck) {
@@ -196,6 +206,16 @@ async function handleSave() {
 
 async function handleCancel() {
   await Window.Close();
+}
+
+function handleSubagentEnabledChange() {
+  if (draft.subagentEnabled) {
+    if (!Array.isArray(draft.subagentRoles) || draft.subagentRoles.length === 0) {
+      draft.subagentRoles = subagentRoleOptions.map((option) => option.value);
+    }
+    return;
+  }
+  draft.subagentRoles = [];
 }
 
 function handleModelTypeChange(type) {
@@ -313,6 +333,33 @@ onMounted(async () => {
             <span :class="[tab.icon, 'text-[16px]']"></span>
             <span>{{ tab.label }}</span>
           </button>
+        </div>
+
+        <div class="rounded-[8px] border border-[#343434] bg-[#202020] p-3">
+          <label class="flex items-center gap-2 text-sm text-[#d4d4d4]">
+            <input
+              v-model="draft.subagentEnabled"
+              type="checkbox"
+              class="h-4 w-4 accent-[#10AD5D]"
+              @change="handleSubagentEnabledChange"
+            />
+            <span>允许作为子代理模型</span>
+          </label>
+          <div v-if="draft.subagentEnabled" class="mt-3 flex flex-wrap gap-3">
+            <label
+              v-for="option in subagentRoleOptions"
+              :key="option.value"
+              class="flex items-center gap-2 text-sm text-[#a3a3a3]"
+            >
+              <input
+                v-model="draft.subagentRoles"
+                type="checkbox"
+                :value="option.value"
+                class="h-4 w-4 accent-[#10AD5D]"
+              />
+              <span>{{ option.label }}</span>
+            </label>
+          </div>
         </div>
 
         <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
@@ -444,6 +491,19 @@ onMounted(async () => {
             <Select
               v-model="draft.openAIEndpoint"
               :options="openAIEndpointOptions"
+            />
+          </label>
+
+          <label v-if="draft.openAIEndpoint === OPENAI_ENDPOINT_CUSTOM" class="flex flex-col gap-1 md:col-span-2">
+            <span class="center-row justify-start gap-1.5 text-sm text-[#d4d4d4]">
+              <Tooltip :content="fieldTips.openAIEndpointPath" />
+              <span>自定义 endpoint path</span>
+            </span>
+            <input
+              v-model="draft.openAIEndpointPath"
+              type="text"
+              placeholder="例如：/openai/deployments/model/chat/completions"
+              class="h-9 rounded-[6px] border border-[#3f3f3f] bg-[#232323] px-3 text-sm text-[#e5e5e5] outline-none focus:border-[#10AD5D]"
             />
           </label>
         </div>

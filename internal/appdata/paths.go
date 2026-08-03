@@ -45,10 +45,6 @@ func UsageFilePath() string {
 	return filepath.Join(HistoryRootPath(), "usage.json")
 }
 
-func AdsRootPath() string {
-	return filepath.Join(DataRootPath(), "ads")
-}
-
 func CodebaseIndexRootPath() string {
 	return filepath.Join(DataRootPath(), "codebase-index")
 }
