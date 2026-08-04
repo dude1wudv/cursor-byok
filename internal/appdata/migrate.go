@@ -65,7 +65,7 @@ func copyLegacyFile(sourcePath string, targetPath string) {
 	if err != nil {
 		return
 	}
-	defer sourceFile.Close()
+	defer func() { _ = sourceFile.Close() }()
 
 	info, err := sourceFile.Stat()
 	if err != nil || !info.Mode().IsRegular() {
@@ -78,6 +78,6 @@ func copyLegacyFile(sourcePath string, targetPath string) {
 	if err != nil {
 		return
 	}
-	defer targetFile.Close()
+	defer func() { _ = targetFile.Close() }()
 	_, _ = io.Copy(targetFile, sourceFile)
 }

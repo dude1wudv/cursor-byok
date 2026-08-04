@@ -113,7 +113,7 @@ func main() {
 	ExtractProtos(tempFileName, *outputDir)
 
 	// 清理临时文件
-	os.Remove(tempFileName)
+	_ = os.Remove(tempFileName)
 
 	fmt.Printf("\nOutput directory: %s\n", *outputDir)
 }

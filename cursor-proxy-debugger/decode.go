@@ -129,7 +129,7 @@ func decompressPayload(payload []byte, codec string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gzip 解压失败：%w", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	decoded, err := io.ReadAll(io.LimitReader(reader, maxConnectFrameBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("读取 gzip 内容失败：%w", err)

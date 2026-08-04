@@ -731,6 +731,7 @@ func mergeConversationMetadata(target *ConversationFile, source *ConversationFil
 	}
 	target.ParentConversationID = strings.TrimSpace(source.ParentConversationID)
 	target.ParentToolCallID = strings.TrimSpace(source.ParentToolCallID)
+	target.SubagentDepth = source.SubagentDepth
 	target.SubagentTypeName = strings.TrimSpace(source.SubagentTypeName)
 	if folder := normalizeAgentTranscriptsFolder(source.AgentTranscriptsFolder); folder != "" {
 		target.AgentTranscriptsFolder = folder
@@ -852,7 +853,7 @@ func writeJSONFileAtomic(path string, payload any) error {
 		}
 	}()
 	if _, err := file.Write(append(data, '\n')); err != nil {
-		file.Close()
+		_ = file.Close()
 		return fmt.Errorf("write temp file: %w", err)
 	}
 	if err := file.Close(); err != nil {
@@ -968,7 +969,7 @@ func acquireConversationFileLock(lockPath string) (func(), error) {
 		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
 			owner := conversationLockOwnerToken()
-			_, _ = file.WriteString(fmt.Sprintf("pid=%d\nowner=%s\ncreated_at=%s\n", os.Getpid(), owner, time.Now().UTC().Format(time.RFC3339Nano)))
+			_, _ = fmt.Fprintf(file, "pid=%d\nowner=%s\ncreated_at=%s\n", os.Getpid(), owner, time.Now().UTC().Format(time.RFC3339Nano))
 			_ = file.Close()
 			return func() {
 				removeConversationLockIfOwner(lockPath, owner)
@@ -1123,6 +1124,6 @@ func syncDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	defer func() { _ = dir.Close() }()
 	return dir.Sync()
 }

@@ -23,7 +23,10 @@ import (
 
 	"cursor/gen/agentv1"
 	"cursor/internal/backend/agent/core"
+
 	"cursor/internal/netproxy"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // InteractionApplyResult 表示一次交互桥结果归一化后的最小产物。
@@ -325,7 +328,7 @@ func (bridge *Bridge) openSwitchMode(toolCall runtimecore.ToolInvocation) (*agen
 			},
 		},
 	}
-	argsPayload, _ := json.Marshal(args)
+	argsPayload, _ := protojson.Marshal(&args)
 	return serverMessage, runtimecore.PendingInteraction{
 		InteractionID:   fmt.Sprintf("%d", messageID),
 		ArgsJSON:        argsPayload,
@@ -619,7 +622,7 @@ func (bridge *Bridge) tryBaiduWebSearch(client *http.Client, searchTerm string) 
 	if err != nil {
 		return nil, "", err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, "", fmt.Errorf("baidu http status %d", response.StatusCode)
 	}
@@ -649,7 +652,7 @@ func (bridge *Bridge) tryDuckDuckGoWebSearch(client *http.Client, searchTerm str
 	if err != nil {
 		return nil, "", err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, "", fmt.Errorf("web search http status %d", response.StatusCode)
 	}
@@ -734,7 +737,10 @@ func truncateWebSearchReplay(searchTerm string, references []*agentv1.WebSearchR
 		if reference == nil {
 			continue
 		}
-		next := *reference
+		next, ok := proto.Clone(reference).(*agentv1.WebSearchReference)
+		if !ok || next == nil {
+			continue
+		}
 		title := truncateInteractionText("WebSearch title", next.GetTitle(), webSearchTitleLimit)
 		chunk := truncateInteractionText("WebSearch snippet", next.GetChunk(), webSearchChunkLimit)
 		if title != next.GetTitle() || chunk != next.GetChunk() {
@@ -742,7 +748,7 @@ func truncateWebSearchReplay(searchTerm string, references []*agentv1.WebSearchR
 		}
 		next.Title = title
 		next.Chunk = chunk
-		nextReferences = append(nextReferences, &next)
+		nextReferences = append(nextReferences, next)
 	}
 	nextPayload := formatWebSearchPayload(searchTerm, nextReferences)
 	if strings.TrimSpace(payload) != "" && len(nextPayload) == 0 {
@@ -781,7 +787,7 @@ func (bridge *Bridge) executeWebFetch(rawURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return "", fmt.Errorf("web fetch http status %d", response.StatusCode)
 	}

@@ -65,7 +65,7 @@ func (writer *legacyRunSSEHeaderWriter) Unwrap() http.ResponseWriter {
 
 // applyLegacyHeaders 设置 Cursor legacy RunSSE 需要的响应头。
 func (writer *legacyRunSSEHeaderWriter) applyLegacyHeaders() {
-	header := writer.ResponseWriter.Header()
+	header := writer.Header()
 	header.Set("Content-Type", legacyRunSSEContentType)
 	if header.Get("Cache-Control") == "" {
 		header.Set("Cache-Control", "no-cache")

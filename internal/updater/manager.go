@@ -192,7 +192,7 @@ func (m *Manager) fetchUpdateInfo(ctx context.Context) (*UpdateInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("update manifest request failed: %s", resp.Status)
@@ -265,7 +265,7 @@ func (m *Manager) downloadUpdate(ctx context.Context, info *UpdateInfo) (string,
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("download request failed: %s", resp.Status)

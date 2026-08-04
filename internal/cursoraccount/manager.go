@@ -153,7 +153,7 @@ func (manager *Manager) SignedIn() bool {
 // StartLogin 启动官方浏览器 PKCE 登录，并在后台等待登录结果。
 func (manager *Manager) StartLogin() (Status, error) {
 	if manager == nil {
-		return Status{State: StateError}, fmt.Errorf("Cursor 账号服务未初始化")
+		return Status{State: StateError}, fmt.Errorf("cursor 账号服务未初始化")
 	}
 	verifierBytes := make([]byte, 32)
 	if _, err := rand.Read(verifierBytes); err != nil {
@@ -248,7 +248,7 @@ func (manager *Manager) Authorization(ctx context.Context) (string, error) {
 	}
 	if strings.TrimSpace(creds.RefreshToken) == "" {
 		manager.setAuthorizationError(generation, "Cursor 登录已过期，请重新登录")
-		return "", fmt.Errorf("Cursor 登录已过期且没有刷新令牌")
+		return "", fmt.Errorf("cursor 登录已过期且没有刷新令牌")
 	}
 
 	updated, shouldLogout, err := manager.refresh(ctx, creds)
@@ -327,7 +327,7 @@ func (manager *Manager) fetchProfile(ctx context.Context, authorization string) 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
 		return nil, err
@@ -359,7 +359,7 @@ func (manager *Manager) pollOnce(ctx context.Context, loginID string, verifier s
 	if err != nil {
 		return pollResponse{}, false, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
 		return pollResponse{}, true, nil
@@ -396,7 +396,7 @@ func (manager *Manager) refresh(ctx context.Context, current credentials) (crede
 	if err != nil {
 		return credentials{}, false, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
 		return credentials{}, false, err
@@ -423,7 +423,7 @@ func (manager *Manager) refresh(ctx context.Context, current credentials) (crede
 
 func (manager *Manager) load() error {
 	if manager.path == "" {
-		return fmt.Errorf("Cursor 账号凭据路径为空")
+		return fmt.Errorf("cursor 账号凭据路径为空")
 	}
 	data, err := os.ReadFile(manager.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -450,7 +450,7 @@ func (manager *Manager) load() error {
 
 func (manager *Manager) save(value credentials) error {
 	if manager.path == "" {
-		return fmt.Errorf("Cursor 账号凭据路径为空")
+		return fmt.Errorf("cursor 账号凭据路径为空")
 	}
 	if err := os.MkdirAll(filepath.Dir(manager.path), 0o700); err != nil {
 		return err

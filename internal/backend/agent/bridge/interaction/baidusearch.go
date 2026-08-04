@@ -132,7 +132,7 @@ func requestBaiduRedirectLocation(client *http.Client, method string, rawURL str
 	if err != nil {
 		return ""
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	location := strings.TrimSpace(response.Header.Get("Location"))
 	if location == "" {
 		return ""

@@ -163,7 +163,7 @@ func (recorder *debugRecorder) appendJSONL(ctx context.Context, requestID string
 	if err != nil {
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	_, _ = file.Write(append(payload, '\n'))
 }
 

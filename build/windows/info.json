@@ -1,10 +1,10 @@
 {
 	"fixed": {
-		"file_version": "0.0.80"
+		"file_version": "0.0.81"
 	},
 	"info": {
 		"0000": {
-			"ProductVersion": "0.0.80",
+			"ProductVersion": "0.0.81",
 			"CompanyName": "Cursor助手",
 			"FileDescription": "Cursor助手",
 			"LegalCopyright": "© 2026, Cursor助手",

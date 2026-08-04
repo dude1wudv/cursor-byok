@@ -153,9 +153,12 @@ func newLineWindowFileWriter(path string, maxLines int, trimReserve int) (*lineW
 }
 
 func (writer *lineWindowFileWriter) Write(payload []byte) (int, error) {
+	if writer == nil {
+		return 0, fmt.Errorf("log file writer is not initialized")
+	}
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
-	if writer == nil || writer.file == nil {
+	if writer.file == nil {
 		return 0, fmt.Errorf("log file writer is not initialized")
 	}
 	newLines := writer.countIncomingLines(payload)

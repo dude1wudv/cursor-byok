@@ -260,6 +260,7 @@ func applyRunRewindMetadata(conversation *ConversationFile, source *Conversation
 		}
 		conversation.ParentConversationID = strings.TrimSpace(source.ParentConversationID)
 		conversation.ParentToolCallID = strings.TrimSpace(source.ParentToolCallID)
+		conversation.SubagentDepth = source.SubagentDepth
 		conversation.SubagentTypeName = strings.TrimSpace(source.SubagentTypeName)
 		if folder := normalizeAgentTranscriptsFolder(source.AgentTranscriptsFolder); folder != "" {
 			conversation.AgentTranscriptsFolder = folder

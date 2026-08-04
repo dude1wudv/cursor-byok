@@ -216,7 +216,7 @@ func (host *Host) HealthCheck(ctx context.Context) error {
 		}
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("内置后端健康检查返回状态码 %d", response.StatusCode)
 	}
@@ -831,7 +831,7 @@ func cursorControlPlaneAction(
 			return fallback(ctx)
 		}
 		if ctx == nil || ctx.Request == nil || ctx.Request.URL == nil {
-			return fmt.Errorf("Cursor 控制面请求上下文无效")
+			return fmt.Errorf("cursor 控制面请求上下文无效")
 		}
 		targetURL := *ctx.Request.URL
 		targetURL.Scheme = "https"

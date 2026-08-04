@@ -14,13 +14,15 @@ import (
 
 // SubagentModelOverrideSelection 表示父 run 对某类 subagent 的模型选择覆盖。
 type SubagentModelOverrideSelection struct {
-	SubagentType                  string `json:"subagent_type"`
-	Selection                     string `json:"selection"`
-	ModelID                       string `json:"model_id,omitempty"`
-	MaxMode                       bool   `json:"max_mode,omitempty"`
-	ParameterCount                int    `json:"parameter_count,omitempty"`
-	BuiltInModel                  bool   `json:"built_in_model,omitempty"`
-	IsVariantStringRepresentation bool   `json:"is_variant_string_representation,omitempty"`
+	SubagentType                  string            `json:"subagent_type"`
+	Selection                     string            `json:"selection"`
+	ModelID                       string            `json:"model_id,omitempty"`
+	ThinkingEffort                string            `json:"thinking_effort,omitempty"`
+	Parameters                    map[string]string `json:"parameters,omitempty"`
+	MaxMode                       bool              `json:"max_mode,omitempty"`
+	ParameterCount                int               `json:"parameter_count,omitempty"`
+	BuiltInModel                  bool              `json:"built_in_model,omitempty"`
+	IsVariantStringRepresentation bool              `json:"is_variant_string_representation,omitempty"`
 }
 
 // LookupSubagentModelOverride 按 Task subagent_type 查找运行期模型覆盖。

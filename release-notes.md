@@ -1,28 +1,37 @@
-# Cursor助手 v0.0.80
+# Cursor助手 v0.0.81
 
-本版本以最新上游 `leookun/cursor-byok@639c452`（v0.0.44）为干净基线重新实现，不继承旧 fork 的 Shell、协议、缓存或子代理生命周期补丁。
+本版本聚焦 Cursor 子代理调度、执行权限契约和模型思考强度传递。
 
-## 可选子代理与角色路由
+## 子代理树级调度
 
-- 模型渠道可选择是否作为子代理模型，并配置 `simple_explore`、`medium_explore`、`complex_debug` 三种任务角色。
-- Task 显式指定模型时优先使用该渠道；省略时按配置顺序选择第一个匹配角色的渠道。
-- 子代理权限继续使用上游原生 `readonly` 语义，没有引入额外权限策略。
-- 同一父任务的单个 provider pass 最多派发 4 个直接子代理，超过上限会在创建子代理前明确拒绝。
+- 根任务派发的第一级子代理硬上限为 4，提示词默认建议只拆分 2 个互不重叠方向。
+- 第一级子代理最多继续派发 2 个第二级子代理；第二级子代理禁止继续派发第三级任务。
+- 调度预算按子代理树深度持久化，不再因 provider pass 切换而重置。
+- Task `CallID` 重试、回放或重复 provider 事件保持幂等，不重复派发或计数。
+- 拒绝原因明确区分 `subagent_depth_limit` 与 `subagent_level_budget_exceeded`。
 
-## 自定义 OpenAI endpoint path
+## 模型与思考强度
 
-- 自定义端点模式新增独立 `openAIEndpointPath`，可配置以 `/responses` 或 `/chat/completions` 结尾的相对路径。
-- 路径参与渠道身份计算，并保留旧渠道 ID 的解析兼容。
-- 拒绝绝对 URL、query、fragment 和目录穿越路径。
+- 删除 `fast` 子代理模型选项及其默认模型别名语义。
+- 完整保留 `RequestedModel` 的 `parameters`、`max_mode`、内建模型和 variant 标志。
+- 统一归一化 `thinking_effort`、`reasoning_effort`、`thinking_intensity` 与模型 variant suffix。
+- 显式 `max` 和 `max_mode=true` 会传入实际 `SubagentArgs.model_id` 变体，不再被父任务默认 `high` 覆盖。
+- runtime debug 记录请求、解析、实际应用的模型和思考强度。
 
-## 完整去广告
+## 文件修改权限契约
 
-- 删除首页广告组件、广告事件、广告 bridge、下载与缓存服务、`/ad` 路由及后台刷新。
-- 保留首页使用统计、作者入口、Cursor 控制面账号和更新功能。
+- Task schema 和运行时 prompt 均明确注入 `readonly=true/false` 的执行边界。
+- 可写任务要求在同一次子代理任务中完成修改与验证，而不是先只读调查再重复派发。
+- 子代理结果要求报告是否修改文件、修改路径、验证命令和结果。
+
+## 模型目录
+
+- available-model 目录正确暴露思考强度 variants、默认值和 `max` 支持。
+- 子代理渠道 tooltip 补充角色对应关系和默认思考强度。
 
 ## 发布资产
 
-- `cursor-byok-0.0.80-windows-amd64.zip`
-- `cursor-byok-0.0.80-macos-arm64.tar.gz`
-- `cursor-byok-0.0.80-macos-amd64.tar.gz`
+- `cursor-byok-0.0.81-windows-amd64.zip`
+- `cursor-byok-0.0.81-macos-arm64.tar.gz`
+- `cursor-byok-0.0.81-macos-amd64.tar.gz`
 - `update.json`

@@ -68,7 +68,7 @@ func (server *Server) handleEvents(writer http.ResponseWriter, request *http.Req
 	writer.Header().Set("Connection", "keep-alive")
 	updates, unsubscribe := server.store.subscribe()
 	defer unsubscribe()
-	fmt.Fprint(writer, "event: ready\ndata: {}\n\n")
+	_, _ = fmt.Fprint(writer, "event: ready\ndata: {}\n\n")
 	flusher.Flush()
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
@@ -81,10 +81,10 @@ func (server *Server) handleEvents(writer http.ResponseWriter, request *http.Req
 				return
 			}
 			payload, _ := json.Marshal(event)
-			fmt.Fprintf(writer, "event: update\ndata: %s\n\n", payload)
+			_, _ = fmt.Fprintf(writer, "event: update\ndata: %s\n\n", payload)
 			flusher.Flush()
 		case <-heartbeat.C:
-			fmt.Fprint(writer, ": heartbeat\n\n")
+			_, _ = fmt.Fprint(writer, ": heartbeat\n\n")
 			flusher.Flush()
 		}
 	}

@@ -78,7 +78,7 @@ func syncCursorAuthStateDB(path string, values map[string]string) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
@@ -111,7 +111,7 @@ func syncCursorAuthStateDB(path string, values map[string]string) error {
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	for _, key := range keys {
 		if _, err := stmt.ExecContext(ctx, key, values[key]); err != nil {

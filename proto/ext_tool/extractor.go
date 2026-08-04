@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1084,7 +1085,9 @@ func extractEnumValues(text string, start int) []EnumValue {
 }
 
 func generateProtos(messages []Message, enums []Enum, services []Service, resolver *TypeResolver, outputDir string) {
-	os.MkdirAll(outputDir, 0755)
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		log.Fatalf("create output directory: %v", err)
+	}
 
 	// Group by package
 	packages := make(map[string]struct {
@@ -1489,7 +1492,9 @@ func generateProtoFile(pkgName string, messages []Message, enums []Enum, service
 	fileName := strings.ReplaceAll(pkgName, ".", "_") + ".proto"
 	filePath := filepath.Join(outputDir, fileName)
 
-	os.WriteFile(filePath, []byte(sb.String()), 0644)
+	if err := os.WriteFile(filePath, []byte(sb.String()), 0o644); err != nil {
+		log.Printf("write nested proto file %s failed: %v", filePath, err)
+	}
 	fmt.Printf("Generated: %s (%d messages, %d enums, %d services)\n", filePath, len(messages), len(enums), len(services))
 }
 

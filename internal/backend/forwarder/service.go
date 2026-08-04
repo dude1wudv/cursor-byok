@@ -71,10 +71,23 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 				parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "empty_model_id"})
 				continue
 			}
+			parameters := make(map[string]string, len(model.GetParameters()))
+			for _, parameter := range model.GetParameters() {
+				if parameter == nil || strings.TrimSpace(parameter.GetId()) == "" {
+					continue
+				}
+				parameters[strings.TrimSpace(parameter.GetId())] = strings.TrimSpace(parameter.GetValue())
+			}
+			effort := extractRuntimeThinkingEffortFromRequestedModel(model)
+			if model.GetMaxMode() && effort == "" {
+				effort = "max"
+			}
 			parsed.Overrides[subagentType] = runtimecore.SubagentModelOverrideSelection{
 				SubagentType:                  subagentType,
 				Selection:                     "model",
 				ModelID:                       modelID,
+				ThinkingEffort:                effort,
+				Parameters:                    parameters,
 				MaxMode:                       model.GetMaxMode(),
 				ParameterCount:                len(model.GetParameters()),
 				BuiltInModel:                  model.GetBuiltInModel(),
@@ -110,18 +123,30 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 	}
 	subagentType := readStringMapValue(args, "subagent_type", "subagentType")
 	taskRequestedModelID := readStringMapValue(args, "model", "model_id", "modelId")
+	taskRequestedThinkingEffort := normalizeRuntimeThinkingEffort(readStringMapValue(args, "thinking_effort", "reasoning_effort", "thinking_intensity"))
+	_, taskVariantEffort := splitRuntimeThinkingEffortVariantString(taskRequestedModelID)
+	if taskRequestedThinkingEffort == "" {
+		taskRequestedThinkingEffort = taskVariantEffort
+	}
 	effectiveModelID := taskRequestedModelID
+	effectiveThinkingEffort := taskRequestedThinkingEffort
 	selection := "none"
 	disabled := false
 	overrideHit := false
 	matchedSubagentType := ""
-	if override, matched, ok := runtimecore.LookupSubagentModelOverride(overrides, subagentType); ok {
+	modelSource := readStringMapValue(args, "_model_source")
+	if override, matched, ok := runtimecore.LookupSubagentModelOverride(overrides, subagentType); ok && modelSource != "explicit" {
 		overrideHit = true
 		matchedSubagentType = matched
 		selection = strings.TrimSpace(override.Selection)
 		switch selection {
 		case "model":
 			effectiveModelID = strings.TrimSpace(override.ModelID)
+			if strings.TrimSpace(override.ThinkingEffort) != "" {
+				effectiveThinkingEffort = strings.TrimSpace(override.ThinkingEffort)
+			} else if override.MaxMode {
+				effectiveThinkingEffort = "max"
+			}
 		case "inherit":
 			effectiveModelID = strings.TrimSpace(parentModelID)
 		case "disabled":
@@ -132,15 +157,31 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 	if effectiveModelID == "" && !disabled {
 		effectiveModelID = strings.TrimSpace(parentModelID)
 	}
+	appliedModelID := strings.TrimSpace(effectiveModelID)
+	if effectiveThinkingEffort != "" {
+		base, existingEffort := splitRuntimeThinkingEffortVariantString(appliedModelID)
+		if existingEffort == "" && base == "" {
+			base = appliedModelID
+		}
+		if existingEffort == "" && base != "" {
+			appliedModelID = base + ":" + effectiveThinkingEffort
+		}
+	}
 	payload := map[string]any{
-		"tool_call_id":            strings.TrimSpace(invocation.CallID),
-		"subagent_type":           subagentType,
-		"override_hit":            overrideHit,
-		"selection":               selection,
-		"task_requested_model_id": taskRequestedModelID,
-		"parent_model_id":         strings.TrimSpace(parentModelID),
-		"effective_model_id":      strings.TrimSpace(effectiveModelID),
-		"disabled":                disabled,
+		"tool_call_id":              strings.TrimSpace(invocation.CallID),
+		"subagent_type":             subagentType,
+		"override_hit":              overrideHit,
+		"selection":                 selection,
+		"task_requested_model_id":   taskRequestedModelID,
+		"parent_model_id":           strings.TrimSpace(parentModelID),
+		"requested_model":           taskRequestedModelID,
+		"requested_thinking_effort": taskRequestedThinkingEffort,
+		"parsed_model":              strings.TrimSpace(effectiveModelID),
+		"applied_model":             appliedModelID,
+		"applied_thinking_effort":   strings.TrimSpace(effectiveThinkingEffort),
+		"fallback_reason":           "",
+		"effective_model_id":        strings.TrimSpace(effectiveModelID),
+		"disabled":                  disabled,
 	}
 	if matchedSubagentType != "" {
 		payload["matched_subagent_type"] = matchedSubagentType
@@ -157,6 +198,9 @@ func rewriteTaskInvocationModelForDisplay(invocation runtimecore.ToolInvocation,
 		return invocation
 	}
 	subagentType := readStringMapValue(args, "subagent_type", "subagentType")
+	if readStringMapValue(args, "_model_source") == "explicit" {
+		return invocation
+	}
 	override, _, ok := runtimecore.LookupSubagentModelOverride(overrides, subagentType)
 	if !ok {
 		return invocation
@@ -204,6 +248,13 @@ func cloneSubagentModelOverrides(overrides map[string]runtimecore.SubagentModelO
 	}
 	cloned := make(map[string]runtimecore.SubagentModelOverrideSelection, len(overrides))
 	for key, value := range overrides {
+		if len(value.Parameters) > 0 {
+			parameters := make(map[string]string, len(value.Parameters))
+			for parameterID, parameterValue := range value.Parameters {
+				parameters[parameterID] = parameterValue
+			}
+			value.Parameters = parameters
+		}
 		cloned[strings.TrimSpace(key)] = value
 	}
 	return cloned
@@ -230,6 +281,12 @@ func subagentModelOverrideSummaries(overrides map[string]runtimecore.SubagentMod
 		}
 		if selection.MaxMode {
 			summary["max_mode"] = true
+		}
+		if strings.TrimSpace(selection.ThinkingEffort) != "" {
+			summary["thinking_effort"] = strings.TrimSpace(selection.ThinkingEffort)
+		}
+		if len(selection.Parameters) > 0 {
+			summary["parameters"] = selection.Parameters
 		}
 		if selection.ParameterCount > 0 {
 			summary["parameter_count"] = selection.ParameterCount
@@ -765,6 +822,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	clearPendingProviderCompletion(stream)
 	stream.mu.Lock()
 	stream.ThinkingEffort = strings.TrimSpace(intent.ThinkingEffort)
+	stream.SubagentDepth = conversation.SubagentDepth
 	stream.SubagentModelOverrides = cloneSubagentModelOverrides(intent.SubagentModelOverrides)
 	stream.ManualCompaction = intent.ManualCompaction
 	stream.PendingProviderAction = providerActionNone
@@ -1665,7 +1723,15 @@ func (service *Service) resolveTaskModel(invocation runtimecore.ToolInvocation) 
 		return invocation, fmt.Errorf("decode Task args failed: %w", err)
 	}
 	requested := readStringMapValue(args, "model", "model_id", "modelId")
+	requestedBase, requestedEffort := splitRuntimeThinkingEffortVariantString(requested)
+	if requestedBase == "" {
+		requestedBase = requested
+	}
 	role := readStringMapValue(args, "task_role", "taskRole")
+	effort := normalizeRuntimeThinkingEffort(readStringMapValue(args, "thinking_effort", "reasoning_effort", "thinking_intensity"))
+	if effort == "" {
+		effort = requestedEffort
+	}
 	if role == "" {
 		return invocation, fmt.Errorf("task_role is required")
 	}
@@ -1676,8 +1742,8 @@ func (service *Service) resolveTaskModel(invocation runtimecore.ToolInvocation) 
 	models := directory.EnabledSubagentModels(context.Background())
 	selected := ""
 	for _, model := range models {
-		if requested != "" && strings.TrimSpace(model.ID) == requested {
-			selected = requested
+		if requested != "" && strings.TrimSpace(model.ID) == requestedBase {
+			selected = requestedBase
 			break
 		}
 		if requested == "" {
@@ -1698,7 +1764,15 @@ func (service *Service) resolveTaskModel(invocation runtimecore.ToolInvocation) 
 		}
 		return invocation, nil
 	}
+	if effort != "" {
+		selected += ":" + effort
+	}
 	args["model"] = selected
+	if requested != "" {
+		args["_model_source"] = "explicit"
+	} else {
+		args["_model_source"] = "role"
+	}
 	rewritten, err := json.Marshal(args)
 	if err != nil {
 		return invocation, err
@@ -1707,38 +1781,58 @@ func (service *Service) resolveTaskModel(invocation runtimecore.ToolInvocation) 
 	return invocation, nil
 }
 
-func reserveTaskDispatch(stream *ActiveStream, invocation runtimecore.ToolInvocation) error {
+func reserveTaskDispatch(stream *ActiveStream, invocation runtimecore.ToolInvocation) (bool, error) {
 	if strings.TrimSpace(invocation.ToolName) != "Task" {
-		return nil
+		return true, nil
 	}
 	callID := strings.TrimSpace(invocation.CallID)
 	if callID == "" {
-		return fmt.Errorf("Task call ID is required for dispatch limiting")
+		return false, fmt.Errorf("subagent_depth_limit: Task call ID is required")
 	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	if stream.TaskDispatchReservations == nil {
-		stream.TaskDispatchReservations = make(map[int]map[string]struct{})
+	if stream.TaskDispatchDepthReservations == nil {
+		stream.TaskDispatchDepthReservations = make(map[int]map[string]struct{})
 	}
-	pass := stream.ProviderPassCount
-	reservations := stream.TaskDispatchReservations[pass]
+	if stream.TaskDispatchCallIDs == nil {
+		stream.TaskDispatchCallIDs = make(map[string]struct{})
+	}
+	if _, exists := stream.TaskDispatchCallIDs[callID]; exists {
+		return false, nil
+	}
+	level := stream.SubagentDepth + 1
+	limit := 0
+	switch level {
+	case 1:
+		limit = 4
+	case 2:
+		limit = 2
+	default:
+		return false, fmt.Errorf("subagent_depth_limit: subagent level %d cannot dispatch Task", level)
+	}
+	reservations := stream.TaskDispatchDepthReservations[level]
 	if reservations == nil {
 		reservations = make(map[string]struct{})
-		stream.TaskDispatchReservations[pass] = reservations
+		stream.TaskDispatchDepthReservations[level] = reservations
 	}
-	if _, exists := reservations[callID]; exists {
-		return nil
-	}
-	if len(reservations) >= 4 {
-		return fmt.Errorf("at most 4 direct subagents may be dispatched in one provider pass")
+	if len(reservations) >= limit {
+		return false, fmt.Errorf("subagent_level_budget_exceeded: subagent level %d allows at most %d Task dispatches", level, limit)
 	}
 	reservations[callID] = struct{}{}
-	return nil
+	stream.TaskDispatchCallIDs[callID] = struct{}{}
+	return true, nil
 }
 
 // handleToolInvocation 把模型产生的工具意图转成 exec/interaction 请求并下发给客户端。
 func (service *Service) handleToolInvocation(stream *ActiveStream, invocation runtimecore.ToolInvocation) error {
-	if err := providerLoopInterruptErr(nil, stream, invocation.ModelCallID); err != nil {
+	reservedTaskCallID := ""
+	taskDispatchSucceeded := false
+	defer func() {
+		if reservedTaskCallID != "" && !taskDispatchSucceeded {
+			releaseTaskDispatchSlot(stream, reservedTaskCallID)
+		}
+	}()
+	if err := providerLoopInterruptErr(context.Background(), stream, invocation.ModelCallID); err != nil {
 		return err
 	}
 	invocation = service.rewriteDirectMCPToolInvocation(stream, invocation)
@@ -1769,9 +1863,25 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		if err != nil {
 			return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
 		}
-		if err := reserveTaskDispatch(stream, invocation); err != nil {
-			return service.completePreDispatchToolError(stream, invocation, nil, false, false, err)
+		shouldDispatch, reserveErr := reserveTaskDispatch(stream, invocation)
+		if reserveErr != nil {
+			service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "subagent_dispatch_rejected", map[string]any{
+				"tool_call_id":   strings.TrimSpace(invocation.CallID),
+				"subagent_depth": stream.SubagentDepth,
+				"reason":         reserveErr.Error(),
+			})
+			return service.completePreDispatchToolError(stream, invocation, nil, false, false, reserveErr)
 		}
+		if !shouldDispatch {
+			duplicateErr := fmt.Errorf("duplicate_task_dispatch: Task call ID %q was already dispatched", strings.TrimSpace(invocation.CallID))
+			service.debug.LogRuntime(context.Background(), stream.RequestID, stream.ConversationID, "subagent_dispatch_rejected", map[string]any{
+				"tool_call_id":   strings.TrimSpace(invocation.CallID),
+				"subagent_depth": stream.SubagentDepth,
+				"reason":         "duplicate_task_dispatch",
+			})
+			return service.completePreDispatchToolError(stream, invocation, nil, false, false, duplicateErr)
+		}
+		reservedTaskCallID = strings.TrimSpace(invocation.CallID)
 	}
 	if isPatchEditToolName(trimmedToolName) {
 		if err := service.handlePatchEditToolInvocation(stream, invocation); err != nil {
@@ -1811,7 +1921,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	startedToolCall := buildStartedToolCall(invocation)
 	startedEmitted := suppressStartedToolCall
 	ensureLoopActive := func() error {
-		return providerLoopInterruptErr(nil, stream, invocation.ModelCallID)
+		return providerLoopInterruptErr(context.Background(), stream, invocation.ModelCallID)
 	}
 	if startedToolCall != nil {
 		if err := ensureLoopActive(); err != nil {
@@ -1858,6 +1968,8 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		serverMessage, pendingExec, err := service.execBridge.OpenExec(execbridge.OpenExecContext{
 			ConversationID:         stream.ConversationID,
 			ModelID:                stream.ModelID,
+			ThinkingEffort:         stream.ThinkingEffort,
+			SubagentDepth:          stream.SubagentDepth,
 			SubagentModelOverrides: subagentOverrides,
 		}, invocation)
 		if err != nil {
@@ -1891,6 +2003,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 				removePendingExec()
 				return err
 			}
+			taskDispatchSucceeded = true
 			if err := ensureLoopActive(); err != nil {
 				removePendingExec()
 				return err
@@ -1929,6 +2042,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			removePendingExec()
 			return err
 		}
+		taskDispatchSucceeded = true
 		service.recordExecDispatchMetadata(stream, pendingExec, false, startedEmitted, "started_then_checkpoint_then_exec")
 		return nil
 	}
@@ -2897,10 +3011,10 @@ func extractRequestedModelID(message *agentv1.AgentClientMessage) string {
 		return ""
 	}
 	if runRequest := message.GetRunRequest(); runRequest != nil {
-		return firstNonEmpty(extractRequestedModelIDFromRequestedModel(runRequest.GetRequestedModel()), runRequest.GetModelDetails().GetModelId())
+		return firstNonEmpty(extractRequestedModelIDFromRequestedModel(runRequest.GetRequestedModel()), normalizeRequestedModelID(runRequest.GetModelDetails().GetModelId()))
 	}
 	if prewarm := message.GetPrewarmRequest(); prewarm != nil {
-		return firstNonEmpty(extractRequestedModelIDFromRequestedModel(prewarm.GetRequestedModel()), prewarm.GetModelDetails().GetModelId())
+		return firstNonEmpty(extractRequestedModelIDFromRequestedModel(prewarm.GetRequestedModel()), normalizeRequestedModelID(prewarm.GetModelDetails().GetModelId()))
 	}
 	return ""
 }
@@ -2909,11 +3023,15 @@ func extractRequestedModelIDFromRequestedModel(model *agentv1.RequestedModel) st
 	if model == nil {
 		return ""
 	}
-	if model.GetIsVariantStringRepresentation() {
-		modelID, _ := splitRuntimeThinkingEffortVariantString(model.GetModelId())
+	return normalizeRequestedModelID(model.GetModelId())
+}
+
+func normalizeRequestedModelID(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if modelID, effort := splitRuntimeThinkingEffortVariantString(trimmed); modelID != "" && effort != "" {
 		return modelID
 	}
-	return strings.TrimSpace(model.GetModelId())
+	return trimmed
 }
 
 func extractRuntimeThinkingEffort(message *agentv1.AgentClientMessage) string {
@@ -2921,10 +3039,10 @@ func extractRuntimeThinkingEffort(message *agentv1.AgentClientMessage) string {
 		return ""
 	}
 	if runRequest := message.GetRunRequest(); runRequest != nil {
-		return extractRuntimeThinkingEffortFromRequestedModel(runRequest.GetRequestedModel())
+		return firstNonEmpty(extractRuntimeThinkingEffortFromRequestedModel(runRequest.GetRequestedModel()), extractRuntimeThinkingEffortFromVariant(runRequest.GetModelDetails().GetModelId()))
 	}
 	if prewarm := message.GetPrewarmRequest(); prewarm != nil {
-		return extractRuntimeThinkingEffortFromRequestedModel(prewarm.GetRequestedModel())
+		return firstNonEmpty(extractRuntimeThinkingEffortFromRequestedModel(prewarm.GetRequestedModel()), extractRuntimeThinkingEffortFromVariant(prewarm.GetModelDetails().GetModelId()))
 	}
 	return ""
 }
@@ -2941,13 +3059,20 @@ func extractRuntimeThinkingEffortFromRequestedModel(model *agentv1.RequestedMode
 			return effort
 		}
 	}
-	if model.GetIsVariantStringRepresentation() {
-		if _, effort := splitRuntimeThinkingEffortVariantString(model.GetModelId()); effort != "" {
-			return effort
-		}
-		return normalizeRuntimeThinkingEffort(model.GetModelId())
+	if effort := extractRuntimeThinkingEffortFromVariant(model.GetModelId()); effort != "" {
+		return effort
+	}
+	if model.GetMaxMode() {
+		return "max"
 	}
 	return ""
+}
+
+func extractRuntimeThinkingEffortFromVariant(raw string) string {
+	if _, effort := splitRuntimeThinkingEffortVariantString(raw); effort != "" {
+		return effort
+	}
+	return normalizeRuntimeThinkingEffort(raw)
 }
 
 func isRuntimeThinkingEffortParameterID(raw string) bool {
@@ -3000,33 +3125,39 @@ func splitRuntimeThinkingEffortVariantString(raw string) (string, string) {
 }
 
 func (service *Service) resolveRequestedModelName(message *agentv1.AgentClientMessage, modelID string) string {
+	displayName := ""
+	displayModelID := ""
+	modelID = normalizeRequestedModelID(modelID)
 	if message != nil {
 		if runRequest := message.GetRunRequest(); runRequest != nil {
-			if name := firstNonEmpty(
-				runRequest.GetModelDetails().GetDisplayName(),
-				runRequest.GetModelDetails().GetDisplayModelId(),
-			); name != "" {
-				return name
-			}
+			displayName = validRequestedModelDisplayName(runRequest.GetModelDetails().GetDisplayName(), modelID)
+			displayModelID = normalizeRequestedModelID(runRequest.GetModelDetails().GetDisplayModelId())
 		}
 		if prewarm := message.GetPrewarmRequest(); prewarm != nil {
-			if name := firstNonEmpty(
-				prewarm.GetModelDetails().GetDisplayName(),
-				prewarm.GetModelDetails().GetDisplayModelId(),
-			); name != "" {
-				return name
-			}
+			displayName = validRequestedModelDisplayName(prewarm.GetModelDetails().GetDisplayName(), modelID)
+			displayModelID = normalizeRequestedModelID(prewarm.GetModelDetails().GetDisplayModelId())
 		}
 	}
 	if service != nil && service.resolver != nil {
-		channel, err := service.resolver.SelectChannelForModel(context.Background(), strings.TrimSpace(modelID))
+		channel, err := service.resolver.SelectChannelForModel(context.Background(), modelID)
 		if err == nil && channel != nil {
 			if name := firstNonEmpty(channel.Name, channel.Model); name != "" {
 				return name
 			}
 		}
 	}
-	return strings.TrimSpace(modelID)
+	return firstNonEmpty(displayName, displayModelID, modelID)
+}
+
+func validRequestedModelDisplayName(raw string, modelID string) string {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return ""
+	}
+	if normalized := normalizeRequestedModelID(name); normalized != "" && normalized == normalizeRequestedModelID(modelID) {
+		return ""
+	}
+	return name
 }
 
 func (service *Service) resolveContextWindowTokens(modelID string) uint32 {
@@ -3334,6 +3465,25 @@ func pendingAssistantToolShape(pending runtimecore.PendingExec) (string, []byte,
 	}
 }
 
+func releaseTaskDispatchSlot(stream *ActiveStream, callID string) {
+	if stream == nil {
+		return
+	}
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return
+	}
+	stream.mu.Lock()
+	for level, reservations := range stream.TaskDispatchDepthReservations {
+		delete(reservations, callID)
+		if len(reservations) == 0 {
+			delete(stream.TaskDispatchDepthReservations, level)
+		}
+	}
+	stream.UpdatedAt = time.Now().UTC()
+	stream.mu.Unlock()
+}
+
 // markExecCompleted 保留一个短时 tombstone，避免迟到的 transport-level control 被误判为协议错误。
 func markExecCompleted(stream *ActiveStream, pending runtimecore.PendingExec) {
 	if stream == nil {
@@ -3344,6 +3494,15 @@ func markExecCompleted(stream *ActiveStream, pending runtimecore.PendingExec) {
 
 	stream.mu.Lock()
 	delete(stream.PendingExecs, pending.ExecID)
+	if strings.TrimSpace(pending.ExecKind) == "subagent" {
+		callID := strings.TrimSpace(pending.ToolCallID)
+		for level, reservations := range stream.TaskDispatchDepthReservations {
+			delete(reservations, callID)
+			if len(reservations) == 0 {
+				delete(stream.TaskDispatchDepthReservations, level)
+			}
+		}
+	}
 	if pending.MessageID != 0 {
 		if stream.RecentCompletedExecs == nil {
 			stream.RecentCompletedExecs = make(map[uint32]time.Time)

@@ -3,6 +3,7 @@ package upstream
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"cursor/gen/agentv1"
@@ -71,5 +72,45 @@ func TestBuildBootstrapStatsigConfigJSONDisablesAlwaysLocalDecompositionGate(t *
 	}
 	if ruleID, _ := gate["rule_id"].(string); ruleID != "local_disabled" {
 		t.Fatalf("unexpected rule_id: %q", ruleID)
+	}
+}
+
+func TestAvailableModelEntriesExposeMaxVariantAndSubagentRoles(t *testing.T) {
+	entries := buildAvailableModelEntries([]legacyruntime.ModelAdapterConfig{{
+		ID: "channel-a", ModelID: "model-a", DisplayName: "Model A", Type: "openai",
+		ReasoningEffort: "high", SubagentEnabled: true, SubagentRoles: []string{"medium_explore", "complex_debug"},
+	}})
+	if len(entries) != 1 {
+		t.Fatalf("entries=%d", len(entries))
+	}
+	entry := entries[0]
+	if entry["supportsMaxMode"] != true {
+		t.Fatalf("supportsMaxMode=%v", entry["supportsMaxMode"])
+	}
+	variants, ok := entry["variants"].([]map[string]any)
+	if !ok {
+		t.Fatalf("variants type=%T", entry["variants"])
+	}
+	wantEfforts := map[string]bool{"low": false, "medium": false, "high": false, "xhigh": false, "max": false}
+	for _, variant := range variants {
+		representation, _ := variant["variantStringRepresentation"].(string)
+		for effort := range wantEfforts {
+			if representation == "channel-a:"+effort {
+				wantEfforts[effort] = true
+			}
+		}
+	}
+	foundMax := wantEfforts["max"]
+	for effort, found := range wantEfforts {
+		if !found {
+			t.Fatalf("%s variant missing: %#v", effort, variants)
+		}
+	}
+	if !foundMax {
+		t.Fatal("max variant missing")
+	}
+	tooltip := entry["tooltipData"].(map[string]any)["markdownContent"].(string)
+	if !strings.Contains(tooltip, "medium_explore") || !strings.Contains(tooltip, "Default thinking: High") {
+		t.Fatalf("tooltip=%q", tooltip)
 	}
 }

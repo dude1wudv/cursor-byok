@@ -4,7 +4,7 @@ import "strings"
 
 func IsMetaModelAlias(modelRef string) bool {
 	switch strings.ToLower(strings.TrimSpace(modelRef)) {
-	case "fast", "default", "auto":
+	case "default", "auto":
 		return true
 	default:
 		return false

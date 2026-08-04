@@ -170,9 +170,7 @@ func docsIndexChunks(record DocsIndexRecord, topK uint32) []*aiserverv1.Document
 	if content == "" {
 		return nil
 	}
-	if topK == 0 {
-		topK = 1
-	}
+	_ = topK
 	return []*aiserverv1.DocumentationChunk{
 		{
 			DocName:            record.Title,

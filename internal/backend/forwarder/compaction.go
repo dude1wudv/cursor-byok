@@ -1903,10 +1903,7 @@ func extractCompactFieldJSON(message protoreflect.Message, fieldName string) (st
 	if !child.IsValid() {
 		return "", false
 	}
-	item, ok := child.Interface().(proto.Message)
-	if !ok {
-		return "", false
-	}
+	item := child.Interface()
 	payload, err := protojson.MarshalOptions{EmitUnpopulated: false}.Marshal(item)
 	if err != nil {
 		return "", false

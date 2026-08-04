@@ -690,6 +690,14 @@ func buildAvailableModelEntries(adapters []legacyruntime.ModelAdapterConfig) []m
 			modelDisplayName = modelID
 		}
 		defaultThinkingEffort := defaultThinkingEffortForAdapter(adapter)
+		supportsMaxMode := adapterSupportsMaxThinking(adapter.Type)
+		rolesText := strings.Join(adapter.SubagentRoles, ", ")
+		if adapter.SubagentEnabled && rolesText != "" {
+			if tooltipData != "" {
+				tooltipData += "\n\n"
+			}
+			tooltipData += "Subagent roles: " + rolesText + ". Default thinking: " + thinkingEffortDisplayName(defaultThinkingEffort) + "."
+		}
 		output = append(output, map[string]any{
 			"clientDisplayName":                  displayName,
 			"defaultOn":                          true,
@@ -702,7 +710,7 @@ func buildAvailableModelEntries(adapters []legacyruntime.ModelAdapterConfig) []m
 			"serverModelName":                    channelID,
 			"supportsAgent":                      true,
 			"supportsImages":                     true,
-			"supportsMaxMode":                    false,
+			"supportsMaxMode":                    supportsMaxMode,
 			"supportsNonMaxMode":                 true,
 			"supportsPlanMode":                   true,
 			"supportsSandboxing":                 true,
@@ -774,7 +782,8 @@ func buildThinkingEffortVariants(adapterType string, channelID string, modelDisp
 			"displayName":              variantDisplayName,
 			"displayNameOutsidePicker": variantDisplayName,
 			"isDefaultNonMaxConfig":    value == defaultThinkingEffort,
-			"isMaxMode":                false,
+			"isMaxMode":                value == "max",
+			"isDefaultMaxConfig":       value == "max" && value == defaultThinkingEffort,
 			"parameterValues":          []map[string]any{{"id": modelRuntimeThinkingEffortParameterID, "value": value}},
 		}
 		if normalizeAvailableModelThinkingEffort(value, true, "") != "disabled" {
@@ -802,6 +811,11 @@ func buildThinkingEffortVariantDisplayName(modelDisplayName string, effortValue 
 		return `<span class="ui-model-picker__item-tagline" style="color: var(--cursor-text-secondary); white-space: nowrap;">:icon-brain: ` + effortDisplayName + `</span>`
 	}
 	return modelDisplayName + ` <span class="ui-model-picker__item-tagline" style="color: var(--cursor-text-secondary); white-space: nowrap;">:icon-brain: ` + effortDisplayName + `</span>`
+}
+
+func adapterSupportsMaxThinking(adapterType string) bool {
+	adapterType = strings.ToLower(strings.TrimSpace(adapterType))
+	return adapterType == "openai" || adapterType == "anthropic"
 }
 
 func thinkingEffortValuesForAdapter(adapterType string) []string {

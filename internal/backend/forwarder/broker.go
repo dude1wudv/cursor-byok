@@ -76,6 +76,12 @@ func (broker *StreamBroker) OpenStream(requestID string, conversationID string, 
 		if existing.BackgroundShellActions == nil {
 			existing.BackgroundShellActions = make(map[string]time.Time)
 		}
+		if existing.TaskDispatchDepthReservations == nil {
+			existing.TaskDispatchDepthReservations = make(map[int]map[string]struct{})
+		}
+		if existing.TaskDispatchCallIDs == nil {
+			existing.TaskDispatchCallIDs = make(map[string]struct{})
+		}
 		existing.UpdatedAt = time.Now().UTC()
 		existing.mu.Unlock()
 		return existing, nil
@@ -102,6 +108,8 @@ func (broker *StreamBroker) OpenStream(requestID string, conversationID string, 
 		BackgroundShellsByMessageID:   make(map[uint32]string),
 		BackgroundShellsByExecID:      make(map[string]string),
 		BackgroundShellActions:        make(map[string]time.Time),
+		TaskDispatchDepthReservations: make(map[int]map[string]struct{}),
+		TaskDispatchCallIDs:           make(map[string]struct{}),
 		PendingCheckpointBlobWrites:   make(map[uint32]pendingCheckpointBlobWrite),
 		PendingCheckpointBlobRequests: make(map[string]uint32),
 		CreatedAt:                     now,
@@ -169,9 +177,7 @@ func (broker *StreamBroker) Unsubscribe(requestID string, subscriberID string) i
 	}
 	remaining := 0
 	stream.mu.Lock()
-	if _, ok := stream.Subscribers[strings.TrimSpace(subscriberID)]; ok {
-		delete(stream.Subscribers, strings.TrimSpace(subscriberID))
-	}
+	delete(stream.Subscribers, strings.TrimSpace(subscriberID))
 	remaining = len(stream.Subscribers)
 	stream.mu.Unlock()
 	return remaining

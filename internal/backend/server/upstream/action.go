@@ -39,10 +39,10 @@ func AuthenticatedForwardAction(deps Dependencies, cfg CompatRouteConfig, author
 			return err
 		}
 		if reqCtx == nil || reqCtx.Request == nil {
-			return fmt.Errorf("Cursor 控制面请求上下文无效")
+			return fmt.Errorf("cursor 控制面请求上下文无效")
 		}
 		if authorizationProvider == nil {
-			return fmt.Errorf("Cursor 账号服务未初始化")
+			return fmt.Errorf("cursor 账号服务未初始化")
 		}
 		authorization, err := authorizationProvider.Authorization(reqCtx.Request.Context())
 		if err != nil {

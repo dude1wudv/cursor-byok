@@ -1,0 +1,97 @@
+package forwarder
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"cursor/gen/agentv1"
+	legacyruntime "cursor/internal/runtime"
+)
+
+func TestRequestedModelThinkingEffortPreservesParametersAndMax(t *testing.T) {
+	model := &agentv1.RequestedModel{
+		ModelId:    "model-x",
+		MaxMode:    true,
+		Parameters: []*agentv1.RequestedModel_ModelParameterValue{{Id: "thinking_effort", Value: "max"}},
+	}
+	if got := extractRuntimeThinkingEffortFromRequestedModel(model); got != "max" {
+		t.Fatalf("effort=%q, want max", got)
+	}
+	parsed := parseSubagentModelOverrides([]*agentv1.SubagentModelOverride{{
+		SubagentType: "explore",
+		Selection:    &agentv1.SubagentModelOverride_Model{Model: model},
+	}})
+	selection := parsed.Overrides["explore"]
+	if selection.ThinkingEffort != "max" || selection.Parameters["thinking_effort"] != "max" || !selection.MaxMode {
+		t.Fatalf("selection lost model parameters: %+v", selection)
+	}
+}
+
+func TestVariantThinkingEffortNormalizes(t *testing.T) {
+	model, effort := splitRuntimeThinkingEffortVariantString("model-x:maximum")
+	if model != "model-x" || effort != "max" {
+		t.Fatalf("got model=%q effort=%q", model, effort)
+	}
+}
+
+func TestSubagentDepthFromExecutionPrompt(t *testing.T) {
+	if got := subagentDepthFromPrompt("<subagent_execution_contract>\nsubagent_depth=2\n</subagent_execution_contract>"); got != 2 {
+		t.Fatalf("depth=%d, want 2", got)
+	}
+}
+
+type subagentModelTestResolver struct {
+	channel *legacyruntime.ResolvedChannel
+}
+
+func (resolver subagentModelTestResolver) SelectChannelForModel(_ context.Context, modelID string) (*legacyruntime.ResolvedChannel, error) {
+	if resolver.channel != nil && modelID == resolver.channel.ID {
+		copy := *resolver.channel
+		return &copy, nil
+	}
+	return nil, nil
+}
+
+func (subagentModelTestResolver) ProviderStreamIdleTimeout(context.Context) time.Duration {
+	return time.Minute
+}
+
+func TestRequestedModelVariantParsesWithoutVariantFlag(t *testing.T) {
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
+		t.Run(effort, func(t *testing.T) {
+			model := &agentv1.RequestedModel{ModelId: "channel-a:" + effort}
+			if got := extractRequestedModelIDFromRequestedModel(model); got != "channel-a" {
+				t.Fatalf("model id=%q, want channel-a", got)
+			}
+			if got := extractRuntimeThinkingEffortFromRequestedModel(model); got != effort {
+				t.Fatalf("thinking effort=%q, want %q", got, effort)
+			}
+		})
+	}
+}
+
+func TestLegacyModelDetailsVariantParsesWithoutRequestedModel(t *testing.T) {
+	message := &agentv1.AgentClientMessage{Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: &agentv1.AgentRunRequest{
+		ModelDetails: &agentv1.ModelDetails{ModelId: "channel-a:max"},
+	}}}
+	if got := extractRequestedModelID(message); got != "channel-a" {
+		t.Fatalf("model id=%q, want channel-a", got)
+	}
+	if got := extractRuntimeThinkingEffort(message); got != "max" {
+		t.Fatalf("thinking effort=%q, want max", got)
+	}
+}
+
+func TestResolveRequestedModelNameUsesConfiguredChannelNameForVariantDisplayID(t *testing.T) {
+	service := &Service{resolver: subagentModelTestResolver{channel: &legacyruntime.ResolvedChannel{
+		ID: "e7bbe0a5c209c3e2", Name: "gpt-5.6-luna", Model: "gpt-5.6-luna",
+	}}}
+	message := &agentv1.AgentClientMessage{Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: &agentv1.AgentRunRequest{
+		RequestedModel: &agentv1.RequestedModel{ModelId: "e7bbe0a5c209c3e2:max"},
+		ModelDetails:   &agentv1.ModelDetails{ModelId: "e7bbe0a5c209c3e2:max", DisplayModelId: "e7bbe0a5c209c3e2:max", DisplayName: "e7bbe0a5c209c3e2:max"},
+	}}}
+	if got := service.resolveRequestedModelName(message, "e7bbe0a5c209c3e2"); got != "gpt-5.6-luna" {
+		t.Fatalf("model name=%q, want gpt-5.6-luna", got)
+	}
+}

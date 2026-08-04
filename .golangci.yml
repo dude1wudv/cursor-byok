@@ -1,0 +1,14 @@
+version: "2"
+
+linters:
+  default: standard
+  disable:
+    - unused
+  settings:
+    staticcheck:
+      checks:
+        - all
+        - -QF1003
+        - -QF1012
+        - -SA1019
+        - -ST1000

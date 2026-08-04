@@ -8,8 +8,7 @@ import (
 	"runtime"
 )
 
-// Public DTOs remain in package main for Wails service compatibility.
-// ProxyState 定义了当前模块中的 ProxyState 类型。
+// ProxyState aliases the public client state DTO for Wails service compatibility.
 type ProxyState = client.ProxyState
 
 // UserConfig 定义了当前模块中的 UserConfig 类型。

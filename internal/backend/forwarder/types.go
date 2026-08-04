@@ -21,6 +21,7 @@ type ConversationFile struct {
 	RootConversationID              string                                `json:"root_conversation_id"`
 	ParentConversationID            string                                `json:"parent_conversation_id"`
 	ParentToolCallID                string                                `json:"parent_tool_call_id"`
+	SubagentDepth                   int                                   `json:"subagent_depth,omitempty"`
 	SubagentTypeName                string                                `json:"subagent_type_name,omitempty"`
 	AgentTranscriptsFolder          string                                `json:"agent_transcripts_folder,omitempty"`
 	Mode                            string                                `json:"mode"`
@@ -137,6 +138,7 @@ type ActiveStream struct {
 	Status                 StreamStatus
 	ThinkingEffort         string
 	SubagentModelOverrides map[string]runtimecore.SubagentModelOverrideSelection
+	SubagentDepth          int
 
 	CurrentModelCallID                          string
 	ProviderActive                              bool
@@ -170,25 +172,26 @@ type ActiveStream struct {
 	NextCheckpointRevision                      uint64
 	PendingCheckpoint                           *pendingCheckpointPublish
 
-	Backlog                     []StreamEvent
-	Subscribers                 map[string]*StreamSubscriber
-	CheckpointConversation      *ConversationFile
-	TaskDispatchReservations    map[int]map[string]struct{}
-	PendingExecs                map[string]runtimecore.PendingExec
-	PendingInteractions         map[string]runtimecore.PendingInteraction
-	PartialToolCallIDs          map[string]struct{}
-	PatchEditQueues             map[string][]queuedPatchEditOperation
-	MCPToolServers              map[string]string
-	WorkspacePaths              []string
-	TerminalsFolder             string
-	RequestFileContents         map[string]string
-	RecentCompletedExecs        map[uint32]time.Time
-	BackgroundShells            map[string]*BackgroundShellState
-	BackgroundShellsByMessageID map[uint32]string
-	BackgroundShellsByExecID    map[string]string
-	BackgroundShellActions      map[string]time.Time
-	TerminalCleanupTimer        *time.Timer
-	TerminalCleanupSeq          atomic.Uint64
+	Backlog                       []StreamEvent
+	Subscribers                   map[string]*StreamSubscriber
+	CheckpointConversation        *ConversationFile
+	TaskDispatchDepthReservations map[int]map[string]struct{}
+	TaskDispatchCallIDs           map[string]struct{}
+	PendingExecs                  map[string]runtimecore.PendingExec
+	PendingInteractions           map[string]runtimecore.PendingInteraction
+	PartialToolCallIDs            map[string]struct{}
+	PatchEditQueues               map[string][]queuedPatchEditOperation
+	MCPToolServers                map[string]string
+	WorkspacePaths                []string
+	TerminalsFolder               string
+	RequestFileContents           map[string]string
+	RecentCompletedExecs          map[uint32]time.Time
+	BackgroundShells              map[string]*BackgroundShellState
+	BackgroundShellsByMessageID   map[uint32]string
+	BackgroundShellsByExecID      map[string]string
+	BackgroundShellActions        map[string]time.Time
+	TerminalCleanupTimer          *time.Timer
+	TerminalCleanupSeq            atomic.Uint64
 
 	CreatedAt time.Time
 	UpdatedAt time.Time

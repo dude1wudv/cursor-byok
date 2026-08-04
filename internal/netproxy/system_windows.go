@@ -18,7 +18,7 @@ func loadSystemProxyConfig() systemProxyConfig {
 			LoadErrMessage: sanitizeLoadError(err),
 		}
 	}
-	defer key.Close()
+	defer func() { _ = key.Close() }()
 
 	var cfg systemProxyConfig
 	cfg.Source = "windows"

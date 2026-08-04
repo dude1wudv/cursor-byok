@@ -174,9 +174,11 @@ func newPromptContextReminder(source string, content string) PromptContextMessag
 
 func subagentContractText() string {
 	return strings.Join([]string{
-		"The turn that contains this reminder runs inside a subagent child conversation. Work as an investigator for the parent agent, not as the final user-facing assistant.",
-		"Return a short textual result: lead with the conclusion, keep only the key evidence, and do not produce a long response.",
-		"Use the available agent tools when they materially improve correctness or efficiency. Do not ask the user questions. If required information is missing, report the gap to the parent agent instead of asking the user directly.",
+		"The turn that contains this reminder runs inside a subagent child conversation. Work for the parent agent, not as the final user-facing assistant.",
+		"The Task readonly flag is an execution contract. readonly=true: only investigate, read, analyze, and report; do not modify files or run write commands. readonly=false: you may modify files and must complete the requested fix in this same task, then verify it; do not return suggestions instead of applying the fix.",
+		"Never repeat the same Task merely because an initial investigation made no edits. If a change is required and readonly=false, make it before finishing.",
+		"Return a concise structured result stating whether files were modified, modified paths, verification commands, and verification results. Do not ask the user questions; report missing information to the parent agent.",
+		"Subagent dispatch budget: first level max 4 (recommend 2), second level max 2, and no third-level Task dispatch.",
 	}, "\n\n")
 }
 

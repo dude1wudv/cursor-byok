@@ -3,6 +3,7 @@ package forwarder
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,6 +78,12 @@ func (service *Service) bootstrapRuntimeConversation(intent InboundIntent) (*Con
 	if strings.TrimSpace(intent.SubagentTypeName) != "" {
 		conversation.SubagentTypeName = strings.TrimSpace(intent.SubagentTypeName)
 	}
+	if depth := subagentDepthFromPrompt(userMessageText(intent.UserMessage)); depth > 0 {
+		conversation.SubagentDepth = depth
+	}
+	if conversation.SubagentDepth == 0 && strings.TrimSpace(conversation.ParentConversationID) != "" && service.store != nil {
+		conversation.SubagentDepth = service.resolveConversationSubagentDepth(conversation.ParentConversationID) + 1
+	}
 	if contextWindowTokens > 0 {
 		conversation.TokenDetailsMaxTokens = contextWindowTokens
 	} else if conversation.TokenDetailsMaxTokens == 0 {
@@ -129,6 +136,7 @@ func (service *Service) syncConversationRecord(conversationID string, conversati
 		item.RootConversationID = conversation.RootConversationID
 		item.ParentConversationID = conversation.ParentConversationID
 		item.ParentToolCallID = conversation.ParentToolCallID
+		item.SubagentDepth = conversation.SubagentDepth
 		item.SubagentTypeName = conversation.SubagentTypeName
 		item.Mode = conversation.Mode
 		item.TokenDetailsUsedTokens = conversation.TokenDetailsUsedTokens
@@ -296,4 +304,50 @@ func buildSummaryAnnotations(conversation *ConversationFile, requestID string) m
 		}
 	}
 	return nil
+}
+
+func subagentDepthFromPrompt(prompt string) int {
+	const marker = "subagent_depth="
+	index := strings.Index(prompt, marker)
+	if index < 0 {
+		return 0
+	}
+	value := prompt[index+len(marker):]
+	if end := strings.IndexAny(value, "\r\n <"); end >= 0 {
+		value = value[:end]
+	}
+	depth, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || depth < 1 || depth > 32 {
+		return 0
+	}
+	return depth
+}
+
+func (service *Service) resolveConversationSubagentDepth(conversationID string) int {
+	if service == nil || service.store == nil {
+		return 0
+	}
+	depth := 0
+	seen := map[string]struct{}{}
+	current := strings.TrimSpace(conversationID)
+	for current != "" && depth < 32 {
+		if _, ok := seen[current]; ok {
+			break
+		}
+		seen[current] = struct{}{}
+		item, err := service.store.LoadConversation(current)
+		if err != nil || item == nil {
+			break
+		}
+		if item.SubagentDepth > depth {
+			depth = item.SubagentDepth
+		}
+		parent := strings.TrimSpace(item.ParentConversationID)
+		if parent == "" {
+			break
+		}
+		depth++
+		current = parent
+	}
+	return depth
 }

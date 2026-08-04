@@ -54,7 +54,7 @@ func ForwardToUpstream(reqCtx *RequestContext, options ForwardOptions) (*Forward
 	if err != nil {
 		return nil, err
 	}
-	defer upstreamResponse.Body.Close()
+	defer func() { _ = upstreamResponse.Body.Close() }()
 
 	copyResponseHeadersToClient(reqCtx.ResponseWriter.Header(), upstreamResponse.Header)
 	reqCtx.ResponseWriter.WriteHeader(upstreamResponse.StatusCode)

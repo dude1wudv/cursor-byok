@@ -39,6 +39,8 @@ type ExecApplyResult struct {
 type OpenExecContext struct {
 	ConversationID         string
 	ModelID                string
+	ThinkingEffort         string
+	SubagentDepth          int
 	SubagentModelOverrides map[string]runtimecore.SubagentModelOverrideSelection
 }
 
@@ -364,7 +366,7 @@ func decodeReadExecArgs(raw []byte) (readExecArgs, error) {
 		Path: strings.TrimSpace(readStringArg(args, "path")),
 	}
 	if result.Path == "" {
-		return result, fmt.Errorf("Read path is required")
+		return result, fmt.Errorf("read path is required")
 	}
 	if offset, found, err := runtimecore.ReadInt32Arg(args, "offset"); err != nil {
 		return result, err
@@ -538,7 +540,7 @@ func decodeShellArgs(raw []byte) (shellResultArgs, error) {
 		WorkingDirectory: strings.TrimSpace(readStringArg(args, "working_directory", "workingDirectory")),
 	}
 	if result.Command == "" {
-		return result, fmt.Errorf("Shell command is required")
+		return result, fmt.Errorf("shell command is required")
 	}
 	if blockUntilMS, found, err := runtimecore.ReadFloat64Arg(args, "block_until_ms", "blockUntilMS"); err != nil {
 		return result, err
@@ -777,19 +779,34 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 	parentConversationID := strings.TrimSpace(openContext.ConversationID)
 	taskRequestedModelID := strings.TrimSpace(readStringArg(args, "model", "model_id", "modelId"))
 	modelID := taskRequestedModelID
-	if override, _, ok := runtimecore.LookupSubagentModelOverride(openContext.SubagentModelOverrides, subagentType); ok {
+	effort := normalizeSubagentThinkingEffort(readStringArg(args, "thinking_effort", "reasoning_effort", "thinking_intensity"))
+	if _, parsedEffort := splitSubagentModelVariant(taskRequestedModelID); effort == "" {
+		effort = parsedEffort
+	}
+	modelSource := strings.TrimSpace(readStringArg(args, "_model_source"))
+	if override, _, ok := runtimecore.LookupSubagentModelOverride(openContext.SubagentModelOverrides, subagentType); ok && modelSource != "explicit" {
 		switch strings.TrimSpace(override.Selection) {
 		case "disabled":
 			return nil, runtimecore.PendingExec{}, fmt.Errorf("subagent type %q is disabled by model override", subagentType)
 		case "model":
 			modelID = strings.TrimSpace(override.ModelID)
+			if strings.TrimSpace(override.ThinkingEffort) != "" {
+				effort = strings.TrimSpace(override.ThinkingEffort)
+			}
+			if override.MaxMode && effort == "" {
+				effort = "max"
+			}
 		case "inherit":
 			modelID = strings.TrimSpace(openContext.ModelID)
+			if effort == "" {
+				effort = strings.TrimSpace(openContext.ThinkingEffort)
+			}
 		}
 	}
 	if modelID == "" {
 		modelID = strings.TrimSpace(openContext.ModelID)
 	}
+	modelID = ensureSubagentModelVariant(modelID, effort)
 	serverMessage := &agentv1.AgentServerMessage{
 		Message: &agentv1.AgentServerMessage_ExecServerMessage{
 			ExecServerMessage: &agentv1.ExecServerMessage{
@@ -800,7 +817,7 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 						ToolCallId:           toolCall.CallID,
 						SubagentType:         subagentType,
 						ModelId:              modelID,
-						Prompt:               strings.TrimSpace(readStringArg(args, "prompt")),
+						Prompt:               buildSubagentExecutionPrompt(strings.TrimSpace(readStringArg(args, "prompt")), readonly, openContext.SubagentDepth+1),
 						Readonly:             readonly,
 						ResumeAgentId:        stringPtr(strings.TrimSpace(readStringArg(args, "resume"))),
 						ParentConversationId: stringPtrIfNonEmpty(parentConversationID),
@@ -819,6 +836,64 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 		StreamState: "opened",
 		OpenedAt:    now,
 	}, nil
+}
+
+func buildSubagentExecutionPrompt(prompt string, readonly bool, depth int) string {
+	permission := "readonly=false: file modification and write commands are allowed. If the task requests a fix, implement it and verify it in this same task; do not stop at investigation or suggestions."
+	if readonly {
+		permission = "readonly=true: investigate, read, analyze, and report only. Do not modify files or run commands that write state."
+	}
+	contract := strings.Join([]string{
+		"<subagent_execution_contract>",
+		fmt.Sprintf("subagent_depth=%d", depth),
+		permission,
+		"Do not repeat or re-dispatch this task merely because initial investigation made no edits.",
+		"At completion report: files_modified=true|false; modified_paths; verification_commands; verification_results.",
+		"Dispatch budget: first-level max 4 (2 recommended), second-level max 2, third-level Task dispatch forbidden.",
+		"</subagent_execution_contract>",
+	}, "\n")
+	if strings.TrimSpace(prompt) == "" {
+		return contract
+	}
+	return contract + "\n\n" + strings.TrimSpace(prompt)
+}
+
+func normalizeSubagentThinkingEffort(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "disabled", "low", "medium", "high", "xhigh", "max":
+		return strings.ToLower(strings.TrimSpace(raw))
+	case "maximum":
+		return "max"
+	case "very_high", "very-high", "veryhigh", "extra_high", "extra-high", "extrahigh":
+		return "xhigh"
+	default:
+		return ""
+	}
+}
+
+func splitSubagentModelVariant(raw string) (string, string) {
+	text := strings.TrimSpace(raw)
+	index := strings.LastIndex(text, ":")
+	if index <= 0 || index >= len(text)-1 {
+		return text, ""
+	}
+	effort := normalizeSubagentThinkingEffort(text[index+1:])
+	if effort == "" {
+		return text, ""
+	}
+	return strings.TrimSpace(text[:index]), effort
+}
+
+func ensureSubagentModelVariant(modelID string, effort string) string {
+	base, existing := splitSubagentModelVariant(modelID)
+	if existing != "" {
+		return strings.TrimSpace(modelID)
+	}
+	effort = normalizeSubagentThinkingEffort(effort)
+	if effort == "" || strings.TrimSpace(base) == "" {
+		return strings.TrimSpace(base)
+	}
+	return strings.TrimSpace(base) + ":" + effort
 }
 
 // openGrep 构造 Grep 对应的执行桥请求。
@@ -2866,7 +2941,7 @@ func DecodeReadToolArgs(raw []byte) (*agentv1.ReadToolArgs, error) {
 		Path: strings.TrimSpace(readStringArg(args, "path")),
 	}
 	if result.Path == "" {
-		return result, fmt.Errorf("Read path is required")
+		return result, fmt.Errorf("read path is required")
 	}
 	if offset, found, err := runtimecore.ReadInt32Arg(args, "offset"); err != nil {
 		return result, err
@@ -2898,7 +2973,7 @@ func DecodeGrepToolArgs(raw []byte, toolCallID string) (*agentv1.GrepArgs, error
 		ToolCallId: strings.TrimSpace(toolCallID),
 	}
 	if result.Pattern == "" {
-		return result, fmt.Errorf("Grep pattern is required")
+		return result, fmt.Errorf("grep pattern is required")
 	}
 	if contextBefore, found, err := runtimecore.ReadInt32Arg(args, "-B"); err != nil {
 		return result, err

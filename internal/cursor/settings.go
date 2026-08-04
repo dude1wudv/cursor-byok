@@ -198,12 +198,10 @@ func ClearUserProxySettings() error {
 		return nil
 	}
 
-	settings := make(map[string]any)
-	parsed, err := decodeCursorSettingsJSONC(data)
+	settings, err := decodeCursorSettingsJSONC(data)
 	if err != nil {
 		return fmt.Errorf("解析 Cursor 配置失败: %w", err)
 	}
-	settings = parsed
 
 	changed := false
 	for _, key := range injectedCursorSettingsKeys {

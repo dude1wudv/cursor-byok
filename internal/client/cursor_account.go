@@ -22,7 +22,7 @@ func (s *ProxyService) GetCursorAccountStatus() CursorAccountStatus {
 
 func (s *ProxyService) StartCursorAccountLogin() (CursorAccountStatus, error) {
 	if s == nil || s.cursorAccount == nil {
-		return CursorAccountStatus{State: cursoraccount.StateError}, fmt.Errorf("Cursor 账号服务未初始化")
+		return CursorAccountStatus{State: cursoraccount.StateError}, fmt.Errorf("cursor 账号服务未初始化")
 	}
 	return s.cursorAccount.StartLogin()
 }
