@@ -1,49 +1,6 @@
-# Cursor助手 v0.0.83
+# Cursor助手 v0.0.84
 
-本版本将子代理执行信息转换为可读标签，同时保留 v0.0.82 的模型名称解析和内部渠道路由。
+## Task 子代理显示修复
 
-## 可读子代理标签
-
-- Cursor 任务界面不再直接展示内部 channel ID。
-- 标签统一展示短名称、实际上游模型名和思考强度，例如 `luna · gpt-5.6-luna · medium`。
-- 展示转换仅作用于 UI 工具调用副本，底层执行继续使用稳定 adapter ID，不影响 BYOK 渠道选择。
-
-## 回归兼容
-
-- 继续兼容显式 adapter ID 调用。
-- 保留 `low`、`medium`、`high`、`xhigh`、`max` 全部子代理思考强度。
-- 保留第一级 4 个、第二级 2 个活跃槽位、终态释放槽位及第三级禁止派发规则。
-
-## 子代理树级调度
-
-- 根任务派发的第一级子代理硬上限为 4，提示词默认建议只拆分 2 个互不重叠方向。
-- 第一级子代理最多继续派发 2 个第二级子代理；第二级子代理禁止继续派发第三级任务。
-- 调度预算按子代理树深度持久化，不再因 provider pass 切换而重置。
-- Task `CallID` 重试、回放或重复 provider 事件保持幂等，不重复派发或计数。
-- 拒绝原因明确区分 `subagent_depth_limit` 与 `subagent_level_budget_exceeded`。
-
-## 模型与思考强度
-
-- 删除 `fast` 子代理模型选项及其默认模型别名语义。
-- 完整保留 `RequestedModel` 的 `parameters`、`max_mode`、内建模型和 variant 标志。
-- 统一归一化 `thinking_effort`、`reasoning_effort`、`thinking_intensity` 与模型 variant suffix。
-- 显式 `max` 和 `max_mode=true` 会传入实际 `SubagentArgs.model_id` 变体，不再被父任务默认 `high` 覆盖。
-- runtime debug 记录请求、解析、实际应用的模型和思考强度。
-
-## 文件修改权限契约
-
-- Task schema 和运行时 prompt 均明确注入 `readonly=true/false` 的执行边界。
-- 可写任务要求在同一次子代理任务中完成修改与验证，而不是先只读调查再重复派发。
-- 子代理结果要求报告是否修改文件、修改路径、验证命令和结果。
-
-## 模型目录
-
-- available-model 目录正确暴露思考强度 variants、默认值和 `max` 支持。
-- 子代理渠道 tooltip 补充角色对应关系和默认思考强度。
-
-## 发布资产
-
-- `cursor-byok-0.0.83-windows-amd64.zip`
-- `cursor-byok-0.0.83-macos-arm64.tar.gz`
-- `cursor-byok-0.0.83-macos-amd64.tar.gz`
-- `update.json`
+- 同一 Task `CallID` 的 `PartialToolCall` 与 `ToolCallStarted` UI 事件统一使用可读的渠道标签（`luna`、`sol`、`terra`），防止 Cursor UI 误显示伪重复子代理。
+- 底层 adapter ID 路由、执行模型和 `CallID` 幂等保持不变；仅 UI 发布副本改写，不代表真实执行两次。

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"cursor/gen/agentv1"
+	runtimecore "cursor/internal/backend/agent/core"
 	modeladapter "cursor/internal/backend/agent/model"
 	legacyruntime "cursor/internal/runtime"
 )
@@ -44,6 +45,7 @@ func TestSubagentDepthFromExecutionPrompt(t *testing.T) {
 
 type subagentModelTestResolver struct {
 	channel *legacyruntime.ResolvedChannel
+	models  []modeladapter.SubagentModel
 }
 
 func (resolver subagentModelTestResolver) SelectChannelForModel(_ context.Context, modelID string) (*legacyruntime.ResolvedChannel, error) {
@@ -52,6 +54,10 @@ func (resolver subagentModelTestResolver) SelectChannelForModel(_ context.Contex
 		return &copy, nil
 	}
 	return nil, nil
+}
+
+func (resolver subagentModelTestResolver) EnabledSubagentModels(context.Context) []modeladapter.SubagentModel {
+	return resolver.models
 }
 
 func (subagentModelTestResolver) ProviderStreamIdleTimeout(context.Context) time.Duration {
@@ -91,6 +97,36 @@ func TestReadableTaskModelLabelIncludesAliasModelAndEffort(t *testing.T) {
 func TestReadableTaskModelLabelPreservesUnknownModel(t *testing.T) {
 	if got := readableTaskModelLabel(nil, "unknown:max"); got != "unknown:max" {
 		t.Fatalf("label=%q", got)
+	}
+}
+
+func TestTaskPartialAndStartedEventsUseSameReadableModel(t *testing.T) {
+	modelID := "e7bbe0a5c209c3e2:medium"
+	models := []modeladapter.SubagentModel{{
+		ID: "e7bbe0a5c209c3e2", DisplayName: "gpt-5.6-luna", ModelID: "gpt-5.6-luna",
+	}}
+	service := &Service{resolver: subagentModelTestResolver{models: models}}
+	stream := &ActiveStream{SubagentModelOverrides: map[string]runtimecore.SubagentModelOverrideSelection{
+		"explore": {SubagentType: "explore", Selection: "model", ModelID: modelID},
+	}}
+	toolCall := &agentv1.ToolCall{Tool: &agentv1.ToolCall_TaskToolCall{TaskToolCall: &agentv1.TaskToolCall{
+		Args: &agentv1.TaskArgs{
+			Model: &modelID,
+			SubagentType: &agentv1.SubagentType{Type: &agentv1.SubagentType_Explore{
+				Explore: &agentv1.SubagentTypeExplore{},
+			}},
+		},
+	}}}
+	partial := service.rewriteTaskToolCallModelForDisplay(stream, toolCall)
+	started := service.rewriteTaskToolCallModelForDisplay(stream, toolCall)
+	if partial.GetTaskToolCall().GetArgs().GetModel() != "luna · gpt-5.6-luna · medium" {
+		t.Fatalf("partial model=%q", partial.GetTaskToolCall().GetArgs().GetModel())
+	}
+	if started.GetTaskToolCall().GetArgs().GetModel() != partial.GetTaskToolCall().GetArgs().GetModel() {
+		t.Fatalf("started model=%q, partial model=%q", started.GetTaskToolCall().GetArgs().GetModel(), partial.GetTaskToolCall().GetArgs().GetModel())
+	}
+	if toolCall.GetTaskToolCall().GetArgs().GetModel() != modelID {
+		t.Fatalf("execution model was mutated: %q", toolCall.GetTaskToolCall().GetArgs().GetModel())
 	}
 }
 

@@ -1940,6 +1940,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	bufferExecDispatch := isExecInvocation && shouldBufferExecDispatch(invocation.ToolName)
 	suppressStartedToolCall := shouldSuppressStartedToolCallAfterPartial(stream, trimmedToolName, invocation.CallID)
 	startedToolCall := buildStartedToolCall(invocation)
+	displayStartedToolCall := service.rewriteTaskToolCallModelForDisplay(stream, startedToolCall)
 	startedEmitted := suppressStartedToolCall
 	ensureLoopActive := func() error {
 		return providerLoopInterruptErr(context.Background(), stream, invocation.ModelCallID)
@@ -1964,7 +1965,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			return err
 		}
 		if err := service.broker.Publish(stream.RequestID, StreamEvent{
-			Message: buildToolCallStartedMessage(invocation.CallID, invocation.ModelCallID, startedToolCall),
+			Message: buildToolCallStartedMessage(invocation.CallID, invocation.ModelCallID, displayStartedToolCall),
 		}); err != nil {
 			return err
 		}
@@ -1979,7 +1980,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	if isInteractionInvocation {
 		if err := service.handleInteractionToolInvocation(stream, invocation); err != nil {
 			if cause, ok := recoverableToolInvocationCause(err); ok {
-				return service.completePreDispatchToolError(stream, invocation, startedToolCall, startedToolCall != nil, startedEmitted, cause)
+				return service.completePreDispatchToolError(stream, invocation, displayStartedToolCall, startedToolCall != nil, startedEmitted, cause)
 			}
 			return err
 		}
@@ -1994,7 +1995,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 			SubagentModelOverrides: subagentOverrides,
 		}, invocation)
 		if err != nil {
-			return service.completePreDispatchToolError(stream, invocation, startedToolCall, startedToolCall != nil, startedEmitted, err)
+			return service.completePreDispatchToolError(stream, invocation, displayStartedToolCall, startedToolCall != nil, startedEmitted, err)
 		}
 		pendingExec.ModelCallID = invocation.ModelCallID
 		pendingExec.ReasoningContent = invocation.ReasoningContent
@@ -2030,7 +2031,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 				return err
 			}
 			if err := service.broker.Publish(stream.RequestID, StreamEvent{
-				Message: buildToolCallStartedMessage(invocation.CallID, invocation.ModelCallID, startedToolCall),
+				Message: buildToolCallStartedMessage(invocation.CallID, invocation.ModelCallID, displayStartedToolCall),
 			}); err != nil {
 				removePendingExec()
 				return err
