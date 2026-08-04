@@ -79,6 +79,21 @@ func TestResolveEnabledSubagentModelIDRejectsAmbiguousName(t *testing.T) {
 	}
 }
 
+func TestReadableTaskModelLabelIncludesAliasModelAndEffort(t *testing.T) {
+	models := []modeladapter.SubagentModel{{
+		ID: "e7bbe0a5c209c3e2", DisplayName: "gpt-5.6-luna", ModelID: "gpt-5.6-luna",
+	}}
+	if got := readableTaskModelLabel(models, "e7bbe0a5c209c3e2:medium"); got != "luna · gpt-5.6-luna · medium" {
+		t.Fatalf("label=%q", got)
+	}
+}
+
+func TestReadableTaskModelLabelPreservesUnknownModel(t *testing.T) {
+	if got := readableTaskModelLabel(nil, "unknown:max"); got != "unknown:max" {
+		t.Fatalf("label=%q", got)
+	}
+}
+
 func TestRequestedModelVariantParsesWithoutVariantFlag(t *testing.T) {
 	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
 		t.Run(effort, func(t *testing.T) {

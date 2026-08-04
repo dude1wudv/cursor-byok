@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -637,6 +638,9 @@ func (service *Service) rewriteTaskToolCallModelForDisplay(stream *ActiveStream,
 	if effectiveModelID == "" {
 		return toolCall
 	}
+	if directory, ok := service.resolver.(modeladapter.SubagentModelDirectory); ok {
+		effectiveModelID = readableTaskModelLabel(directory.EnabledSubagentModels(context.Background()), effectiveModelID)
+	}
 	cloned, ok := proto.Clone(toolCall).(*agentv1.ToolCall)
 	if !ok || cloned == nil {
 		return toolCall
@@ -679,6 +683,30 @@ func effectiveTaskDisplayModelID(subagentType string, parentModelID string, over
 		}
 	}
 	return ""
+}
+
+func readableTaskModelLabel(models []modeladapter.SubagentModel, effectiveModelID string) string {
+	base, effort := splitRuntimeThinkingEffortVariantString(effectiveModelID)
+	if base == "" {
+		base = strings.TrimSpace(effectiveModelID)
+	}
+	for _, model := range models {
+		if strings.TrimSpace(model.ID) != base {
+			continue
+		}
+		displayName := firstNonEmpty(strings.TrimSpace(model.DisplayName), strings.TrimSpace(model.ModelID), base)
+		shortName := strings.TrimPrefix(displayName, "gpt-5.6-")
+		modelName := firstNonEmpty(strings.TrimSpace(model.ModelID), displayName)
+		parts := []string{shortName}
+		if modelName != shortName {
+			parts = append(parts, modelName)
+		}
+		if effort != "" {
+			parts = append(parts, effort)
+		}
+		return strings.Join(parts, " · ")
+	}
+	return strings.TrimSpace(effectiveModelID)
 }
 
 func (service *Service) handleProviderDoneEvent(stream *ActiveStream, payload *streamProviderEvent) error {

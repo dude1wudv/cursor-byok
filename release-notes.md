@@ -1,12 +1,12 @@
-# Cursor助手 v0.0.82
+# Cursor助手 v0.0.83
 
-本版本修复自定义子代理模型的可读名称解析，并保留 v0.0.81 的调度、权限契约和思考强度能力。
+本版本将子代理执行信息转换为可读标签，同时保留 v0.0.82 的模型名称解析和内部渠道路由。
 
-## 自定义子代理模型
+## 可读子代理标签
 
-- `Task.model` 现在可使用模型显示名或上游 `modelID`，不再要求父代理暴露或传递内部 channel ID。
-- 可读名称命中后仍转换为稳定 adapter ID 执行，保持现有渠道路由和思考强度 variant 行为。
-- 多个启用渠道使用相同显示名或 `modelID` 时会明确拒绝歧义选择，避免静默路由到错误渠道。
+- Cursor 任务界面不再直接展示内部 channel ID。
+- 标签统一展示短名称、实际上游模型名和思考强度，例如 `luna · gpt-5.6-luna · medium`。
+- 展示转换仅作用于 UI 工具调用副本，底层执行继续使用稳定 adapter ID，不影响 BYOK 渠道选择。
 
 ## 回归兼容
 
@@ -43,7 +43,7 @@
 
 ## 发布资产
 
-- `cursor-byok-0.0.82-windows-amd64.zip`
-- `cursor-byok-0.0.82-macos-arm64.tar.gz`
-- `cursor-byok-0.0.82-macos-amd64.tar.gz`
+- `cursor-byok-0.0.83-windows-amd64.zip`
+- `cursor-byok-0.0.83-macos-arm64.tar.gz`
+- `cursor-byok-0.0.83-macos-amd64.tar.gz`
 - `update.json`
