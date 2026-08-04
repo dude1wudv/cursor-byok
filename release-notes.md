@@ -1,6 +1,18 @@
-# Cursor助手 v0.0.81
+# Cursor助手 v0.0.82
 
-本版本聚焦 Cursor 子代理调度、执行权限契约和模型思考强度传递。
+本版本修复自定义子代理模型的可读名称解析，并保留 v0.0.81 的调度、权限契约和思考强度能力。
+
+## 自定义子代理模型
+
+- `Task.model` 现在可使用模型显示名或上游 `modelID`，不再要求父代理暴露或传递内部 channel ID。
+- 可读名称命中后仍转换为稳定 adapter ID 执行，保持现有渠道路由和思考强度 variant 行为。
+- 多个启用渠道使用相同显示名或 `modelID` 时会明确拒绝歧义选择，避免静默路由到错误渠道。
+
+## 回归兼容
+
+- 继续兼容显式 adapter ID 调用。
+- 保留 `low`、`medium`、`high`、`xhigh`、`max` 全部子代理思考强度。
+- 保留第一级 4 个、第二级 2 个活跃槽位、终态释放槽位及第三级禁止派发规则。
 
 ## 子代理树级调度
 
@@ -31,7 +43,7 @@
 
 ## 发布资产
 
-- `cursor-byok-0.0.81-windows-amd64.zip`
-- `cursor-byok-0.0.81-macos-arm64.tar.gz`
-- `cursor-byok-0.0.81-macos-amd64.tar.gz`
+- `cursor-byok-0.0.82-windows-amd64.zip`
+- `cursor-byok-0.0.82-macos-arm64.tar.gz`
+- `cursor-byok-0.0.82-macos-amd64.tar.gz`
 - `update.json`

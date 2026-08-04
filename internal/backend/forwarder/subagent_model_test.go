@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"cursor/gen/agentv1"
+	modeladapter "cursor/internal/backend/agent/model"
 	legacyruntime "cursor/internal/runtime"
 )
 
@@ -55,6 +56,27 @@ func (resolver subagentModelTestResolver) SelectChannelForModel(_ context.Contex
 
 func (subagentModelTestResolver) ProviderStreamIdleTimeout(context.Context) time.Duration {
 	return time.Minute
+}
+
+func TestResolveEnabledSubagentModelIDAcceptsPublicNames(t *testing.T) {
+	models := []modeladapter.SubagentModel{{
+		ID: "e7bbe0a5c209c3e2", DisplayName: "gpt-5.6-luna", ModelID: "gpt-5.6-luna",
+	}}
+	for _, requested := range []string{"e7bbe0a5c209c3e2", "gpt-5.6-luna"} {
+		if got, err := resolveEnabledSubagentModelID(models, requested); err != nil || got != "e7bbe0a5c209c3e2" {
+			t.Fatalf("requested=%q got=%q err=%v", requested, got, err)
+		}
+	}
+}
+
+func TestResolveEnabledSubagentModelIDRejectsAmbiguousName(t *testing.T) {
+	models := []modeladapter.SubagentModel{
+		{ID: "channel-a", DisplayName: "worker", ModelID: "model-a"},
+		{ID: "channel-b", DisplayName: "worker", ModelID: "model-b"},
+	}
+	if _, err := resolveEnabledSubagentModelID(models, "worker"); err == nil {
+		t.Fatal("ambiguous display name should be rejected")
+	}
 }
 
 func TestRequestedModelVariantParsesWithoutVariantFlag(t *testing.T) {

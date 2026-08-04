@@ -1741,12 +1741,14 @@ func (service *Service) resolveTaskModel(invocation runtimecore.ToolInvocation) 
 	}
 	models := directory.EnabledSubagentModels(context.Background())
 	selected := ""
-	for _, model := range models {
-		if requested != "" && strings.TrimSpace(model.ID) == requestedBase {
-			selected = requestedBase
-			break
+	if requested != "" {
+		var resolveErr error
+		selected, resolveErr = resolveEnabledSubagentModelID(models, requestedBase)
+		if resolveErr != nil {
+			return invocation, resolveErr
 		}
-		if requested == "" {
+	} else {
+		for _, model := range models {
 			for _, candidateRole := range model.Roles {
 				if strings.TrimSpace(candidateRole) == role {
 					selected = strings.TrimSpace(model.ID)
@@ -1779,6 +1781,25 @@ func (service *Service) resolveTaskModel(invocation runtimecore.ToolInvocation) 
 	}
 	invocation.ArgsJSON = rewritten
 	return invocation, nil
+}
+
+func resolveEnabledSubagentModelID(models []modeladapter.SubagentModel, requested string) (string, error) {
+	requested = strings.TrimSpace(requested)
+	selected := ""
+	for _, model := range models {
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			continue
+		}
+		if id != requested && strings.TrimSpace(model.DisplayName) != requested && strings.TrimSpace(model.ModelID) != requested {
+			continue
+		}
+		if selected != "" && selected != id {
+			return "", fmt.Errorf("subagent model %q is ambiguous", requested)
+		}
+		selected = id
+	}
+	return selected, nil
 }
 
 func reserveTaskDispatch(stream *ActiveStream, invocation runtimecore.ToolInvocation) (bool, error) {
