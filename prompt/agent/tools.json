@@ -505,7 +505,7 @@
             "type": "string"
           },
           "model": {
-            "description": "Optional enabled subagent model adapter ID. Do not use fast; it is not a valid model. If omitted, the first enabled model for task_role is used.",
+            "description": "Optional enabled subagent adapter ID, full model name, or gpt-5.6 short alias such as luna, sol, or terra. Follow the user's explicit model request; for 'luna max', send model='luna' and thinking_effort='max'. Do not use fast. If omitted, the first enabled model for task_role is used.",
             "type": "string"
           },
           "task_role": {
@@ -540,7 +540,15 @@
             "type": "string"
           },
           "thinking_effort": {
-            "description": "Optional thinking intensity: disabled, low, medium, high, xhigh, or max. Explicit max is preserved.",
+            "description": "Optional thinking intensity. Follow the user's explicit intensity request; max must remain max.",
+            "enum": [
+              "disabled",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
             "type": "string"
           }
         },

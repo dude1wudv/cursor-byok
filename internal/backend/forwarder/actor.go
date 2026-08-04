@@ -543,6 +543,9 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 		if toolCallID == "" || event.ToolCall == nil {
 			return nil
 		}
+		if inferToolName(event.ToolCall) == "Task" {
+			return nil
+		}
 		displayToolCall := service.rewriteTaskToolCallModelForDisplay(stream, event.ToolCall)
 		stream.mu.Lock()
 		if stream.PartialToolCallIDs == nil {
@@ -634,7 +637,10 @@ func (service *Service) rewriteTaskToolCallModelForDisplay(stream *ActiveStream,
 	parentModelID := strings.TrimSpace(stream.ModelID)
 	overrides := cloneSubagentModelOverrides(stream.SubagentModelOverrides)
 	stream.mu.Unlock()
-	effectiveModelID := effectiveTaskDisplayModelID(subagentType, parentModelID, overrides)
+	effectiveModelID := strings.TrimSpace(taskToolCall.GetArgs().GetModel())
+	if effectiveModelID == "" {
+		effectiveModelID = effectiveTaskDisplayModelID(subagentType, parentModelID, overrides)
+	}
 	if effectiveModelID == "" {
 		return toolCall
 	}
@@ -694,17 +700,11 @@ func readableTaskModelLabel(models []modeladapter.SubagentModel, effectiveModelI
 		if strings.TrimSpace(model.ID) != base {
 			continue
 		}
-		displayName := firstNonEmpty(strings.TrimSpace(model.DisplayName), strings.TrimSpace(model.ModelID), base)
-		shortName := strings.TrimPrefix(displayName, "gpt-5.6-")
-		modelName := firstNonEmpty(strings.TrimSpace(model.ModelID), displayName)
-		parts := []string{shortName}
-		if modelName != shortName {
-			parts = append(parts, modelName)
+		modelName := firstNonEmpty(strings.TrimSpace(model.ModelID), strings.TrimSpace(model.DisplayName), base)
+		if effort == "" {
+			return modelName
 		}
-		if effort != "" {
-			parts = append(parts, effort)
-		}
-		return strings.Join(parts, " · ")
+		return modelName + " (" + effort + ")"
 	}
 	return strings.TrimSpace(effectiveModelID)
 }

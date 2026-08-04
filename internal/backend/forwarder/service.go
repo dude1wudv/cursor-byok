@@ -1724,14 +1724,8 @@ func (service *Service) resolveTaskModel(invocation runtimecore.ToolInvocation) 
 	}
 	requested := readStringMapValue(args, "model", "model_id", "modelId")
 	requestedBase, requestedEffort := splitRuntimeThinkingEffortVariantString(requested)
-	if requestedBase == "" {
-		requestedBase = requested
-	}
 	role := readStringMapValue(args, "task_role", "taskRole")
 	effort := normalizeRuntimeThinkingEffort(readStringMapValue(args, "thinking_effort", "reasoning_effort", "thinking_intensity"))
-	if effort == "" {
-		effort = requestedEffort
-	}
 	if role == "" {
 		return invocation, fmt.Errorf("task_role is required")
 	}
@@ -1741,11 +1735,29 @@ func (service *Service) resolveTaskModel(invocation runtimecore.ToolInvocation) 
 	}
 	models := directory.EnabledSubagentModels(context.Background())
 	selected := ""
+	var err error
 	if requested != "" {
-		var resolveErr error
-		selected, resolveErr = resolveEnabledSubagentModelID(models, requestedBase)
-		if resolveErr != nil {
-			return invocation, resolveErr
+		selected, err = resolveEnabledSubagentModelID(models, requested)
+		if err != nil {
+			return invocation, err
+		}
+		if selected == "" && requestedBase != "" {
+			selected, err = resolveEnabledSubagentModelID(models, requestedBase)
+			if err != nil {
+				return invocation, err
+			}
+		}
+		if selected == "" {
+			spaceBase, spaceEffort := splitNaturalTaskModelRequest(requested)
+			if spaceBase != "" {
+				selected, err = resolveEnabledSubagentModelID(models, spaceBase)
+				if err != nil {
+					return invocation, err
+				}
+				if selected != "" && requestedEffort == "" {
+					requestedEffort = spaceEffort
+				}
+			}
 		}
 	} else {
 		for _, model := range models {
@@ -1765,6 +1777,9 @@ func (service *Service) resolveTaskModel(invocation runtimecore.ToolInvocation) 
 			return invocation, fmt.Errorf("subagent model %q is not enabled", requested)
 		}
 		return invocation, nil
+	}
+	if effort == "" {
+		effort = requestedEffort
 	}
 	if effort != "" {
 		selected += ":" + effort
@@ -1799,7 +1814,54 @@ func resolveEnabledSubagentModelID(models []modeladapter.SubagentModel, requeste
 		}
 		selected = id
 	}
+	if selected != "" {
+		return selected, nil
+	}
+	requestedAlias := strings.ToLower(requested)
+	for _, model := range models {
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			continue
+		}
+		aliases := []string{subagentModelAlias(model.DisplayName), subagentModelAlias(model.ModelID)}
+		for _, alias := range aliases {
+			if alias == "" || strings.ToLower(alias) != requestedAlias {
+				continue
+			}
+			if selected != "" && selected != id {
+				return "", fmt.Errorf("subagent model %q is ambiguous", requested)
+			}
+			selected = id
+		}
+	}
 	return selected, nil
+}
+
+func subagentModelAlias(raw string) string {
+	const prefix = "gpt-5.6-"
+	name := strings.TrimSpace(raw)
+	if len(name) <= len(prefix) || !strings.EqualFold(name[:len(prefix)], prefix) {
+		return ""
+	}
+	alias := strings.TrimSpace(name[len(prefix):])
+	if alias == "" || strings.IndexAny(alias, " \t\r\n") >= 0 {
+		return ""
+	}
+	return alias
+}
+
+func splitNaturalTaskModelRequest(raw string) (string, string) {
+	text := strings.TrimSpace(raw)
+	index := strings.LastIndexAny(text, " \t\r\n")
+	if index <= 0 || index >= len(text)-1 {
+		return "", ""
+	}
+	model := strings.TrimSpace(text[:index])
+	effort := normalizeRuntimeThinkingEffort(text[index+1:])
+	if model == "" || effort == "" {
+		return "", ""
+	}
+	return model, effort
 }
 
 func reserveTaskDispatch(stream *ActiveStream, invocation runtimecore.ToolInvocation) (bool, error) {
